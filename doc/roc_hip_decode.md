@@ -63,6 +63,7 @@ Current local verification on gfx1201 includes:
 - 98 GEMV matrix, routing, codebook, K5, and K6 tests per model fixture
 - 88 cache / reconstruct tests
 - 61 multi-head latent attention (MLA) / DeepSeek sparse attention (DSA) tests
+- 34 native ROCm hyperconnection route, numerical, stream, validation, and fallback tests
 - forced-identical-context 16-step logits oracles for mul1 and MCG models
 
 The Qwen3.8-27B mul1 oracle reports:
@@ -124,7 +125,11 @@ A short greedy smoke produced `Paris. Paris is the capital` and executed the dir
 - K5 reconstruction: 1,232 launches to zero;
 - real shared-expert gate/up/down K5 projections match reconstruct+hgemm on both gfx1201 devices.
 
-This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP has not been enabled, and sparse QSA beyond the short-context dense threshold still needs ROCm qualification. The remaining short-context bottlenecks are small fp16 matrix multiplications, launch count, and K3 expert GEMV.
+The existing fused GatedResidual and hyperconnection kernels are also available on wave32 ROCm devices. They replace the decode reference path's small matrix multiplications and elementwise chains with two `gr_mix` launches and one in-place `hc_apply` launch per residual site. Unsupported wave sizes retain the PyTorch path. In a controlled same-process comparison, fusion improved the 32-token median from 7.787 to 14.085 tok/s. Over four tokens, it reduced `aten::mm` from 1,552 to 392 calls and removed 7,736 HIP launches. A separate fresh-process run measured a 13.553 tok/s median.
+
+Keeping the PLE table in RAM did not improve that fresh-process result: disk streaming measured 13.553 tok/s versus 13.410 tok/s from RAM. RAM residency also increased model load time from 17.0 to 30.9 seconds. The streamed path remains the recommended default and avoids reserving 32.64 GB of host memory.
+
+This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP has not been enabled, and sparse QSA beyond the short-context dense threshold still needs ROCm qualification. The remaining short-context bottlenecks are launch count and K3 expert GEMV. Prefill and long-context performance need separate measurements before comparison with sparse QSA serving results.
 
 ## MCG compatibility
 

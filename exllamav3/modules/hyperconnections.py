@@ -8,6 +8,21 @@ from ..model.config import Config
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
 
+_hc_mix_support_cache: dict[tuple[object, int], bool] = {}
+
+
+def _hc_mix_supported(device: torch.device) -> bool:
+    """Return whether the fused kernels' fixed 32-lane shuffle layout is valid."""
+    support_fn = getattr(ext, "hc_mix_supported", None)
+    if support_fn is None or device.type != "cuda":
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (support_fn, index)
+    if key not in _hc_mix_support_cache:
+        _hc_mix_support_cache[key] = bool(support_fn(index))
+    return _hc_mix_support_cache[key]
+
+
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
 # the embedding into the streams, each sublayer site mixes them through a HyperConnection
@@ -119,6 +134,7 @@ class HyperConnection(Module):
         hc = self.hc_mult
         b, s, H, D = streams.shape
         if hasattr(ext, "hc_mix_num_chunks") and hasattr(ext, "hc_mix") \
+                and _hc_mix_supported(streams.device) \
                 and hc == 4 and streams.dtype == torch.float and D % 4 == 0 \
                 and streams.is_contiguous():
             R = b * s
@@ -179,7 +195,7 @@ class HyperConnection(Module):
         path: the capture and advance passes forward the SAME stored input states twice."""
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
-        if hasattr(ext, "hc_apply") and not converting \
+        if hasattr(ext, "hc_apply") and not converting and _hc_mix_supported(x.device) \
                 and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
@@ -360,7 +376,9 @@ class GatedResidual(Module):
         if not s3.is_contiguous():
             s3 = s3.contiguous()
         dev = s3.device
-        if not hasattr(ext, "gr_mix"):
+        has_gr_mix = hasattr(ext, "gr_mix")
+        native_mix = has_gr_mix and _hc_mix_supported(dev)
+        if not has_gr_mix or (R <= self.FUSED_MAX_R and not native_mix):
             post, mixed = self._mix_ref(s3.view(1, R, H, Dh))
             return (post.view(R, H) if post is not None else None), mixed.view(R, Dh).half()
         post = torch.empty((R, H), dtype = torch.float, device = dev) \
@@ -400,12 +418,14 @@ class GatedResidual(Module):
         """Residual update for one sublayer site, in place: x <- x + post (x) y (comb unused).
         Conversion must NOT run the in-place path: the capture and advance passes forward the
         SAME stored input states twice (mHC apply_ has the same guard)."""
-        if not hasattr(ext, "hc_apply") or "quant_preserve" in params or "capture" in params:
+        b, s, H, D = x.shape
+        if not hasattr(ext, "hc_apply") or "quant_preserve" in params or "capture" in params \
+                or not _hc_mix_supported(x.device) or H != 4 or D % 4 != 0 \
+                or x.dtype != torch.float or not x.is_contiguous() \
+                or y.dtype not in (torch.half, torch.float) or not y.is_contiguous() \
+                or post.dtype != torch.float or not post.is_contiguous():
             return x + post.unsqueeze(-1) * y.float().unsqueeze(-2)
-        b, s = x.shape[:2]
         y2 = y.reshape(b * s, self.hidden_size)
-        if y2.dtype not in (torch.half, torch.float):
-            y2 = y2.half()
         ext.hc_apply(
             x.view(b * s, self.hc_mult, self.hidden_size),
             y2.contiguous(),
@@ -561,6 +581,7 @@ class HyperHead(Module):
             return x.mean(dim = 2)
         b, s, H, D = x.shape
         if hasattr(ext, "hc_mix_num_chunks") and hasattr(ext, "hc_head") \
+                and _hc_mix_supported(x.device) \
                 and H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
             R = b * s
             chunks = ext.hc_mix_num_chunks(R, H * D)

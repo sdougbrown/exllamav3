@@ -1,10 +1,19 @@
+#if defined(USE_ROCM)
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.h>
+#endif
+#include <atomic>
+#include <cstdint>
 #include "hc_mix.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 #include "util.cuh"
+#if !defined(USE_ROCM)
 #include "graph.cuh"
+#endif
 
 /*
 
@@ -556,6 +565,45 @@ void hc_apply_kernel
 
 // Shared launch logic. mode: fn rows M = 2H + H^2 (mix) or H (head)
 
+bool hc_mix_supported(int device)
+{
+#if defined(USE_ROCM)
+    constexpr int MAX_CACHED_DEVICES = 128;
+    if (device < 0 || device >= MAX_CACHED_DEVICES) return false;
+    static std::atomic<int> support_cache[MAX_CACHED_DEVICES];  // 0 unknown, 1 false, 2 true
+    int cached = support_cache[device].load(std::memory_order_acquire);
+    if (cached) return cached == 2;
+    hipDeviceProp_t prop;
+    bool supported = hipGetDeviceProperties(&prop, device) == hipSuccess && prop.warpSize == 32;
+    support_cache[device].store(supported ? 2 : 1, std::memory_order_release);
+    return supported;
+#else
+    (void) device;
+    return true;
+#endif
+}
+
+static void hc_check_common
+(
+    const at::Tensor& tensor,
+    const at::Device& device,
+    const char* op,
+    const char* name
+)
+{
+    TORCH_CHECK(tensor.is_cuda(), op, ": ", name, " must be a CUDA tensor");
+    TORCH_CHECK(tensor.device() == device, op, ": all tensors must be on the same device (", name, ")");
+    TORCH_CHECK(tensor.is_contiguous(), op, ": ", name, " must be contiguous");
+}
+
+static void hc_check_aligned(const at::Tensor& tensor, const char* op, const char* name)
+{
+    TORCH_CHECK(
+        reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+        op, ": ", name, " must be 16-byte aligned"
+    );
+}
+
 static void hc_mix_launch
 (
     const at::Tensor& streams,
@@ -569,35 +617,84 @@ static void hc_mix_launch
     at::Tensor* post,
     at::Tensor* comb,
     at::Tensor& collapsed,
+    bool head,
     Graph* graph
 )
 {
-    const at::cuda::OptionalCUDAGuard device_guard(streams.device());
+    const char* op = head ? "hc_head" : "hc_mix";
+    TORCH_CHECK(streams.is_cuda(), op, ": streams must be a CUDA tensor");
+    TORCH_CHECK(streams.dim() == 3, op, ": streams must have shape (R, 4, D)");
+    const int R = streams.size(0);
+    const int H = streams.size(1);
+    const int D = streams.size(2);
+    TORCH_CHECK(H == 4 && D > 0 && D % 4 == 0, op, ": streams must have shape (R, 4, D) with D divisible by 4");
+    const int row_len = H * D;
+    const int M = head ? H : 2 * H + H * H;
+    const at::Device device = streams.device();
+
+    hc_check_common(streams, device, op, "streams");
+    hc_check_common(fn, device, op, "fn");
+    hc_check_common(base, device, op, "base");
+    hc_check_common(scale, device, op, "scale");
+    hc_check_common(partials, device, op, "partials");
+    hc_check_common(collapsed, device, op, "collapsed");
+    TORCH_CHECK(streams.scalar_type() == at::kFloat, op, ": streams must have dtype float32");
+    TORCH_CHECK(fn.scalar_type() == at::kFloat || fn.scalar_type() == at::kHalf,
+                op, ": fn must have dtype float32 or float16");
+    TORCH_CHECK(base.scalar_type() == at::kFloat, op, ": base must have dtype float32");
+    TORCH_CHECK(scale.scalar_type() == at::kFloat, op, ": scale must have dtype float32");
+    TORCH_CHECK(partials.scalar_type() == at::kFloat, op, ": partials must have dtype float32");
+    TORCH_CHECK(collapsed.scalar_type() == at::kFloat || collapsed.scalar_type() == at::kHalf,
+                op, ": collapsed must have dtype float32 or float16");
+    TORCH_CHECK(fn.dim() == 2 && fn.size(0) == M && fn.size(1) == row_len,
+                op, ": fn must have shape (", M, ", ", row_len, ")");
+    TORCH_CHECK(base.dim() == 1 && base.size(0) == M, op, ": base must have shape (", M, ")");
+    const int scale_size = head ? 1 : 3;
+    TORCH_CHECK(scale.dim() == 1 && scale.size(0) == scale_size,
+                op, ": scale must have shape (", scale_size, ")");
+    const int n_chunks_a = hc_mix_num_chunks(R, row_len);
+    TORCH_CHECK(partials.dim() == 3 && partials.size(0) == R &&
+                partials.size(1) >= n_chunks_a && partials.size(2) == M + 1,
+                op, ": partials must have shape (R, at least ", n_chunks_a, ", ", M + 1, ")");
+    TORCH_CHECK(collapsed.dim() == 2 && collapsed.size(0) == R && collapsed.size(1) == D,
+                op, ": collapsed must have shape (R, D)");
+    if (head)
+    {
+        TORCH_CHECK(post == nullptr && comb == nullptr, "hc_head: post and comb must be absent");
+    }
+    else
+    {
+        TORCH_CHECK(post != nullptr && comb != nullptr, "hc_mix: post and comb outputs are required");
+        hc_check_common(*post, device, op, "post");
+        hc_check_common(*comb, device, op, "comb");
+        TORCH_CHECK(post->scalar_type() == at::kFloat && post->dim() == 2 &&
+                    post->size(0) == R && post->size(1) == H,
+                    "hc_mix: post must be float32 with shape (R, 4)");
+        TORCH_CHECK(comb->scalar_type() == at::kFloat && comb->dim() == 3 &&
+                    comb->size(0) == R && comb->size(1) == H && comb->size(2) == H,
+                    "hc_mix: comb must be float32 with shape (R, 4, 4)");
+        TORCH_CHECK(sinkhorn_iters >= 1, "hc_mix: sinkhorn_iters must be at least 1");
+    }
+
+    hc_check_aligned(streams, op, "streams");
+    hc_check_aligned(fn, op, "fn");
+    hc_check_aligned(collapsed, op, "collapsed");
+    TORCH_CHECK(hc_mix_supported(device.index()), op, ": device must use a 32-lane warp/wavefront");
+    if (R == 0) return;
+
+    const at::cuda::OptionalCUDAGuard device_guard(device);
+#if defined(USE_ROCM)
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+#else
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+#endif
 
-    TORCH_CHECK_DTYPE(streams, kFloat);
-    TORCH_CHECK(streams.is_contiguous() && fn.is_contiguous(), "hc_mix: contiguous inputs required");
-    int R = streams.size(0);
-    int H = streams.size(1);
-    int D = streams.size(2);
-    int row_len = H * D;
-    int M = fn.size(0);
-    bool head = M == H;
-    TORCH_CHECK(H == 4, "hc_mix: H = 4 only");
-    TORCH_CHECK(head || M == 2 * H + H * H, "hc_mix: fn rows must be H or 2H + H^2");
-    TORCH_CHECK(fn.size(1) == row_len && D % 4 == 0, "hc_mix: dims");
-    bool fn_half = fn.dtype() == at::kHalf;
-    if (!fn_half) TORCH_CHECK_DTYPE(fn, kFloat);
-    TORCH_CHECK_DTYPE(base, kFloat);
-    TORCH_CHECK_DTYPE(scale, kFloat);
-
-    int n_chunks_a = partials.size(1);
-    int chunk_cols = ((row_len / n_chunks_a + 4 * NUM_THREADS_A - 1) / (4 * NUM_THREADS_A)) * (4 * NUM_THREADS_A);
-    n_chunks_a = (row_len + chunk_cols - 1) / chunk_cols;
-    TORCH_CHECK(n_chunks_a <= partials.size(1), "hc_mix: partials workspace too small");
-
+    const bool fn_half = fn.dtype() == at::kHalf;
+    const int target_cols_a = (row_len + n_chunks_a - 1) / n_chunks_a;
+    int chunk_cols = ((target_cols_a + 4 * NUM_THREADS_A - 1) / (4 * NUM_THREADS_A)) * (4 * NUM_THREADS_A);
     int chunks_c = std::min(32, std::max(1, 256 / R));
-    int chunk_cols_c = ((D / chunks_c + 4 * NUM_THREADS - 1) / (4 * NUM_THREADS)) * (4 * NUM_THREADS);
+    const int target_cols_c = (D + chunks_c - 1) / chunks_c;
+    int chunk_cols_c = ((target_cols_c + 4 * NUM_THREADS - 1) / (4 * NUM_THREADS)) * (4 * NUM_THREADS);
     int n_chunks_c = (D + chunk_cols_c - 1) / chunk_cols_c;
 
     bool half_out = collapsed.dtype() == at::kHalf;
@@ -645,8 +742,10 @@ static void hc_mix_launch
 
 int hc_mix_num_chunks(int R, int row_len)
 {
+    TORCH_CHECK(R >= 0 && row_len > 0, "hc_mix_num_chunks: R must be nonnegative and row_len must be positive");
     int chunks_a = std::min(128, std::max(1, 512 / std::max(R, 1)));
-    int chunk_cols = ((row_len / chunks_a + 4 * NUM_THREADS_A - 1) / (4 * NUM_THREADS_A)) * (4 * NUM_THREADS_A);
+    const int target_cols = (row_len + chunks_a - 1) / chunks_a;
+    int chunk_cols = ((target_cols + 4 * NUM_THREADS_A - 1) / (4 * NUM_THREADS_A)) * (4 * NUM_THREADS_A);
     return (row_len + chunk_cols - 1) / chunk_cols;
 }
 
@@ -678,6 +777,7 @@ void hc_mix
         &post,
         &comb,
         collapsed,
+        false,
         nullptr
     );
 }
@@ -707,6 +807,7 @@ void hc_head
         nullptr,
         nullptr,
         collapsed,
+        true,
         nullptr
     );
 }
@@ -719,29 +820,45 @@ void hc_apply
     const c10::optional<at::Tensor>& comb   // (R, H, H) float, or none (x[h] += post[h] * y)
 )
 {
-    const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-
-    TORCH_CHECK_DTYPE(x, kFloat);
-    TORCH_CHECK_DTYPE(post, kFloat);
-    TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && post.is_contiguous(), "hc_apply: contiguous inputs required");
-    int R = x.size(0);
-    int H = x.size(1);
-    int D = x.size(2);
-    TORCH_CHECK(H == 4, "hc_apply: H = 4 only");
-    TORCH_CHECK(D % 4 == 0, "hc_apply: dims");
-    TORCH_CHECK(y.size(0) == R && y.size(-1) == D, "hc_apply: y shape");
-    TORCH_CHECK(post.size(0) == R, "hc_apply: gate shapes");
-    const float* comb_p = nullptr;
+    TORCH_CHECK(x.is_cuda(), "hc_apply: x must be a CUDA tensor");
+    TORCH_CHECK(x.dim() == 3, "hc_apply: x must have shape (R, 4, D)");
+    const int R = x.size(0);
+    const int H = x.size(1);
+    const int D = x.size(2);
+    TORCH_CHECK(H == 4 && D > 0 && D % 4 == 0,
+                "hc_apply: x must have shape (R, 4, D) with D divisible by 4");
+    const at::Device device = x.device();
+    hc_check_common(x, device, "hc_apply", "x");
+    hc_check_common(y, device, "hc_apply", "y");
+    hc_check_common(post, device, "hc_apply", "post");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "hc_apply: x must have dtype float32");
+    TORCH_CHECK(y.scalar_type() == at::kFloat || y.scalar_type() == at::kHalf,
+                "hc_apply: y must have dtype float32 or float16");
+    TORCH_CHECK(post.scalar_type() == at::kFloat, "hc_apply: post must have dtype float32");
+    TORCH_CHECK(y.dim() == 2 && y.size(0) == R && y.size(1) == D,
+                "hc_apply: y must have shape (R, D)");
+    TORCH_CHECK(post.dim() == 2 && post.size(0) == R && post.size(1) == H,
+                "hc_apply: post must have shape (R, 4)");
     if (comb)
     {
-        TORCH_CHECK_DTYPE(comb.value(), kFloat);
-        TORCH_CHECK(comb.value().is_contiguous() && comb.value().size(0) == R, "hc_apply: comb shape");
-        comb_p = (const float*) comb.value().data_ptr();
+        hc_check_common(comb.value(), device, "hc_apply", "comb");
+        TORCH_CHECK(comb.value().scalar_type() == at::kFloat && comb.value().dim() == 3 &&
+                    comb.value().size(0) == R && comb.value().size(1) == H && comb.value().size(2) == H,
+                    "hc_apply: comb must be float32 with shape (R, 4, 4)");
     }
+    hc_check_aligned(x, "hc_apply", "x");
+    hc_check_aligned(y, "hc_apply", "y");
+    TORCH_CHECK(hc_mix_supported(device.index()),
+                "hc_apply: device must use a 32-lane warp/wavefront");
+    if (R == 0) return;
+
+    const at::cuda::OptionalCUDAGuard device_guard(device);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    const float* comb_p = comb ? (const float*) comb.value().data_ptr() : nullptr;
 
     int chunks_c = std::min(32, std::max(1, 256 / R));
-    int chunk_cols = ((D / chunks_c + 4 * NUM_THREADS - 1)
+    const int target_cols = (D + chunks_c - 1) / chunks_c;
+    int chunk_cols = ((target_cols + 4 * NUM_THREADS - 1)
                       / (4 * NUM_THREADS)) * (4 * NUM_THREADS);
     int n_chunks = (D + chunk_cols - 1) / chunk_cols;
 
@@ -775,29 +892,58 @@ void gr_mix
     at::Tensor mixed                     // (R, D) half or float out
 )
 {
-    const at::cuda::OptionalCUDAGuard device_guard(streams.device());
+    TORCH_CHECK(streams.is_cuda(), "gr_mix: streams must be a CUDA tensor");
+    TORCH_CHECK(streams.dim() == 3, "gr_mix: streams must have shape (R, 4, D)");
+    const int R = streams.size(0);
+    const int H = streams.size(1);
+    const int D = streams.size(2);
+    TORCH_CHECK(H == 4 && D > 0 && D % 8 == 0,
+                "gr_mix: streams must have shape (R, 4, D) with D divisible by 8");
+    TORCH_CHECK(upt.dim() == 4, "gr_mix: upt must have shape (4, D / 4, LR, 4)");
+    const int LR = upt.size(2);
+    const int M = LR + (post ? H : 0);
+    const at::Device device = streams.device();
+
+    hc_check_common(streams, device, "gr_mix", "streams");
+    hc_check_common(fn, device, "gr_mix", "fn");
+    hc_check_common(upt, device, "gr_mix", "upt");
+    hc_check_common(w, device, "gr_mix", "w");
+    hc_check_common(dots, device, "gr_mix", "dots");
+    hc_check_common(mixed, device, "gr_mix", "mixed");
+    TORCH_CHECK(streams.scalar_type() == at::kFloat, "gr_mix: streams must have dtype float32");
+    TORCH_CHECK(fn.scalar_type() == at::kHalf, "gr_mix: fn must have dtype float16");
+    TORCH_CHECK(upt.scalar_type() == at::kHalf, "gr_mix: upt must have dtype float16");
+    TORCH_CHECK(w.scalar_type() == at::kHalf, "gr_mix: w must have dtype float16");
+    TORCH_CHECK(dots.scalar_type() == at::kFloat, "gr_mix: dots must have dtype float32");
+    TORCH_CHECK(mixed.scalar_type() == at::kFloat || mixed.scalar_type() == at::kHalf,
+                "gr_mix: mixed must have dtype float32 or float16");
+    TORCH_CHECK(fn.dim() == 2 && fn.size(0) == M && fn.size(1) == H * D,
+                "gr_mix: fn must have shape (LR [+ 4], 4 * D)");
+    TORCH_CHECK(upt.size(0) == H && upt.size(1) == D / 4 && upt.size(3) == 4,
+                "gr_mix: upt must have shape (4, D / 4, LR, 4)");
+    TORCH_CHECK(w.dim() == 1 && w.size(0) == H * D, "gr_mix: w must have shape (4 * D)");
+    TORCH_CHECK(dots.dim() == 3 && dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H,
+                "gr_mix: dots must have shape (R, M + 1, 4)");
+    TORCH_CHECK(mixed.dim() == 2 && mixed.size(0) == R && mixed.size(1) == D,
+                "gr_mix: mixed must have shape (R, D)");
+    if (post)
+    {
+        hc_check_common(post.value(), device, "gr_mix", "post");
+        TORCH_CHECK(post.value().scalar_type() == at::kFloat && post.value().dim() == 2 &&
+                    post.value().size(0) == R && post.value().size(1) == H,
+                    "gr_mix: post must be float32 with shape (R, 4)");
+    }
+    hc_check_aligned(streams, "gr_mix", "streams");
+    hc_check_aligned(fn, "gr_mix", "fn");
+    hc_check_aligned(upt, "gr_mix", "upt");
+    hc_check_aligned(w, "gr_mix", "w");
+    hc_check_aligned(mixed, "gr_mix", "mixed");
+    TORCH_CHECK(hc_mix_supported(device.index()),
+                "gr_mix: device must use a 32-lane warp/wavefront");
+    if (R == 0) return;
+
+    const at::cuda::OptionalCUDAGuard device_guard(device);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-
-    TORCH_CHECK_DTYPE(streams, kFloat);
-    TORCH_CHECK_DTYPE(fn, kHalf);
-    TORCH_CHECK_DTYPE(upt, kHalf);
-    TORCH_CHECK_DTYPE(w, kHalf);
-    TORCH_CHECK_DTYPE(dots, kFloat);
-    TORCH_CHECK(streams.is_contiguous() && fn.is_contiguous() && upt.is_contiguous() &&
-                w.is_contiguous() && dots.is_contiguous(), "gr_mix: contiguous inputs required");
-    int R = streams.size(0);
-    int H = streams.size(1);
-    int D = streams.size(2);
-    int M = fn.size(0);
-    TORCH_CHECK(upt.dim() == 4 && upt.size(0) == H && upt.size(1) == D / 4 && upt.size(3) == 4,
-                "gr_mix: upt must be the (H, D / 4, LR, 4) repacked layout");
-    int LR = upt.size(2);
-    TORCH_CHECK(H == 4, "gr_mix: H = 4 only");
-    TORCH_CHECK(D % 8 == 0, "gr_mix: dims");
-    TORCH_CHECK(M == LR + (post ? H : 0), "gr_mix: fn rows must be LR (+ H with post)");
-    TORCH_CHECK(fn.size(1) == H * D && w.numel() == H * D, "gr_mix: dims");
-    TORCH_CHECK(dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H, "gr_mix: dots shape");
-
     dim3 grid_a(M + 1, R);
     gr_dots_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>
     (
