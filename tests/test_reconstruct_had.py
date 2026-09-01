@@ -31,6 +31,23 @@ def ref_transform(w_hat, suh, svh):
     return (w * suh.float()[:, None] * svh.float()[None, :]).half()
 
 
+def make_trellis(k, n, K, mcg, mul1):
+    if mcg and K == 4:
+        packed = 0x3333
+        return torch.full((k // 16, n // 16, 256 * K // 16), packed, dtype = torch.int32, device = device).to(torch.short)
+    if mul1 and K == 3:
+        packed = 0x2492
+        return torch.full((k // 16, n // 16, 256 * K // 16), packed, dtype = torch.int32, device = device).to(torch.short)
+    cycles = [0x0000, 0x1111, 0x2222, 0x5555]
+    tiles = []
+    for i in range(k // 16):
+        row = []
+        for j in range(n // 16):
+            row.append(torch.full((256 * K // 16,), cycles[(i + j) % len(cycles)], dtype = torch.int32, device = device))
+        tiles.append(torch.stack(row, 0))
+    return torch.stack(tiles, 0).to(torch.short)
+
+
 def main():
     for (k, n, K, mcg, mul1) in [
         (256, 128, 3, False, False),
@@ -41,10 +58,15 @@ def main():
         (4096, 1024, 3, False, False),
     ]:
         torch.manual_seed(k * 7 + n + K)
-        trellis = torch.randint(0, 65536, (k // 16, n // 16, 256 * K // 16),
-                                dtype = torch.int32, device = device).to(torch.short)
-        suh = torch.sign(torch.randn(k, device = device)).half()
-        svh = torch.sign(torch.randn(n, device = device)).half()
+        trellis = make_trellis(k, n, K, mcg, mul1)
+        gen = torch.Generator(device = device)
+        gen.manual_seed(k * 7 + n + K)
+        suh = torch.where(torch.rand(k, generator = gen, device = device) > 0.5,
+                          torch.ones((k,), device = device),
+                          -torch.ones((k,), device = device)).half()
+        svh = torch.where(torch.rand(n, generator = gen, device = device) > 0.5,
+                          torch.ones((n,), device = device),
+                          -torch.ones((n,), device = device)).half()
 
         w_hat = torch.empty(k, n, dtype = torch.half, device = device)
         ext.reconstruct(w_hat, trellis, K, mcg, mul1)
@@ -70,10 +92,15 @@ def main():
     # Forward equivalence: old had->gemm->had pipeline vs plain gemm on fused W
     k, n, K = 1024, 512, 3
     torch.manual_seed(99)
-    trellis = torch.randint(0, 65536, (k // 16, n // 16, 256 * K // 16),
-                            dtype = torch.int32, device = device).to(torch.short)
-    suh = torch.sign(torch.randn(k, device = device)).half()
-    svh = torch.sign(torch.randn(n, device = device)).half()
+    trellis = make_trellis(k, n, K, False, False)
+    gen = torch.Generator(device = device)
+    gen.manual_seed(99)
+    suh = torch.where(torch.rand(k, generator = gen, device = device) > 0.5,
+                      torch.ones((k,), device = device),
+                      -torch.ones((k,), device = device)).half()
+    svh = torch.where(torch.rand(n, generator = gen, device = device) > 0.5,
+                      torch.ones((n,), device = device),
+                      -torch.ones((n,), device = device)).half()
     x = torch.randn(64, k, dtype = torch.half, device = device) * 0.1
 
     w_hat = torch.empty(k, n, dtype = torch.half, device = device)
@@ -94,6 +121,10 @@ def main():
     assert num / den < 2e-2, f"forward: rel {num/den:.2e}"
     print(f"  PASS forward old-pipeline vs fused-W: rel {num/den:.2e}")
     print("ALL PASS")
+
+
+def test_reconstruct_had():
+    main()
 
 
 if __name__ == "__main__":
