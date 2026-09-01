@@ -75,6 +75,7 @@
 #include "hgemm.cuh"
 #include "rope.cuh"
 #include "gdn.cuh"
+#include "routing_std_gfx12.cuh"
 #include "add.cuh"
 
 #include "quant/pack.cuh"
@@ -293,6 +294,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemv_supported", &exl3_gemv_supported, "exl3_gemv_supported");
     m.def("exl3_moe_gfx12_k3", &exl3_moe_gfx12_k3, "exl3_moe_gfx12_k3");
+    m.def("routing_std_gfx12_bsz1", &routing_std_gfx12_bsz1,
+          "routing_std_gfx12_bsz1");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
     m.def("pack_signs", &pack_signs, "pack_signs");
