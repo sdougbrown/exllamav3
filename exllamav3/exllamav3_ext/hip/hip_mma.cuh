@@ -11,8 +11,8 @@
 //     the builtin signature are confirmed by the ROCm 7.2.4 compiler and the shipped
 //     ComposableKernel headers, but the per-lane <-> element placement is NOT verified
 //     (no CDNA hardware/ISA doc reachable in this session) and MUST be oracle-verified
-//     before use.  It is deliberately #error-gated so it cannot silently produce
-//     wrong results.
+//     before use.  Its device branch intentionally does nothing so broad ROCm builds
+//     succeed; exl3_gemv_try_launch rejects it before any GEMV kernel can launch.
 //
 // There is no fp16-accumulate tensor core on AMD: both families accumulate in fp32
 // natively, so the CUDA kernel's fp16-accumulate + cadence-fold (ch / acc0 / FOLD) is
@@ -37,7 +37,12 @@ struct HipVec
 };
 
 using FragA   = HipVec<half2, 4>;   // m16 A operand / gfx12 WMMA operand: 8 fp16 per lane
+// FragB: when compat_rocm.cuh is already in scope (any ROCm extension TU that includes
+// util.cuh), defer to its layout-identical FragB instead of redefining the name; include
+// compat_rocm.cuh (directly or via hadamard_inner.cuh) before this header
+#ifndef EXL3_ROCM_FRAGB
 using FragB   = HipVec<half2, 2>;   // n8 B operand / A pieces: 4 fp16 per lane (CUDA shape parity)
+#endif
 using FragC   = HipVec<float, 4>;   // CDNA MFMA accumulator: 4 fp32 per lane  (fp32 accumulate)
 using FragC8  = HipVec<float, 8>;   // gfx12 WMMA accumulator: 8 fp32 per lane (fp32 accumulate)
 using FragC_h = HipVec<half2, 2>;   // legacy fp16-accumulate shape, kept for shape parity only
@@ -162,8 +167,9 @@ __device__ __forceinline__ void mma_ab_h_hip(
     d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, d);
     *reinterpret_cast<HipFp32x8*>(&c) = d;
 #elif defined(__gfx90a__) || defined(__gfx94__) || defined(__gfx950__)
+    // CDNA MFMA layout is not oracle-verified. This inert body exists only so a fat ROCm
+    // build can compile; exl3_gemv_try_launch rejects CDNA at runtime.
     (void)a01; (void)a23; (void)b_hi; (void)b_lo; (void)c;
-    #error "hip_mma.cuh: CDNA MFMA path is scaffold-only until its fragment layout is oracle-verified (see doc/roc_hip_decode.md)"
 #else
     (void)a01; (void)a23; (void)b_hi; (void)b_lo; (void)c;   // host pass / unknown arch: parse-only
 #endif

@@ -1,4 +1,9 @@
+#if defined(USE_ROCM)
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.h>
+#endif
 #include "exl3_gemv.cuh"
 
 #include <c10/cuda/CUDAGuard.h>
@@ -9,7 +14,9 @@ namespace cg = cooperative_groups;
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
 #include "exl3_devctx.cuh"
+#include <cstring>
 #include <map>
+#include <mutex>
 
 /*
 QTIP-style small-m GEMV path, kernel in exl3_gemv_kernel.cuh. Dispatched from exl3_gemm via
@@ -33,13 +40,37 @@ static int exl3_gemv_env_mode()
     return atoi(env);
 }
 
+bool exl3_gemv_supported(int device)
+{
+#if defined(USE_ROCM)
+    static std::map<int, bool> support_cache;
+    static std::mutex support_cache_mtx;
+    std::lock_guard<std::mutex> lock(support_cache_mtx);
+    auto it = support_cache.find(device);
+    if (it != support_cache.end()) return it->second;
+
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
+    const char* arch = prop.gcnArchName;
+    bool supported = (!std::strncmp(arch, "gfx1200", 7) || !std::strncmp(arch, "gfx1201", 7))
+        && (arch[7] == '\0' || arch[7] == ':');
+    support_cache[device] = supported;
+    return supported;
+#else
+    (void) device;
+    return true;
+#endif
+}
+
 // -1 = default per bits, 0 = force shuffle extraction, 1 = force smem staging (testing)
+#if !defined(USE_ROCM)
 static int exl3_gemv_env_smem()
 {
     const char* env = std::getenv("EXL3_GEMV_SMEM");
     if (!env) return -1;
     return atoi(env);
 }
+#endif
 
 // -1: not eligible, 0: narrow config, 1: wide config. narrow_coresident = number of narrow-config
 // blocks that fit on the device at once (its grid is one block per 32 output columns)
@@ -73,6 +104,24 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
 
 static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem)
 {
+#if defined(USE_ROCM)
+    // HIP: only the smem-staged extraction is instantiated. gfx12 WMMA operands must not
+    // be fed through __shfl_sync (hardware exception), so SMEM_STAGE is forced true and
+    // the `smem` argument is ignored.
+    #define SEL(bits_, cb_, fp32_, mm_, cfg_) \
+        if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_) \
+            return (void*) exl3_gemv_kernel<bits_, fp32_, cb_, mm_, cfg_, true>;
+    #define SEL_GRID(bits_, cb_) \
+        SEL(bits_, cb_, false, 0, 0) SEL(bits_, cb_, false, 0, 1) \
+        SEL(bits_, cb_, false, 1, 0) SEL(bits_, cb_, false, 1, 1) \
+        SEL(bits_, cb_, true,  0, 0) SEL(bits_, cb_, true,  0, 1) \
+        SEL(bits_, cb_, true,  1, 0) SEL(bits_, cb_, true,  1, 1)
+    SEL_GRID(4, 0) SEL_GRID(4, 1) SEL_GRID(4, 2)
+    SEL_GRID(2, 1) SEL_GRID(2, 2)
+    SEL_GRID(3, 1) SEL_GRID(3, 2)
+    #undef SEL_GRID
+    #undef SEL
+#else
     #define SEL(bits_, cb_, fp32_, mm_, cfg_, sm_) \
         if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_ && smem == sm_) \
             return (void*) exl3_gemv_kernel<bits_, fp32_, cb_, mm_, cfg_, sm_>;
@@ -86,6 +135,7 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     #undef SEL_GRID
     #undef SEL
+#endif
     return nullptr;
 }
 
@@ -100,7 +150,11 @@ bool exl3_gemv_try_launch
     bool c_fp32,
     bool has_su_sv,
     int device,
+#if defined(USE_ROCM)
+    hipStream_t stream,
+#else
     cudaStream_t stream,
+#endif
     void** launched_kernel,
     bool force
 )
@@ -112,6 +166,9 @@ bool exl3_gemv_try_launch
     if (K != 4 && cb == 0) return false;
     if (size_m > EXL3_GEMV_MAX_M) return false;
     if (size_k % 128 || size_n % 128) return false;
+#if defined(USE_ROCM)
+    if (!exl3_gemv_supported(device)) return false;
+#endif
 
     int mode = force ? 2 : exl3_gemv_env_mode();
     if (mode == 0) return false;
@@ -129,13 +186,23 @@ bool exl3_gemv_try_launch
         auto it = cache.find(kernel);
         if (it != cache.end()) return it->second;
         int blocks_per_sm;
+#if defined(USE_ROCM)
+        cuda_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
+#else
         cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
+#endif
         cache[kernel] = blocks_per_sm;
         return blocks_per_sm;
     };
 
+#if defined(USE_ROCM)
+    // Extraction style on HIP: smem staging is the only safe mode (gfx12 shfl->WMMA hazard),
+    // so the EXL3_GEMV_SMEM override is ignored and staging is always on
+    bool smem = true;
+#else
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
     bool smem = exl3_gemv_env_smem() == 1;
+#endif
 
     void* narrow_kernel = exl3_gemv_select_kernel(K, cb, c_fp32, mmode, 0, smem);
     if (!narrow_kernel) return false;
@@ -154,15 +221,22 @@ bool exl3_gemv_try_launch
     int grid = MIN(size_n / cols, max_blocks);
     if (grid < 1) return false;
 
-    cuda_check(cudaLaunchCooperativeKernel
+    cuda_check
     (
-        kernel,
-        dim3(grid),
-        dim3(block_dim),
-        kernel_args,
-        0,
-        stream
-    ));
+#if defined(USE_ROCM)
+        hipLaunchCooperativeKernel
+#else
+        cudaLaunchCooperativeKernel
+#endif
+        (
+            kernel,
+            dim3(grid),
+            dim3(block_dim),
+            kernel_args,
+            0,
+            stream
+        )
+    );
 
     if (launched_kernel) *launched_kernel = kernel;
     return true;
@@ -181,7 +255,11 @@ void exl3_gemv
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
+#if defined(USE_ROCM)
+    hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+#else
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+#endif
 
     TORCH_CHECK_DIM(B, 3);
     TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
@@ -209,7 +287,11 @@ void exl3_gemv
     if (mul1) cb = 2;
 
     int device;
+#if defined(USE_ROCM)
+    hipGetDevice(&device);
+#else
     cudaGetDevice(&device);
+#endif
     int* locks = DevCtx::instance().get_locks(device);
 
     const half* A_ptr = (const half*) A.data_ptr();
@@ -237,5 +319,9 @@ void exl3_gemv
     );
     TORCH_CHECK(ok, "exl3_gemv: call is not eligible for the GEMV kernel");
 
+#if defined(USE_ROCM)
+    cuda_check(hipPeekAtLastError());
+#else
     cuda_check(cudaPeekAtLastError());
+#endif
 }

@@ -7,6 +7,10 @@
 // heuristic applies; also exposed directly for testing. Same kernel arguments as
 // exl3_gemm_kernel, so graph recording/patching is identical.
 
+// True when `device` can execute the GEMV tensor-core kernel. On ROCm this is limited to
+// the oracle-verified gfx1200/gfx1201 WMMA implementations.
+bool exl3_gemv_supported(int device);
+
 // Try to dispatch a GEMM call to the GEMV kernel. Returns false (launching nothing) if the
 // call is not eligible. On success *launched_kernel receives the kernel pointer for graph
 // recording. `force` bypasses the shape heuristic but not the hard constraints.
