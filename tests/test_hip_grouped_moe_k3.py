@@ -238,6 +238,7 @@ def _route_spies():
     bindings = {
         "grouped": "exl3_moe_gfx12_k3",
         "gemv": "exl3_gemv",
+        "shared_gate": "add_sigmoid_gate_proj",
         "reconstruct": "reconstruct",
         "reconstruct_had_slice": "reconstruct_had_slice",
         "hgemm": "hgemm",
@@ -273,15 +274,30 @@ def test_flash_bsz1_route_and_decline_guards(flash_model, device_index, monkeypa
         assert mlp.multi_down.linears == mlp.downs
         x = torch.randn((1, 1, HIDDEN), dtype=torch.float16, device=device)
 
+        assert getattr(ext.add_sigmoid_gate_proj, "__module__", None) == "exllamav3_ext"
         calls, restore = _route_spies()
         try:
-            actual = mlp.forward(x, {}).clone()
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+            ) as profile:
+                actual = mlp.forward(x, {}).clone()
         finally:
             restore()
         assert calls == {
-            "grouped": 1, "gemv": 3, "reconstruct": 0,
+            "grouped": 1, "gemv": 3, "shared_gate": 1, "reconstruct": 0,
             "reconstruct_had_slice": 0, "hgemm": 0,
         }
+        shared_gate_matmuls = [
+            event for event in profile.events()
+            if event.name == "aten::matmul"
+            and len(event.input_shapes) >= 2
+            and event.input_shapes[1] == [HIDDEN, 1]
+        ]
+        assert not shared_gate_matmuls
         assert torch.isfinite(actual).all()
 
         guard_cases = [
