@@ -41,7 +41,7 @@ def get_sources(sources_dir, is_rocm, base_dir=None):
         for file in files:
             if not file.endswith(('.c', '.cpp', '.cu')):
                 continue
-            if '_hip' in file or file.endswith('.hip'):
+            if '_hip' in file or file.startswith('hip_') or file.endswith('.hip'):
                 continue
             rel_path = os.path.relpath(os.path.join(root, file), start=sources_dir)
             norm_rel = rel_path.replace('\\', '/')

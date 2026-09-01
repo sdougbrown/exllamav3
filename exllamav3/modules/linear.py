@@ -62,7 +62,8 @@ class Linear(Module):
         transpose_fused_weights: bool = True,
         ftranspose_after_load: bool = True,
         select_hq_bits: int = 0,
-        qgroup: str = None
+        qgroup: str = None,
+        no_defer_load: bool = False
     ):
         super().__init__(config, key, qmap)
 
@@ -93,6 +94,7 @@ class Linear(Module):
         self.transposed_load = transposed_load
         self.transpose_fused_weights = transpose_fused_weights
         self.ftranspose_after_load = ftranspose_after_load
+        self.no_defer_load = no_defer_load
         self.select_hq_bits = select_hq_bits
         self.qgroup = qgroup or key
         self.lora_a_tensors = {}
@@ -208,7 +210,7 @@ class Linear(Module):
                     scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     assert scale is None or scale_inv is None
-                    no_defer = scale is not None or scale_inv is not None or self.weight_scale != 1.0
+                    no_defer = self.no_defer_load or scale is not None or scale_inv is not None or self.weight_scale != 1.0
                     weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
                     bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer)
                 if scale is not None:
