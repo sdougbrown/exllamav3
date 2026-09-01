@@ -143,7 +143,11 @@ def rms_norm(
     xf = xf * torch.rsqrt(var) * constant_scale
     if wf is not None:
         xf = xf * wf
-    y.copy_(xf.to(y.dtype))
+    if add_residual:
+        # RES_POST semantics (norm.cu): y += norm(x) * w, preserving original y.
+        y.add_(xf.to(y.dtype))
+    else:
+        y.copy_(xf.to(y.dtype))
 
 def rms_norm_res_in(
     x: torch.Tensor,

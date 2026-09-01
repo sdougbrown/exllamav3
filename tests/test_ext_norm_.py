@@ -8,6 +8,31 @@ torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
 device = "cuda:0"
 
+@torch.inference_mode()
+def test_fallback_rms_norm_add_residual():
+    from exllamav3.ext_fallbacks import rms_norm
+
+    dim = 64
+    x = torch.randn(4, dim, dtype = torch.half)
+    w = torch.randn(dim, dtype = torch.half)
+    eps = 1e-5
+
+    # RES_POST semantics (norm.cu): y += norm(x) * w — original y is preserved.
+    y_ref = torch.randn(4, dim, dtype = torch.float32)
+    xf = x.float()
+    var = xf.pow(2).mean(dim = -1, keepdim = True) + eps
+    expected = y_ref + (xf * torch.rsqrt(var)) * w.float()
+
+    # add_residual=False: y = norm(x) * w
+    y0 = torch.empty_like(y_ref)
+    rms_norm(x, w, y0, eps, 0.0, 1.0, False, False)
+    torch.testing.assert_close(y0, expected - y_ref, rtol = 1e-4, atol = 1e-4)
+
+    # add_residual=True: y += norm(x) * w
+    y = y_ref.clone()
+    rms_norm(x, w, y, eps, 0.0, 1.0, False, True)
+    torch.testing.assert_close(y, expected, rtol = 1e-4, atol = 1e-4)
+
 def reference_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float, out_dtype: torch.dtype):
     assert x.dtype in [torch.half, torch.float]
     assert w.dtype in [torch.half]
