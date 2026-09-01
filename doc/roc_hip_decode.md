@@ -68,7 +68,7 @@ Current local verification on gfx1201 includes:
 The logits oracle reports:
 
 - top-1 agreement: 16/16
-- top-5 token-set agreement: 16/16
+- top-5 overlap: at least 4/5 tokens at every step (exact-set agreement can vary at near-tie boundaries)
 - representative max absolute logit delta: 0.4043
 - worst-step mean delta: 0.0661
 - overall mean delta: 0.0399

@@ -61,7 +61,29 @@ class FusedBuffers:
     temp_intermediate_u: torch.Tensor
 
 
+def _routing_std_torch(cfg, y, params, include_bias = False):
+    router_logits = torch.matmul(y, cfg.gate_tensor)
+    router_logits_f = router_logits.float()
+    if include_bias and cfg.router_bias is not None:
+        router_logits_f = router_logits_f + cfg.router_bias.float()
+    if params.get("activate_all_experts"):
+        selected_experts = torch.arange(
+            cfg.num_experts, dtype = torch.long, device = y.device
+        ).expand(y.shape[0], -1)
+        routing_weights = torch.softmax(router_logits_f, dim = -1)
+    else:
+        top_v, selected_experts = torch.topk(
+            router_logits_f, cfg.num_experts_per_tok, dim = -1
+        )
+        routing_weights = torch.softmax(top_v, dim = -1)
+    if cfg.per_expert_scale is not None:
+        routing_weights = routing_weights * cfg.per_expert_scale.float()[selected_experts]
+    return selected_experts, routing_weights.half()
+
+
 def routing_std(bsz, cfg, y, params):
+    if not hasattr(ext, "routing_std"):
+        return _routing_std_torch(cfg, y, params)
     if bsz == 1:
         if cfg.gate_tensor_t is None:
             cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
@@ -109,6 +131,8 @@ def routing_std_bias(bsz, cfg, y, params):
     """Standard softmax routing with a bias on the router logits (gpt-oss): the bias enters
     before top-k selection, and the weights are the softmax over the selected biased logits
     (equivalent to renormalizing the full biased softmax over the top-k set)."""
+    if not hasattr(ext, "routing_std"):
+        return _routing_std_torch(cfg, y, params, include_bias = True)
     if bsz == 1 and not params.get("activate_all_experts"):
         if cfg.gate_tensor_t is None:
             cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
@@ -123,12 +147,11 @@ def routing_std_bias(bsz, cfg, y, params):
             cfg.router_bias,
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    router_logits = torch.matmul(y, cfg.gate_tensor).float()
     if cfg.router_bias is not None:
-        router_logits = torch.addmm(cfg.router_bias, y, cfg.gate_tensor)
-    else:
-        router_logits = torch.matmul(y, cfg.gate_tensor)
+        router_logits = router_logits + cfg.router_bias.float()
     if params.get("activate_all_experts"):
-        routing_weights = torch.softmax(router_logits.float(), dim = -1).half()
+        routing_weights = torch.softmax(router_logits, dim = -1).half()
         selected_experts = (
             torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
             .repeat((bsz, 1))
@@ -177,8 +200,40 @@ def routing_ds3(bsz, cfg, y, params):
     return topk_indices, topk_weights
 
 
+def _routing_nogroup_torch(cfg, y, params, scores):
+    if params.get("activate_all_experts"):
+        selected_experts = torch.arange(
+            cfg.num_experts, dtype = torch.long, device = y.device
+        ).expand(y.shape[0], -1)
+    else:
+        selection_scores = scores
+        if cfg.e_score_correction_bias is not None:
+            selection_scores = selection_scores + cfg.e_score_correction_bias.float().unsqueeze(0)
+        selected_experts = torch.topk(
+            selection_scores, cfg.num_experts_per_tok, dim = -1, sorted = False
+        ).indices
+    routing_weights = scores.gather(1, selected_experts)
+    routing_weights = routing_weights / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
+    routing_weights = routing_weights * cfg.routed_scaling_factor
+    return selected_experts, routing_weights.half()
+
+
 def routing_dots(bsz, cfg, y, params):
 
+    if not hasattr(ext, "routing_ds3_nogroup"):
+        scores = torch.sigmoid(torch.matmul(y, cfg.gate_tensor).float())
+        if params.get("activate_all_experts"):
+            routing_weights = scores
+            if cfg.e_score_correction_bias is not None:
+                routing_weights = routing_weights + cfg.e_score_correction_bias.float().unsqueeze(0)
+            routing_weights *= cfg.routed_scaling_factor / (
+                routing_weights.sum(dim = -1, keepdim = True) + 1e-20
+            )
+            selected_experts = torch.arange(
+                cfg.num_experts, dtype = torch.long, device = y.device
+            ).expand(bsz, -1)
+            return selected_experts, routing_weights.half()
+        return _routing_nogroup_torch(cfg, y, params, scores)
     if bsz == 1:
         if cfg.gate_tensor_t is None:
             cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
@@ -199,7 +254,7 @@ def routing_dots(bsz, cfg, y, params):
         activate_all_experts = params.get("activate_all_experts")
         if activate_all_experts:
             router_logits = torch.matmul(y, cfg.gate_tensor)
-            routing_weights = router_logits.sigmoid().float()
+            routing_weights = torch.sigmoid(router_logits.float())
             if cfg.e_score_correction_bias is not None:
                 routing_weights = routing_weights + cfg.e_score_correction_bias.unsqueeze(0).float()
             factor = cfg.routed_scaling_factor / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
@@ -227,8 +282,8 @@ def routing_dots(bsz, cfg, y, params):
 
 
 def _sqrtsp_scores(cfg, y):
-    logits = torch.matmul(y.float(), cfg.gate_tensor.float())
-    return F.softplus(logits).sqrt()
+    logits = torch.matmul(y, cfg.gate_tensor)
+    return F.softplus(logits.float()).sqrt()
 
 
 def routing_sqrtsp(bsz, cfg, y, params):
@@ -237,15 +292,8 @@ def routing_sqrtsp(bsz, cfg, y, params):
     kernel serves every batch size (one block per row); bsz 1 reuses the cached output
     buffers, larger batches allocate per call. activate_all_experts (conversion) stays
     torch-composed."""
-    if params.get("activate_all_experts"):
-        scores = _sqrtsp_scores(cfg, y)
-        routing_weights = scores / (scores.sum(dim = -1, keepdim = True) + 1e-20)
-        routing_weights = (routing_weights * cfg.routed_scaling_factor).half()
-        selected_experts = (
-            torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
-            .repeat((bsz, 1))
-        )
-        return selected_experts, routing_weights
+    if params.get("activate_all_experts") or not hasattr(ext, "routing_ds3_nogroup"):
+        return _routing_nogroup_torch(cfg, y, params, _sqrtsp_scores(cfg, y))
     if cfg.gate_tensor_t is None:
         cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
     if bsz == 1:
@@ -291,17 +339,22 @@ def routing_sqrtsp_hash(bsz, cfg, y, params):
     else:
         router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
         routing_weights = torch.empty(selected_experts.shape, dtype = torch.half, device = y.device)
-    ext.routing_sel_norm(
-        y,
-        cfg.gate_tensor,
-        router_logits,
-        selected_experts,
-        routing_weights,
-        cfg.routed_scaling_factor,
-        cfg.gate_tensor_t,
-        ROUTING_ACT_SQRTSP,
-    )
-    return selected_experts, routing_weights
+    if hasattr(ext, "routing_sel_norm"):
+        ext.routing_sel_norm(
+            y,
+            cfg.gate_tensor,
+            router_logits,
+            selected_experts,
+            routing_weights,
+            cfg.routed_scaling_factor,
+            cfg.gate_tensor_t,
+            ROUTING_ACT_SQRTSP,
+        )
+        return selected_experts, routing_weights
+    scores = _sqrtsp_scores(cfg, y)
+    routing_weights = scores.gather(1, selected_experts)
+    routing_weights = routing_weights / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
+    return selected_experts, (routing_weights * cfg.routed_scaling_factor).half()
 
 
 @dataclass
@@ -656,8 +709,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss)
+        has_mgemm = hasattr(ext, "exl3_mgemm")
         self.support_quant_paths = (
-            self.is_quantized and
+            has_mgemm and self.is_quantized and
             (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
@@ -671,7 +725,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             has = [l.inner.bias is not None for l in ls]
             return all(has) or not any(has)
         self.support_bc_bsz1 = (
-            self.is_quantized and
+            has_mgemm and self.is_quantized and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             self.shared_experts is None and
@@ -694,6 +748,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.multi_down.q_cb(),
             )
             self.support_fused = (
+                hasattr(ext, "exl3_moe") and hasattr(ext, "exl3_moe_max_concurrency") and
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
                 self.support_quant_paths
             )

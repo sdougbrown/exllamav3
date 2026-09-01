@@ -72,7 +72,7 @@ Always adding more, stay tuned.
 
 Currently on the to-do list:
 
-- ROCm support
+- Broader ROCm architecture coverage and performance beyond the current experimental backend
 
 As for what is implemented, expect that some things may be a little broken at first. Please be patient, raise issues and/or contribute. 👉👈 
 
@@ -131,10 +131,23 @@ Relevant env variables for building:
 
 ### **Experimental** ROCm (AMD GPUs) support
 
-ROCm support is experimental and performance is significantly reduced compared to CUDA. Install ROCm PyTorch and the ROCm SDK from AMD's wheel index, then build with `ROCM_HOME` pointing at the SDK:
+ROCm support is experimental and performance is significantly reduced compared to CUDA. Install the ROCm SDK and a PyTorch package matching the GPU target from AMD's wheel index. For gfx1100:
 
 ```sh
 pip install rocm[libraries,devel] "torch[device-gfx1100]" --index-url https://repo.amd.com/rocm/whl-multi-arch/
+export PYTORCH_ROCM_ARCH=gfx1100
+```
+
+For gfx1200/gfx1201, select the matching gfx12 PyTorch package and build target. For example, on gfx1201:
+
+```sh
+pip install rocm[libraries,devel] "torch[device-gfx1201]" --index-url https://repo.amd.com/rocm/whl-multi-arch/
+export PYTORCH_ROCM_ARCH=gfx1201
+```
+
+Then build ExLlamaV3 against that environment:
+
+```sh
 pip install -r requirements.txt
 python -m rocm_sdk init
 export ROCM_HOME="$(python -m rocm_sdk path --root)"
@@ -143,7 +156,7 @@ pip install . --no-build-isolation
 
 The gfx1100 path remains correctness-first and uses PyTorch fallbacks for CUDA-specific kernels.
 
-On gfx1200/gfx1201, eligible EXL3 decode calls (`m <= 8`, supported K2/K3/K4 codebooks) use the accelerated HIP WMMA kernel. Other shapes and ROCm architectures fall back to reconstruct+hgemm. Cache and DSA shims are also correctness-first PyTorch implementations, not fused performance kernels.
+On gfx1200/gfx1201, eligible EXL3 decode calls (`m <= 8`, supported K2/K3/K4 codebooks) use the accelerated HIP WMMA kernel. Other shapes and ROCm architectures fall back to reconstruct+hgemm. Cache and DSA shims are also correctness-first PyTorch implementations, not fused performance kernels; this is not CUDA feature or performance parity.
 
 For the gfx12 support envelope, build target, validation commands, and current benchmark scope, see [Experimental gfx12 ROCm decode backend](doc/roc_hip_decode.md).
 

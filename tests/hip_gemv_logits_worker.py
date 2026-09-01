@@ -1,3 +1,4 @@
+import atexit
 import os
 import sys
 from pathlib import Path
@@ -20,14 +21,14 @@ def _roc_available():
     return True
 
 
-def _require_gfx1201():
+def _require_gfx12():
     if not _roc_available():
         raise SystemExit("ROCm build / device not available")
     if not hasattr(ext, "exl3_gemv_supported") or not ext.exl3_gemv_supported(0):
         raise SystemExit("synthetic GEMV oracle is limited to gfx1200/gfx1201")
     arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if not arch.startswith("gfx1201"):
-        raise SystemExit(f"synthetic GEMV oracle is bounded to gfx1201, got {arch or 'unknown'}")
+    if not arch.startswith(("gfx1200", "gfx1201")):
+        raise SystemExit(f"HIP GEMV oracle requires gfx1200/gfx1201, got {arch or 'unknown'}")
 
 
 STEPS = 16
@@ -37,7 +38,7 @@ PROMPT = "The capital of France is"
 def main():
     if not _roc_available():
         raise SystemExit("ROCm build / device not available")
-    _require_gfx1201()
+    _require_gfx12()
     if not os.path.isdir(MODEL):
         raise SystemExit(f"Test model not found: {MODEL}")
 
@@ -51,6 +52,8 @@ def main():
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens=2048, max_batch_size=1)
     model.load(device="cuda")
+    unload_model = model.unload
+    atexit.register(unload_model)
     tokenizer = Tokenizer.from_config(model.config)
     generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
 
@@ -130,7 +133,10 @@ def main():
         raise AssertionError(
             f"expected exactly {STEPS} steps, got {token_ids.shape[-1]} tokens and {logits.shape[1]} logits")
     torch.save({"token_ids": token_ids, "logits": logits, "counts": counts}, output_path)
-    model.unload()
+    try:
+        unload_model()
+    finally:
+        atexit.unregister(unload_model)
 
 
 if __name__ == "__main__":
