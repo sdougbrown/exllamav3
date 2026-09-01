@@ -141,7 +141,11 @@ export ROCM_HOME="$(python -m rocm_sdk path --root)"
 pip install . --no-build-isolation
 ```
 
-ROCm support is functional via PyTorch-native fallbacks for CUDA-specific kernels (tensor-core GEMM, cooperative groups, custom attention). Tested on gfx1100 (RX 7900 XTX).
+The gfx1100 path remains correctness-first and uses PyTorch fallbacks for CUDA-specific kernels.
+
+On gfx1200/gfx1201, eligible EXL3 decode calls (`m <= 8`, supported K2/K3/K4 codebooks) use the accelerated HIP WMMA kernel. Other shapes and ROCm architectures fall back to reconstruct+hgemm. Cache and DSA shims are also correctness-first PyTorch implementations, not fused performance kernels.
+
+For the gfx12 support envelope, build target, validation commands, and current benchmark scope, see [Experimental gfx12 ROCm decode backend](doc/roc_hip_decode.md).
 
 ## Conversion
 
