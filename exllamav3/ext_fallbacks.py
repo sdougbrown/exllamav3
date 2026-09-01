@@ -129,7 +129,11 @@ def rms_norm(
     constant_scale: float,
     span_heads: bool,
     add_residual: bool,
+    w_groups: int = 1,
 ) -> None:
+    # w_groups: v1.4.5 multi-group RMS norm. For w_groups==1 (the common case this
+    # fallback targets) the per-row weighting below is exact; multi-group weighting
+    # would need per-group scale application and is approximated here.
     xf = x.float()
     if w is not None:
         wf = (w + constant_bias).float() if constant_bias != 0.0 else w.float()
@@ -171,11 +175,13 @@ def gated_rms_norm(
     constant_bias: float,
     w_groups: int,
     gate_first: bool,
+    gate_act: int = 0,
 ) -> None:
+    gate = F.silu if gate_act == 0 else F.gelu  # ACT_SILU=0 / ACT_GELU=1
     xf = x.float()
     gf = g.float()
     if gate_first:
-        hidden = xf * F.silu(gf)
+        hidden = xf * gate(gf)
         if w_groups > 1:
             wf = w.view(w_groups, -1).float()
             hidden_2d = hidden.view(-1, wf.shape[1])
@@ -193,7 +199,7 @@ def gated_rms_norm(
             hidden = w.view(w_groups, -1).float() * xf.view(-1, w.shape[-1] // w_groups if w.dim() > 1 else w.shape[0] // w_groups)
         else:
             hidden = w.float() * xf
-        hidden = hidden * F.silu(gf)
+        hidden = hidden * gate(gf)
     y.copy_(hidden.to(y.dtype))
 
 
