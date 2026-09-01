@@ -344,6 +344,12 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             a01[1] = hzero;
             a23[1] = hzero;
 
+#if defined(__gfx1200__) || defined(__gfx1201__)
+            // Every adjacent N tile uses the same A rows for this K slice. Assemble the full
+            // operand before the B tiles reuse the warp-private staging buffer.
+            HipFp16x8 a_frag = assemble_a_frag_gfx12(a01, a23);
+#endif
+
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
             {
@@ -362,7 +368,11 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 // One WMMA covers the full 16x16 tile: f0 = cols 0..7 (b_hi), f1 = cols 8..15
                 // (b_lo); operands are reassembled through the LDS staging inside hip_mma.cuh,
                 // never via lane shuffles
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                mma_ab_h_hip_gfx12_preassembled_a(a_frag, f0, f1, acc[t]);
+#else
                 mma_ab_h_hip(a01, a23, f0, f1, acc[t]);
+#endif
 #else
                 if constexpr (SMEM_STAGE)
                 {
