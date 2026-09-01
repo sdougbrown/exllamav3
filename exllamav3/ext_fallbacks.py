@@ -17,16 +17,37 @@ import torch.nn.functional as F
 
 # -- Activation fused ops (activation.cu) -------------------------------------
 
+def _act_mul(
+    activation: Any,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    z: torch.Tensor,
+    act_limit: float,
+) -> None:
+    """Match act_mul_kernel_{h,f}'s dtype and clamp contract."""
+    if x.dtype not in (torch.float16, torch.float32) or y.dtype != x.dtype:
+        raise TypeError("activation multiply expects matching float16 or float32 inputs")
+    if z.dtype != torch.float16:
+        raise TypeError("activation multiply expects float16 output")
+
+    x_act = activation(x)
+    if act_limit != 0.0:
+        x_act = x_act.clamp(max = act_limit)
+        y = y.clamp(min = -act_limit, max = act_limit)
+    result = x_act * y
+    # The float-input native kernels saturate before the float-to-half store.
+    if x.dtype == torch.float32:
+        result = result.clamp(min = -65504.0, max = 65504.0)
+    z.copy_(result)
+
+
 def silu_mul(
     x: torch.Tensor,
     y: torch.Tensor,
     z: torch.Tensor,
     act_limit: float = 0.0,
 ) -> None:
-    r = F.silu(x) * y
-    if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
-    z.copy_(r)
+    _act_mul(F.silu, x, y, z, act_limit)
 
 def silu_oai_mul(
     x: torch.Tensor,
@@ -54,10 +75,8 @@ def gelu_mul(
     z: torch.Tensor,
     act_limit: float = 0.0,
 ) -> None:
-    r = F.gelu(x, approximate = "tanh") * y
-    if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
-    z.copy_(r)
+    _act_mul(lambda t: F.gelu(t, approximate = "tanh"), x, y, z, act_limit)
+
 
 def relu2_mul(
     x: torch.Tensor,
@@ -65,10 +84,8 @@ def relu2_mul(
     z: torch.Tensor,
     act_limit: float = 0.0,
 ) -> None:
-    r = torch.square(F.relu(x)) * y
-    if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
-    z.copy_(r)
+    _act_mul(lambda t: torch.square(F.relu(t)), x, y, z, act_limit)
+
 
 def relu_mul(
     x: torch.Tensor,
@@ -76,10 +93,7 @@ def relu_mul(
     z: torch.Tensor,
     act_limit: float = 0.0,
 ) -> None:
-    r = F.relu(x) * y
-    if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
-    z.copy_(r)
+    _act_mul(F.relu, x, y, z, act_limit)
 
 def xielu(
     x: torch.Tensor,
@@ -102,6 +116,47 @@ def xielu(
         (torch.expm1(torch.minimum(x, eps)) - x) * n + 0.5 * x,
     )
     y.copy_(r.clamp(min = -65504.0, max = 65504.0))
+
+
+# -- Packed logit bitmask (generator/sampling_fused.cu) -----------------------
+
+def apply_logit_bitmask(
+    logits_in: torch.Tensor,
+    logits_out: torch.Tensor,
+    bitmask: torch.Tensor,
+) -> None:
+    """Copy allowed packed-mask logits and write ``-inf`` everywhere else."""
+    if logits_in.ndim != 2 or not logits_in.is_contiguous():
+        raise ValueError("apply_logit_bitmask: logits must be a contiguous 2-D tensor")
+    if not logits_out.is_contiguous():
+        raise ValueError("apply_logit_bitmask: output must be contiguous")
+    if logits_out.shape != logits_in.shape:
+        raise ValueError("apply_logit_bitmask: shape mismatch")
+    if logits_out.dtype != logits_in.dtype:
+        raise TypeError("apply_logit_bitmask: dtype mismatch")
+    if logits_in.dtype not in (torch.float16, torch.float32):
+        raise TypeError("apply_logit_bitmask: logits must be half or float")
+    if bitmask.dtype != torch.int32 or bitmask.ndim != 2 or not bitmask.is_contiguous():
+        raise ValueError("apply_logit_bitmask: bitmask must be a contiguous 2-D int32 tensor")
+    if bitmask.shape[0] not in (1, logits_in.shape[0]):
+        raise ValueError("apply_logit_bitmask: bad bitmask batch dim")
+    if not (logits_in.is_cuda and logits_out.is_cuda and bitmask.is_cuda):
+        raise ValueError("apply_logit_bitmask: tensors must be GPU-local")
+    if logits_in.device != logits_out.device or logits_in.device != bitmask.device:
+        raise ValueError("apply_logit_bitmask: tensors must be on the same device")
+
+    rows, dim = logits_in.shape
+    indices = torch.arange(dim, device = logits_in.device, dtype = torch.long)
+    word_indices = indices >> 5
+    bit_indices = indices & 31
+    mask_rows = bitmask if bitmask.shape[0] == rows else bitmask.expand(rows, -1)
+    in_width = word_indices < bitmask.shape[1]
+    keep = torch.zeros((rows, dim), dtype = torch.bool, device = logits_in.device)
+    if in_width.any():
+        words = mask_rows[:, word_indices[in_width]].to(torch.int64)
+        keep[:, in_width] = ((words >> bit_indices[in_width]) & 1).bool()
+    logits_out.copy_(logits_in)
+    logits_out.masked_fill_(~keep, float("-inf"))
 
 
 # -- In-place gate ops (activation.cu) -----------------------------------------

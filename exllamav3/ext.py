@@ -190,6 +190,7 @@ if torch.version.hip:
 
     for _name in [
         'silu_mul', 'silu_oai_mul', 'gelu_mul', 'relu2_mul', 'relu_mul', 'xielu',
+        'apply_logit_bitmask',
         'mul_sigmoid_', 'mul_sigmoid_broadcast_', 'mul_softplus_broadcast_',
         'add_sigmoid_gate', 'add_sigmoid_gate_proj', 'deinterleave_qg',
         'rms_norm', 'rms_norm_res_in', 'gated_rms_norm',
