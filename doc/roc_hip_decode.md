@@ -65,6 +65,7 @@ Current local verification on gfx1201 includes:
 - 61 multi-head latent attention (MLA) / DeepSeek sparse attention (DSA) tests
 - 34 native ROCm hyperconnection route, numerical, stream, validation, and fallback tests
 - 43 grouped K3 MoE route, numerical, safety, LoRA, and fallback tests, plus an opt-in full Flash oracle
+- 44 native ROCm shared-gate fusion, stream, validation, and fallback tests
 - forced-identical-context 16-step logits oracles for mul1 and MCG models
 
 The Qwen3.8-27B mul1 oracle reports:
@@ -134,11 +135,13 @@ A dedicated gfx12 batch-one MoE route groups the ten selected K3/mul1 experts in
 
 Two warmed free-running comparisons measured grouped medians of 24.59 and 24.83 tok/s, versus 14.21 and 14.63 tok/s without grouping. Individual grouped trials ranged from 20.03 to 29.95 tok/s because generated token paths select different PLE rows and experts. Under one fixed forced-token path, the median improved from 12.315 to 23.697 tok/s, a reproducible 92.4% gain. The four-token profile reduced K3 GEMV calls from 5,808 to 48 and HIP activities from 43,240 to 13,288.
 
+The scalar shared-expert gate also uses the native fused dot–sigmoid–accumulate kernel on ROCm. This removes 192 small matrix multiplications and 960 device activities over four tokens. Controlled fixed-token decode improved from 26.211 to 29.133 tok/s, while the free-running median improved from 25.851 to 28.670 tok/s.
+
 The grouped path's first real-model layer difference is 1.49e-8 maximum in fp32 output. Qwen4Exp recurrent state amplifies numerical noise. A 16-step fallback repeat measured a 3.63 maximum logit delta and 0.270 mean delta. The grouped pass measured 4.44 and 0.274. Both retained 15/16 top-1 agreement with the reference pass and at least 4/5 top-five overlap. The opt-in full-model oracle includes that fallback control and verifies grouped execution on both gfx1201 devices.
 
-The roughly 24.7 tok/s target-only short-context median is above the historical 19.43 tok/s llama.cpp target-only result for this host. It is not directly comparable to llama.cpp's MTP or long-context sparse-QSA measurements, and those remain faster or unqualified respectively.
+The 28.7 tok/s target-only short-context median is above the historical 19.43 tok/s llama.cpp target-only result for this host. It is not directly comparable to llama.cpp's MTP or long-context sparse-QSA measurements, and those remain faster or unqualified respectively.
 
-This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP has not been enabled, and sparse QSA beyond the short-context dense threshold still needs ROCm qualification. The remaining short-context bottlenecks are launch count, small matrix multiplications, K5 projections, and grouped K3 expert work. Prefill and long-context performance need separate measurements before comparison with sparse QSA serving results.
+This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP has not been enabled, and sparse QSA beyond the short-context dense threshold still needs ROCm qualification. The remaining short-context bottlenecks are launch count, fp16 router projections, K5 projections, and grouped K3 expert work. Prefill and long-context performance need separate measurements before comparison with sparse QSA serving results.
 
 ## MCG compatibility
 
