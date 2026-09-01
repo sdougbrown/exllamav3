@@ -160,7 +160,7 @@ class LinearEXL3:
                         and rows <= EXL3_GEMV_HIP_MAX_M
                         and self.in_features % 128 == 0
                         and self.out_features % 128 == 0
-                        and (2 <= self.K <= 4 or self.K == 6)
+                        and 2 <= self.K <= 6
                         and (self.K == 4 or self.mcg or self.mul1)):
                     return self.hip_gemv(x, out_dtype)
 
