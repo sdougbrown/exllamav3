@@ -5,11 +5,14 @@
 #include <cuda_fp16.h>
 #endif
 #include "exl3_gemv.cuh"
+#include "hadamard.cuh"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#if !defined(USE_ROCM)
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
+#endif
 #include "../util.h"
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
@@ -177,8 +180,8 @@ bool exl3_gemv_try_launch
     int mmode = size_m == 1 ? 0 : 1;
     int num_sms = DevCtx::instance().get_num_sms(device);
 
-    // Cooperative launch: grids are capped at full co-residency (cached per kernel), and the
-    // narrow config's co-residency also feeds the shape heuristic
+    // CUDA's cooperative grid is capped at full co-residency. HIP retains the same grid sizing
+    // for the shape heuristic and grid-stride main loop, but uses an ordinary launch.
     static std::map<void*, int> occ_cache[MAX_DEVICES];
     auto& cache = occ_cache[device];
     auto occupancy = [&] (void* kernel, int block_dim) -> int
@@ -224,7 +227,7 @@ bool exl3_gemv_try_launch
     cuda_check
     (
 #if defined(USE_ROCM)
-        hipLaunchCooperativeKernel
+        hipLaunchKernel
 #else
         cudaLaunchCooperativeKernel
 #endif
@@ -294,7 +297,14 @@ void exl3_gemv
 #endif
     int* locks = DevCtx::instance().get_locks(device);
 
+#if defined(USE_ROCM)
+    at::Tensor A_view = A.view({size_m, size_k});
+    at::Tensor A_had_view = A_had.value().view({size_m, size_k});
+    had_r_128(A_view, A_had_view, suh, c10::nullopt, 1.0f);
+    const half* A_ptr = (const half*) A_had_view.data_ptr();
+#else
     const half* A_ptr = (const half*) A.data_ptr();
+#endif
     const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
     void* C_ptr = (void*) C.data_ptr();
 
@@ -320,6 +330,8 @@ void exl3_gemv
     TORCH_CHECK(ok, "exl3_gemv: call is not eligible for the GEMV kernel");
 
 #if defined(USE_ROCM)
+    at::Tensor C_view = C.view({size_m, size_n});
+    had_r_128(C_view, C_view, c10::nullopt, svh, 1.0f);
     cuda_check(hipPeekAtLastError());
 #else
     cuda_check(cudaPeekAtLastError());
