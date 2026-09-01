@@ -168,9 +168,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
 #if defined(USE_ROCM) || defined(__HIPCC__)
     // HIP: the WMMA fp32 C fragment holds rows 0..7 in lanes 0..15 (one column per lane,
-    // 8 rows across the 8 registers), so the reduction is always 8 rows regardless of mode;
-    // the output stage only reads rows < size_m
-    constexpr int ROWS = EXL3_GEMV_MAX_M;
+    // 8 rows across the 8 registers). MMODE 0 only stages its one valid output row.
+    constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
 #else
     constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
     constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
@@ -437,7 +436,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
                 #pragma unroll
-                for (int r = 0; r < EXL3_GEMV_MAX_M; ++r)
+                for (int r = 0; r < ROWS; ++r)
                     sh_red[warp][r][t * 16 + lane] = acc[t][r];
         }
 #else
