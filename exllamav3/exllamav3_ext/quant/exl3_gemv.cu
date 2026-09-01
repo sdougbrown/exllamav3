@@ -42,6 +42,7 @@ namespace {
 
 constexpr int MOE_HIDDEN = 2560;
 constexpr int MOE_TOP_K = 10;
+constexpr int MOE_MAX_ROWS = 5;
 constexpr int MOE_THREADS = 512;
 constexpr float HAD_SCALE = 0.088388347648f;
 
@@ -54,15 +55,15 @@ void moe_had_rows_kernel
     const int64_t* selected,
     const int64_t* scale_tables_0,
     const int64_t* scale_tables_1,
-    int rows_per_projection,
+    int assignments,
     int width,
     int experts,
-    bool repeated_input
+    bool token_input
 )
 {
     const int matrix = blockIdx.x;
-    const int slot = matrix % rows_per_projection;
-    const int projection = matrix / rows_per_projection;
+    const int slot = matrix % assignments;
+    const int projection = matrix / assignments;
     const int64_t expert = selected[slot];
     const int64_t* scale_table = projection == 0 ? scale_tables_0 : scale_tables_1;
     const size_t output_offset = (size_t) matrix * width + blockIdx.y * 128;
@@ -84,7 +85,7 @@ void moe_had_rows_kernel
     }
 
     const half* scale = reinterpret_cast<const half*>(scale_ptr);
-    const size_t input_row = repeated_input ? 0 : matrix;
+    const size_t input_row = token_input ? slot / MOE_TOP_K : matrix;
     const size_t input_offset = input_row * width + blockIdx.y * 128;
 
     if constexpr (FP32)
@@ -127,14 +128,15 @@ void moe_grouped_gemv_k3_kernel
     void* C,
     int size_k,
     int size_n,
-    int experts
+    int experts,
+    int assignments
 )
 {
     const int slot = blockIdx.y;
     const int projection = TWO_PROJECTIONS ? blockIdx.z : 0;
     const int64_t expert = selected[slot];
     const int64_t* B_table = projection == 0 ? B_table_0 : B_table_1;
-    const size_t matrix = (size_t) projection * MOE_TOP_K + slot;
+    const size_t matrix = (size_t) projection * assignments + slot;
     void* C_row = FP32
         ? static_cast<void*>(reinterpret_cast<float*>(C) + matrix * size_n)
         : static_cast<void*>(reinterpret_cast<half*>(C) + matrix * size_n);
@@ -166,11 +168,16 @@ __global__ void moe_weighted_reduce_kernel
     int width
 )
 {
+    const int row = blockIdx.y;
+    rows += (size_t) row * MOE_TOP_K * width;
+    selected += row * MOE_TOP_K;
+    weights += row * MOE_TOP_K;
+    output += (size_t) row * width;
     for (int col = blockIdx.x * blockDim.x + threadIdx.x;
          col < width; col += blockDim.x * gridDim.x)
     {
-        // Match the established bsz1 fallback's expert-sorted accumulation order. Ties
-        // retain their routing-slot order, so duplicate assignments remain distinct.
+        // Match the established fallback's expert-sorted accumulation order independently
+        // for each token. Ties retain routing-slot order, so duplicates remain distinct.
         unsigned used = 0;
         float sum = 0.0f;
         #pragma unroll
@@ -248,17 +255,20 @@ void exl3_moe_gfx12_k3
     TORCH_CHECK(exl3_gemv_supported(device), "exl3_moe_gfx12_k3 requires gfx1200/gfx1201");
 
     TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.dtype() == at::kHalf &&
-                A.numel() == MOE_HIDDEN && A.size(-1) == MOE_HIDDEN,
-                "exl3_moe_gfx12_k3 requires one contiguous fp16 row of width 2560");
+                A.dim() == 2 && A.size(1) == MOE_HIDDEN &&
+                A.size(0) >= 1 && A.size(0) <= MOE_MAX_ROWS,
+                "exl3_moe_gfx12_k3 requires contiguous fp16[R, 2560], R=1..5");
+    const int rows = A.size(0);
+    const int assignments = rows * MOE_TOP_K;
     TORCH_CHECK(output.device() == A.device() && output.is_contiguous() && output.dtype() == at::kFloat &&
-                output.numel() == MOE_HIDDEN,
-                "exl3_moe_gfx12_k3 output must be contiguous fp32[1, 2560]");
+                output.dim() == 2 && output.size(0) == rows && output.size(1) == MOE_HIDDEN,
+                "exl3_moe_gfx12_k3 output must be contiguous fp32[R, 2560]");
     TORCH_CHECK(selected.device() == A.device() && selected.is_contiguous() && selected.dtype() == at::kLong &&
-                selected.numel() == MOE_TOP_K,
-                "exl3_moe_gfx12_k3 selected must be contiguous device int64[1, 10]");
+                selected.dim() == 2 && selected.size(0) == rows && selected.size(1) == MOE_TOP_K,
+                "exl3_moe_gfx12_k3 selected must be contiguous device int64[R, 10]");
     TORCH_CHECK(weights.device() == A.device() && weights.is_contiguous() && weights.dtype() == at::kHalf &&
-                weights.numel() == MOE_TOP_K,
-                "exl3_moe_gfx12_k3 weights must be contiguous device fp16[1, 10]");
+                weights.dim() == 2 && weights.size(0) == rows && weights.size(1) == MOE_TOP_K,
+                "exl3_moe_gfx12_k3 weights must be contiguous device fp16[R, 10]");
 
     const int64_t experts = gate_trellis.numel();
     TORCH_CHECK(experts > 0, "exl3_moe_gfx12_k3 requires nonempty expert tables");
@@ -272,21 +282,23 @@ void exl3_moe_gfx12_k3
     check_ptr_table(down_suh, experts, A.device(), "down_suh");
     check_ptr_table(down_svh, experts, A.device(), "down_svh");
 
-    const int intermediate = down_had.numel() / MOE_TOP_K;
+    TORCH_CHECK(down_had.numel() % assignments == 0,
+                "down_had has the wrong shape");
+    const int intermediate = down_had.numel() / assignments;
     TORCH_CHECK(intermediate == 640 || intermediate == 768,
                 "exl3_moe_gfx12_k3 intermediate width must be 640 or 768");
     TORCH_CHECK(gu_had.device() == A.device() && gu_had.is_contiguous() && gu_had.dtype() == at::kHalf &&
-                gu_had.numel() == 2 * MOE_TOP_K * MOE_HIDDEN,
-                "gu_had must be contiguous fp16[2, 10, 2560]");
+                gu_had.numel() == 2 * assignments * MOE_HIDDEN,
+                "gu_had must be contiguous fp16[2 * R * 10, 2560]");
     TORCH_CHECK(gu_out.device() == A.device() && gu_out.is_contiguous() && gu_out.dtype() == at::kHalf &&
-                gu_out.numel() == 2 * MOE_TOP_K * intermediate,
+                gu_out.numel() == 2 * assignments * intermediate,
                 "gu_out has the wrong shape");
     TORCH_CHECK(down_had.device() == A.device() && down_had.is_contiguous() && down_had.dtype() == at::kHalf &&
-                down_had.numel() == MOE_TOP_K * intermediate,
+                down_had.numel() == assignments * intermediate,
                 "down_had has the wrong shape");
     TORCH_CHECK(down_out.device() == A.device() && down_out.is_contiguous() && down_out.dtype() == at::kFloat &&
-                down_out.numel() == MOE_TOP_K * MOE_HIDDEN,
-                "down_out must be contiguous fp32[10, 2560]");
+                down_out.numel() == assignments * MOE_HIDDEN,
+                "down_out must be contiguous fp32[R * 10, 2560]");
 
     check_moe_alignment(A, "A");
     check_moe_alignment(output, "output");
@@ -310,39 +322,39 @@ void exl3_moe_gfx12_k3
     const int64_t* dsuh = reinterpret_cast<const int64_t*>(down_suh.data_ptr());
     const int64_t* dsvh = reinterpret_cast<const int64_t*>(down_svh.data_ptr());
 
-    dim3 had_gu_grid(2 * MOE_TOP_K, MOE_HIDDEN / 128);
+    dim3 had_gu_grid(2 * assignments, MOE_HIDDEN / 128);
     moe_had_rows_kernel<true, false><<<had_gu_grid, 32, 0, stream>>>
     (A.data_ptr(), gu_had.data_ptr(), selected_ptr, gsuh, usuh,
-     MOE_TOP_K, MOE_HIDDEN, experts, true);
+     assignments, MOE_HIDDEN, experts, true);
 
-    dim3 gu_grid(intermediate / 32, MOE_TOP_K, 2);
+    dim3 gu_grid(intermediate / 32, assignments, 2);
     moe_grouped_gemv_k3_kernel<false, true><<<gu_grid, MOE_THREADS, 0, stream>>>
     (reinterpret_cast<const half*>(gu_had.data_ptr()), selected_ptr, gt, ut,
-     gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts);
+     gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
 
-    moe_had_rows_kernel<false, false><<<dim3(2 * MOE_TOP_K, intermediate / 128), 32, 0, stream>>>
+    moe_had_rows_kernel<false, false><<<dim3(2 * assignments, intermediate / 128), 32, 0, stream>>>
     (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, gsvh, usvh,
-     MOE_TOP_K, intermediate, experts, false);
+     assignments, intermediate, experts, false);
 
-    const int activation_count = MOE_TOP_K * intermediate;
+    const int activation_count = assignments * intermediate;
     const half* gu_ptr = reinterpret_cast<const half*>(gu_out.data_ptr());
     moe_silu_mul_kernel<<<CEIL_DIVIDE(activation_count, 256), 256, 0, stream>>>
     (gu_ptr, gu_ptr + activation_count, reinterpret_cast<half*>(down_had.data_ptr()), activation_count);
 
-    moe_had_rows_kernel<true, false><<<dim3(MOE_TOP_K, intermediate / 128), 32, 0, stream>>>
+    moe_had_rows_kernel<true, false><<<dim3(assignments, intermediate / 128), 32, 0, stream>>>
     (down_had.data_ptr(), down_had.data_ptr(), selected_ptr, dsuh, dsuh,
-     MOE_TOP_K, intermediate, experts, false);
+     assignments, intermediate, experts, false);
 
-    dim3 down_grid(MOE_HIDDEN / 32, MOE_TOP_K, 1);
+    dim3 down_grid(MOE_HIDDEN / 32, assignments, 1);
     moe_grouped_gemv_k3_kernel<true, false><<<down_grid, MOE_THREADS, 0, stream>>>
     (reinterpret_cast<const half*>(down_had.data_ptr()), selected_ptr, dt, dt,
-     down_out.data_ptr(), intermediate, MOE_HIDDEN, experts);
+     down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
 
-    moe_had_rows_kernel<false, true><<<dim3(MOE_TOP_K, MOE_HIDDEN / 128), 32, 0, stream>>>
+    moe_had_rows_kernel<false, true><<<dim3(assignments, MOE_HIDDEN / 128), 32, 0, stream>>>
     (down_out.data_ptr(), down_out.data_ptr(), selected_ptr, dsvh, dsvh,
-     MOE_TOP_K, MOE_HIDDEN, experts, false);
+     assignments, MOE_HIDDEN, experts, false);
 
-    moe_weighted_reduce_kernel<<<CEIL_DIVIDE(MOE_HIDDEN, 256), 256, 0, stream>>>
+    moe_weighted_reduce_kernel<<<dim3(CEIL_DIVIDE(MOE_HIDDEN, 256), rows), 256, 0, stream>>>
     (reinterpret_cast<const float*>(down_out.data_ptr()), selected_ptr, weights_ptr,
      reinterpret_cast<float*>(output.data_ptr()), MOE_HIDDEN);
     cuda_check(hipPeekAtLastError());

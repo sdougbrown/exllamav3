@@ -28,6 +28,7 @@ ROUTING_ACT_SQRTSP = 1
 _HIP_ROUTER_HIDDEN = 2560
 _HIP_ROUTER_EXPERTS = 512
 _HIP_ROUTER_TOP_K = 10
+_HIP_GROUPED_MAX_ROWS = 5
 
 
 def _hip_router_device_supported(device):
@@ -936,17 +937,20 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.experts_cfg = cfg
 
         if self.support_hip_grouped:
+            max_assignments = _HIP_GROUPED_MAX_ROWS * numex
+            # Projection-major flat storage keeps every prefix slice contiguous for R=1..5.
+            # All layers on a device share these max-sized cache entries; calls only take views.
             self.hip_grouped_buffers = HIPGroupedBuffers(
                 gu_had = g_tensor_cache.get(
-                    device, (2, numex, H), torch.half, "moe_gfx12_gu_had"),
+                    device, (2 * max_assignments, H), torch.half, "moe_gfx12_gu_had"),
                 gu_out = g_tensor_cache.get(
-                    device, (2, numex, I), torch.half, "moe_gfx12_gu_out"),
+                    device, (2 * max_assignments, I), torch.half, "moe_gfx12_gu_out"),
                 down_had = g_tensor_cache.get(
-                    device, (numex, I), torch.half, "moe_gfx12_down_had"),
+                    device, (max_assignments, I), torch.half, "moe_gfx12_down_had"),
                 down_out = g_tensor_cache.get(
-                    device, (numex, H), torch.float, "moe_gfx12_down_out"),
+                    device, (max_assignments, H), torch.float, "moe_gfx12_down_out"),
                 output = g_tensor_cache.get(
-                    device, (1, H), torch.float, "moe_gfx12_output"),
+                    device, (_HIP_GROUPED_MAX_ROWS, H), torch.float, "moe_gfx12_output"),
             )
 
         if (self.support_quant_paths or self.support_bc_bsz1) \
@@ -1246,19 +1250,30 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
 
-        # gfx12 grouped decode path: selected IDs and weights stay on-device, and every
-        # selected slot remains distinct so duplicates and routing order retain their semantics.
+        # gfx12 grouped decode/verification path: selected IDs and weights stay on-device,
+        # and every row-major assignment slot remains distinct. Router-native remains bsz1;
+        # the standard router above intentionally falls back to torch for verification rows.
         elif (
-            bsz == 1 and self.support_hip_grouped and self.tp_mode is None and self.act_limit == 0 and
+            1 <= bsz <= _HIP_GROUPED_MAX_ROWS and self.support_hip_grouped and
+            self.tp_mode is None and self.act_limit == 0 and
+            tuple(y.shape) == (bsz, _HIP_ROUTER_HIDDEN) and y.dtype == torch.half and
+            tuple(selected_experts.shape) == (bsz, _HIP_ROUTER_TOP_K) and
+            selected_experts.dtype == torch.long and
+            tuple(routing_weights.shape) == (bsz, _HIP_ROUTER_TOP_K) and
+            routing_weights.dtype == torch.half and
+            y.is_contiguous() and selected_experts.is_contiguous() and routing_weights.is_contiguous() and
             os.environ.get("EXL3_HIP_GROUPED_MOE", "1") != "0" and
+            (bsz == 1 or os.environ.get("EXL3_HIP_GROUPED_MOE_MULTIROW", "1") != "0") and
             os.environ.get("EXL3_GEMV", "1") != "0" and
             not params.get("activate_all_experts") and
             not params.get("reconstruct") and not params.get("autosplit_measure")
         ):
             buffers = self.hip_grouped_buffers
+            assignments = bsz * _HIP_ROUTER_TOP_K
+            output = buffers.output[:bsz]
             ext.exl3_moe_gfx12_k3(
                 y,
-                buffers.output,
+                output,
                 selected_experts,
                 routing_weights,
                 self.multi_gate.ptrs_trellis,
@@ -1270,12 +1285,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.multi_down.ptrs_trellis,
                 self.multi_down.ptrs_suh,
                 self.multi_down.ptrs_svh,
-                buffers.gu_had,
-                buffers.gu_out,
-                buffers.down_had,
-                buffers.down_out,
+                buffers.gu_had[:2 * assignments],
+                buffers.gu_out[:2 * assignments],
+                buffers.down_had[:assignments],
+                buffers.down_out[:assignments],
             )
-            final_hidden_states = buffers.output.view(x.shape)
+            final_hidden_states = output.view(x.shape)
 
         # Torch/C++/fused path
         elif (
