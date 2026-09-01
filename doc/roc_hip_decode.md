@@ -10,8 +10,8 @@ The runtime gate in `exllamav3.modules.quant.exl3.LinearEXL3` sends a layer to H
 - the GPU is `gfx1200` or `gfx1201`;
 - the decode batch is `rows <= 8`;
 - `in_features` and `out_features` are both multiples of 128;
-- `K` is 2, 3, 4, or 6;
-- the existing codebook flags match the instantiated family (`mcg` / `mul1` when required); K6 requires one of those two codebooks.
+- `K` is from 2 through 6;
+- the existing codebook flags match the instantiated family (`mcg` / `mul1` when required); K5 and K6 require one of those two codebooks.
 
 On those gfx12 devices, the real EXL3 decode kernel uses `v_wmma_f32_16x16x16_f16` with fp32 accumulation. That is the supported ROCm acceleration path here; it is not a general matrix fused multiply-add (MFMA) backend.
 
@@ -60,7 +60,7 @@ Out of scope for this backend slice:
 
 Current local verification on gfx1201 includes:
 
-- 69 GEMV matrix, routing, codebook, and K6 vocabulary-head tests per model fixture
+- 98 GEMV matrix, routing, codebook, K5, and K6 tests per model fixture
 - 88 cache / reconstruct tests
 - 61 multi-head latent attention (MLA) / DeepSeek sparse attention (DSA) tests
 - forced-identical-context 16-step logits oracles for mul1 and MCG models
@@ -112,6 +112,19 @@ Steady-state profiles after prefill show the K6 vocabulary head changing from re
 A-fragment reuse reduces total self GPU time from 423.119 to 400.882 ms for the eight-step Qwen3.8 profile. The dominant K4 mul1/fp16 wide kernel falls from 163.596 to 154.410 ms. For the twelve-step Qwen3.5 profile, time falls from 217.324 to 197.155 ms. Its K4 MCG/fp32 narrow kernel falls from 67.561 to 57.072 ms.
 
 The one-row reduction lowers the Qwen3.8 wide K4 kernel again, from 154.413 to 140.053 ms in a controlled profile. The corresponding Qwen3.5 wide K4 kernel falls from 51.207 to 42.012 ms; its narrow kernel is effectively unchanged.
+
+## Qwen3.8-Flash-Next target
+
+The `turboderp/Qwen3.8-Flash-Next-exl3` 3.05-bpw checkpoint runs target-only with a layer split across two gfx1201 GPUs. Its 32.64-GB PLE n-gram table stays file-backed and streams only selected rows. A balanced 27/27-GB load budget allocated approximately 28.6 and 24.4 GB on the two GPUs with a 32K cache.
+
+A short greedy smoke produced `Paris. Paris is the capital` and executed the direct EXL3 route. Adding K5 support moves the model's high-quality shared-expert and other K5 projections off reconstruct+hgemm:
+
+- warmed target-only decode: 6.588 to 7.687 tok/s, a 16.7% gain;
+- four-token self-device profile: 875.654 to 752.568 ms, a 14.1% reduction;
+- K5 reconstruction: 1,232 launches to zero;
+- real shared-expert gate/up/down K5 projections match reconstruct+hgemm on both gfx1201 devices.
+
+This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP has not been enabled, and sparse QSA beyond the short-context dense threshold still needs ROCm qualification. The remaining short-context bottlenecks are small fp16 matrix multiplications, launch count, and K3 expert GEMV.
 
 ## MCG compatibility
 

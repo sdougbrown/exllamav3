@@ -154,8 +154,8 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
 #if defined(USE_ROCM) || defined(__HIPCC__)
-    static_assert(bits == 2 || bits == 3 || bits == 4 || bits == 6,
-                  "HIP exl3_gemv_kernel supports 2, 3, 4 and 6 bpw");
+    static_assert(bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6,
+                  "HIP exl3_gemv_kernel supports 2, 3, 4, 5 and 6 bpw");
 #else
     static_assert(bits == 2 || bits == 3 || bits == 4,
                   "CUDA exl3_gemv_kernel supports 2, 3 and 4 bpw");
@@ -176,6 +176,17 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 #endif
 
     constexpr int TWORDS = 8 * bits;                        // uint32 per 16x16 tile
+#if defined(USE_ROCM) || defined(__HIPCC__)
+    constexpr int LSTRIDE = bits == 3 ? 24 : 32;            // uint32 per lane-wide load
+    constexpr int LOADS = bits == 2 ? WNT / 2 :
+                          bits == 5 ? (WNT * TWORDS + LSTRIDE - 1) / LSTRIDE :
+                          bits == 6 ? WNT * 3 / 2 : WNT;
+    static_assert((bits != 2 && bits != 6) || WNT % 2 == 0,
+                  "2 bpw and 6 bpw lane-wide loads require an even tile count");
+    static_assert(LOADS * LSTRIDE >= WNT * TWORDS &&
+                  LOADS * LSTRIDE < WNT * TWORDS + LSTRIDE,
+                  "lane-wide loads must cover the staged tiles with at most one padded tail");
+#else
     constexpr int LOADS = bits == 2 ? WNT / 2 :
                           bits == 6 ? WNT * 3 / 2 : WNT;     // lane-wide loads per k-slice
     constexpr int LSTRIDE = bits == 3 ? 24 : 32;            // uint32 per load
@@ -183,6 +194,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                   "2 bpw and 6 bpw lane-wide loads require an even tile count");
     static_assert(LOADS * LSTRIDE == WNT * TWORDS,
                   "lane-wide loads must cover each staged tile exactly");
+#endif
 
 #if !defined(USE_ROCM) && !defined(__HIPCC__)
     auto grid = cooperative_groups::this_grid();
@@ -265,11 +277,11 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         auto ld_b = [&] (int i, int l) -> uint32_t
         {
 #if defined(USE_ROCM) || defined(__HIPCC__)
-            // no DCS load on HIP; plain load
-            if constexpr (bits == 3)
-                return lane < 24 ? *(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
-            else
-                return *(bp + (size_t) i * slice_stride + l * LSTRIDE);
+            // K5's narrow configuration has a 16-word padded tail. Guard every staged
+            // word so the last output group cannot read into the next slice or past B.
+            const int stage_word = l * LSTRIDE + lane;
+            return lane < LSTRIDE && stage_word < WNT * TWORDS
+                ? *(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
 #else
             if constexpr (bits == 3)
                 return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
@@ -316,12 +328,16 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             }
 
 #if defined(USE_ROCM) || defined(__HIPCC__)
-            // Staged extraction: write the tile words to warp-private smem, then decode
+            // Staged extraction: write valid tile words to warp-private smem, then decode.
+            // The padded K5 tail is never read or written.
             __syncwarp();
             #pragma unroll
             for (int l = 0; l < LOADS; ++l)
-                if (bits != 3 || lane < 24)
-                    sh_stage[warp][l * LSTRIDE + lane] = bw[l];
+            {
+                const int stage_word = l * LSTRIDE + lane;
+                if (lane < LSTRIDE && stage_word < WNT * TWORDS)
+                    sh_stage[warp][stage_word] = bw[l];
+            }
             __syncwarp();
 #else
             if constexpr (SMEM_STAGE)
@@ -355,8 +371,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 FragB f0, f1;
 #if defined(USE_ROCM) || defined(__HIPCC__)
                 const uint32_t* tp = &sh_stage[warp][t * TWORDS];
-                if constexpr (bits == 6)
-                    dq_dispatch<6, cb>(tp, lane * 8, f0, f1);
+                if constexpr (bits == 5 || bits == 6)
+                    dq_dispatch<bits, cb>(tp, lane * 8, f0, f1);
                 else if constexpr (bits == 4)
                     exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
                 else if constexpr (bits == 2)

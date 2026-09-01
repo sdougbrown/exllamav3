@@ -63,14 +63,18 @@ def _roc_available():
     return True
 
 
-def _require_gfx12():
+def _require_gfx12(device=0):
     if not _roc_available():
         pytest.skip("ROCm build / device not available")
-    if not hasattr(ext, "exl3_gemv_supported") or not ext.exl3_gemv_supported(0):
-        pytest.skip("synthetic GEMV oracle is limited to gfx1200/gfx1201")
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if not arch.startswith(("gfx1200", "gfx1201")):
+    arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    if arch.split(":", 1)[0] not in ("gfx1200", "gfx1201"):
         pytest.skip(f"HIP GEMV oracle requires gfx1200/gfx1201, got {arch or 'unknown'}")
+    assert hasattr(ext, "exl3_gemv"), \
+        "gfx12 target build is missing the required ext.exl3_gemv binding"
+    assert hasattr(ext, "exl3_gemv_supported"), \
+        "gfx12 target build is missing the required ext.exl3_gemv_supported binding"
+    assert ext.exl3_gemv_supported(device), \
+        f"ext.exl3_gemv_supported rejected gfx12 device {device} ({arch})"
 
 
 @pytest.fixture(scope="module")
@@ -216,6 +220,22 @@ def test_hip_gemv_direct_binding_accepts_rank3_inputs():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
 
 
+@torch.inference_mode()
+def test_hip_gemv_k5_plain_codebook_is_rejected():
+    """K5 requires the MCG or mul1 codebook; cb0 remains unsupported."""
+    _require_gfx12()
+    size = 128
+    A = torch.randn((1, size), dtype=torch.float16, device="cuda") * 1e-3
+    B = torch.full((size // 16, size // 16, 5 * 16), 0x1111,
+                   dtype=torch.int16, device="cuda")
+    signs = torch.ones((size,), dtype=torch.float16, device="cuda")
+    actual = torch.empty((1, size), dtype=torch.float16, device="cuda")
+    A_had = torch.empty_like(A)
+
+    with pytest.raises(RuntimeError, match="not eligible"):
+        ext.exl3_gemv(A, B, actual, signs, A_had, signs, False, False)
+
+
 @pytest.mark.parametrize(
     "mcg, multiplier, addend",
     [
@@ -341,6 +361,95 @@ def test_hip_gemv_k6_synthetic_oracle(mcg, mul1, size_n, batch_size, out_dtype):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
 
 
+def _make_distinct_finite_trellis(K, size_k, size_n, device="cuda"):
+    """Build a unique, finite packed stream for every (K-slice, N-tile)."""
+    kslices = size_k // 16
+    ntiles = size_n // 16
+    tile_id = torch.arange(kslices * ntiles, dtype=torch.int64).view(kslices, ntiles, 1)
+    word = torch.arange(K * 16, dtype=torch.int64).view(1, 1, K * 16)
+    mixed = tile_id * 1103515245 + word * 12345 + tile_id * word * 2654435761
+    choices = ((mixed ^ (mixed >> 16)) >> 8) & 3
+    # The first eight base-4 digits encode tile_id, guaranteeing distinct streams for
+    # every shape in this suite while retaining only known-finite packed words.
+    choices = torch.where(word < 8, (tile_id >> (2 * word)) & 3, choices)
+    palette = torch.tensor([0x1111, 0x2222, 0x5555, 0x2492], dtype=torch.int16)
+    return palette[choices].to(device)
+
+
+def _assert_reconstructed_tiles_differ(weight):
+    tiles = [weight[:16, :16], weight[16:32, :16], weight[:16, 16:32]]
+    assert all(not torch.equal(a, b) for i, a in enumerate(tiles) for b in tiles[i + 1:]), \
+        "representative reconstructed 16x16 tiles unexpectedly alias"
+
+
+def _run_k5_synthetic_oracle(mcg, mul1, size_k, size_n, batch_size, out_dtype):
+    from exllamav3.modules.quant.exl3 import LinearEXL3
+
+    torch.manual_seed(5000 + size_k + size_n + 10 * mcg + 100 * mul1 + batch_size)
+    K = 5
+    trellis = _make_distinct_finite_trellis(K, size_k, size_n)
+    suh = (torch.randint(0, 2, (size_k,), device="cuda") * 2 - 1).to(torch.float16)
+    svh = (torch.randint(0, 2, (size_n,), device="cuda") * 2 - 1).to(torch.float16)
+    codebook = torch.ones((), dtype=torch.int32, device="cuda")
+    linear = LinearEXL3(None, size_k, size_n, suh=suh, svh=svh, trellis=trellis,
+                        mcg=codebook if mcg else None, mul1=codebook if mul1 else None)
+    x = torch.randn((1, batch_size, size_k), dtype=torch.float16, device="cuda") * 1e-3
+
+    # Validate that the oracle data really exercises different tile streams before using
+    # reconstruction as the direct-kernel comparison target.
+    weight = torch.empty((size_k, size_n), dtype=torch.float16, device="cuda")
+    ext.reconstruct(weight, trellis, K, mcg, mul1)
+    assert torch.isfinite(weight).all()
+    _assert_reconstructed_tiles_differ(weight)
+    expected = linear.forward(x, {"reconstruct": True}, out_dtype)
+
+    calls, restore = _spy_ext_route()
+    try:
+        actual = linear.forward(x, {"reconstruct": False}, out_dtype)
+    finally:
+        restore()
+    assert calls["gemv"] == 1
+    assert calls["reconstruct"] == 0
+    assert calls["reconstruct_slice"] == 0
+    assert calls["reconstruct_had_slice"] == 0
+    assert calls["hgemm"] == 0
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
+
+
+@pytest.mark.parametrize(
+    "mcg, mul1",
+    [
+        pytest.param(True, False, id="mcg"),
+        pytest.param(False, True, id="mul1"),
+    ],
+)
+@pytest.mark.parametrize("size_n", [128, 8320], ids=["cfg0-exact-tail", "cfg1"])
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32], ids=["fp16", "fp32"])
+@torch.inference_mode()
+def test_hip_gemv_k5_synthetic_oracle(mcg, mul1, size_n, batch_size, out_dtype):
+    """The full m1/2/8 and fp16/fp32 K5 matrix matches reconstruct+hgemm."""
+    _require_gfx12()
+    _run_k5_synthetic_oracle(mcg, mul1, 128, size_n, batch_size, out_dtype)
+
+
+@pytest.mark.parametrize(
+    "mcg, mul1",
+    [
+        pytest.param(True, False, id="mcg"),
+        pytest.param(False, True, id="mul1"),
+    ],
+)
+@pytest.mark.parametrize("size_n", [128, 8320], ids=["cfg0-exact-tail", "cfg1"])
+@torch.inference_mode()
+def test_hip_gemv_k5_prefetch_refill(mcg, mul1, size_n):
+    """K5 remains correct after both launch configurations refill their prefetch rings."""
+    _require_gfx12()
+    _run_k5_synthetic_oracle(mcg, mul1, 1152, size_n, 1, torch.float16)
+
+
 @pytest.mark.parametrize("test_key", TEST_KEYS)
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @torch.inference_mode()
@@ -432,12 +541,12 @@ def test_hip_gemv_k6_lm_head_matches_reference(model, batch_size, out_dtype):
 
 
 @torch.inference_mode()
-def test_hip_gemv_k5_falls_back():
-    """K5 remains outside the HIP kernel family and uses reconstruct+hgemm."""
+def test_hip_gemv_k7_falls_back():
+    """K7 remains outside the HIP kernel family and uses reconstruct+hgemm."""
     from exllamav3.modules.quant.exl3 import LinearEXL3
 
     _require_gfx12()
-    K = 5
+    K = 7
     size = 128
     trellis = torch.full((size // 16, size // 16, K * 16), 0x1111,
                          dtype=torch.int16, device="cuda")
