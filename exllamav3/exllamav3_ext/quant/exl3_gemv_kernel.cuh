@@ -150,8 +150,13 @@ __device__ __forceinline__ void dq8_regs_3bits(uint32_t a, uint32_t b, int s2, F
 }  // namespace exl3_gemv_ns
 
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>
+#if defined(USE_ROCM) || defined(__HIPCC__)
+__device__ __forceinline__
+void exl3_gemv_kernel_body(EXL3_GEMM_ARGS)
+#else
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
+#endif
 {
 #if defined(USE_ROCM) || defined(__HIPCC__)
     static_assert(bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6,
@@ -525,3 +530,13 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     }
 #endif
 }
+
+#if defined(USE_ROCM) || defined(__HIPCC__)
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256)
+void exl3_gemv_kernel(EXL3_GEMM_ARGS)
+{
+    exl3_gemv_kernel_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE>
+    (A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh);
+}
+#endif

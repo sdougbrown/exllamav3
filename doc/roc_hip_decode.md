@@ -63,6 +63,8 @@ Current local verification on gfx1201 includes:
 - 98 GEMV matrix, routing, codebook, K5, and K6 tests per model fixture
 - 88 cache / reconstruct tests
 - 61 multi-head latent attention (MLA) / DeepSeek sparse attention (DSA) tests
+- 34 native ROCm hyperconnection route, numerical, stream, validation, and fallback tests
+- 43 grouped K3 MoE route, numerical, safety, LoRA, and fallback tests, plus an opt-in full Flash oracle
 - forced-identical-context 16-step logits oracles for mul1 and MCG models
 
 The Qwen3.8-27B mul1 oracle reports:
@@ -124,7 +126,19 @@ A short greedy smoke produced `Paris. Paris is the capital` and executed the dir
 - K5 reconstruction: 1,232 launches to zero;
 - real shared-expert gate/up/down K5 projections match reconstruct+hgemm on both gfx1201 devices.
 
-This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP has not been enabled, and sparse QSA beyond the short-context dense threshold still needs ROCm qualification. The remaining short-context bottlenecks are small fp16 matrix multiplications, launch count, and K3 expert GEMV.
+The existing fused GatedResidual and hyperconnection kernels are also available on wave32 ROCm devices. They replace the decode reference path's small matrix multiplications and elementwise chains with two `gr_mix` launches and one in-place `hc_apply` launch per residual site. Unsupported wave sizes retain the PyTorch path. In a controlled same-process comparison, fusion improved the 32-token median from 7.787 to 14.085 tok/s. Over four tokens, it reduced `aten::mm` from 1,552 to 392 calls and removed 7,736 HIP launches. A separate fresh-process run measured a 13.553 tok/s median.
+
+Keeping the PLE table in RAM did not improve that fresh-process result: disk streaming measured 13.553 tok/s versus 13.410 tok/s from RAM. RAM residency also increased model load time from 17.0 to 30.9 seconds. The streamed path remains the recommended default and avoids reserving 32.64 GB of host memory.
+
+A dedicated gfx12 batch-one MoE route groups the ten selected K3/mul1 experts into device-resident gate/up/down launches. It preserves duplicate expert slots and uses a deterministic fp32 weighted reduction. Strict eligibility keeps batch, conversion, TP, LoRA, activation-limit, unsupported-shape, and non-gfx12 calls on the established path.
+
+Two warmed free-running comparisons measured grouped medians of 24.59 and 24.83 tok/s, versus 14.21 and 14.63 tok/s without grouping. Individual grouped trials ranged from 20.03 to 29.95 tok/s because generated token paths select different PLE rows and experts. Under one fixed forced-token path, the median improved from 12.315 to 23.697 tok/s, a reproducible 92.4% gain. The four-token profile reduced K3 GEMV calls from 5,808 to 48 and HIP activities from 43,240 to 13,288.
+
+The grouped path's first real-model layer difference is 1.49e-8 maximum in fp32 output. Qwen4Exp recurrent state amplifies numerical noise. A 16-step fallback repeat measured a 3.63 maximum logit delta and 0.270 mean delta. The grouped pass measured 4.44 and 0.274. Both retained 15/16 top-1 agreement with the reference pass and at least 4/5 top-five overlap. The opt-in full-model oracle includes that fallback control and verifies grouped execution on both gfx1201 devices.
+
+The roughly 24.7 tok/s target-only short-context median is above the historical 19.43 tok/s llama.cpp target-only result for this host. It is not directly comparable to llama.cpp's MTP or long-context sparse-QSA measurements, and those remain faster or unqualified respectively.
+
+This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP has not been enabled, and sparse QSA beyond the short-context dense threshold still needs ROCm qualification. The remaining short-context bottlenecks are launch count, small matrix multiplications, K5 projections, and grouped K3 expert work. Prefill and long-context performance need separate measurements before comparison with sparse QSA serving results.
 
 ## MCG compatibility
 
