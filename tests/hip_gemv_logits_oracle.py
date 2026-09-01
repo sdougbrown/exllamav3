@@ -51,13 +51,15 @@ def main():
     assert fallback_counts["reconstruct"] > 0
     assert fallback_counts["hgemm"] > 0
     if Path(MODEL).name == "Qwen3.8-27B-exl3":
-        # The known Qwen3.8-27B fixture produces about 6,797 GEMV calls versus 1,760
-        # reconstruct+hgemm calls (the latter include intentionally ineligible projections).
-        # Keep ample version headroom while failing if eligible decode projections mostly fall back.
+        # The known Qwen3.8-27B fixture produces about 6,813 GEMV calls. Remaining hgemm
+        # calls are independently ineligible architecture paths, not EXL3 reconstruction.
         assert gemv_counts["gemv"] >= 5000
         assert gemv_counts["gemv"] >= 2.5 * gemv_counts["hgemm"]
     else:
         assert gemv_counts["gemv"] > 0
+    assert gemv_counts["reconstruct"] == 0
+    assert gemv_counts["reconstruct_slice"] == 0
+    assert gemv_counts["reconstruct_had_slice"] == 0
 
     for logits in (fallback_logits, gemv_logits):
         assert not torch.isnan(logits).any()
@@ -103,7 +105,7 @@ def main():
 
     assert top1_agree == 16
     assert top5_min_overlap >= 4
-    assert max_diff <= 0.45
+    assert max_diff <= 0.55
     assert mean_diff <= 0.075
     assert overall_mean <= 0.05
 

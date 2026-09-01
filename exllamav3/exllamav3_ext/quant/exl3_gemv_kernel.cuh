@@ -153,7 +153,13 @@ template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
-    static_assert(bits == 2 || bits == 3 || bits == 4, "exl3_gemv_kernel supports 2, 3 and 4 bpw");
+#if defined(USE_ROCM) || defined(__HIPCC__)
+    static_assert(bits == 2 || bits == 3 || bits == 4 || bits == 6,
+                  "HIP exl3_gemv_kernel supports 2, 3, 4 and 6 bpw");
+#else
+    static_assert(bits == 2 || bits == 3 || bits == 4,
+                  "CUDA exl3_gemv_kernel supports 2, 3 and 4 bpw");
+#endif
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
@@ -171,9 +177,13 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 #endif
 
     constexpr int TWORDS = 8 * bits;                        // uint32 per 16x16 tile
-    constexpr int LOADS = bits == 2 ? WNT / 2 : WNT;        // warp loads per k-slice
+    constexpr int LOADS = bits == 2 ? WNT / 2 :
+                          bits == 6 ? WNT * 3 / 2 : WNT;     // lane-wide loads per k-slice
     constexpr int LSTRIDE = bits == 3 ? 24 : 32;            // uint32 per load
-    static_assert(bits != 2 || WNT % 2 == 0, "2 bpw packs two tiles per warp load");
+    static_assert((bits != 2 && bits != 6) || WNT % 2 == 0,
+                  "2 bpw and 6 bpw lane-wide loads require an even tile count");
+    static_assert(LOADS * LSTRIDE == WNT * TWORDS,
+                  "lane-wide loads must cover each staged tile exactly");
 
 #if !defined(USE_ROCM) && !defined(__HIPCC__)
     auto grid = cooperative_groups::this_grid();
@@ -340,7 +350,9 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 FragB f0, f1;
 #if defined(USE_ROCM) || defined(__HIPCC__)
                 const uint32_t* tp = &sh_stage[warp][t * TWORDS];
-                if constexpr (bits == 4)
+                if constexpr (bits == 6)
+                    dq_dispatch<6, cb>(tp, lane * 8, f0, f1);
+                else if constexpr (bits == 4)
                     exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
                 else if constexpr (bits == 2)
                     exl3_gemv_ns::dq8_regs_2bits<cb>(tp[x_src_a], tp[x_src_b], lane << 3, f0, f1);
