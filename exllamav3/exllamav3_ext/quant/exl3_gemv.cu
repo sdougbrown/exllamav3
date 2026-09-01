@@ -80,7 +80,11 @@ static int exl3_gemv_env_smem()
 static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
 {
     if (mode == 0) return -1;
+#if defined(USE_ROCM)
+    if (!((K >= 2 && K <= 4) || K == 6)) return -1;
+#else
     if (K < 2 || K > 4) return -1;
+#endif
     if (K != 4 && cb == 0) return -1;
     if (size_m > EXL3_GEMV_MAX_M) return -1;
     if (size_k % 128 || size_n % 128) return -1;
@@ -122,6 +126,7 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID(4, 0) SEL_GRID(4, 1) SEL_GRID(4, 2)
     SEL_GRID(2, 1) SEL_GRID(2, 2)
     SEL_GRID(3, 1) SEL_GRID(3, 2)
+    SEL_GRID(6, 1) SEL_GRID(6, 2)
     #undef SEL_GRID
     #undef SEL
 #else
@@ -165,7 +170,11 @@ bool exl3_gemv_try_launch
     // Free integer checks first; the env read (~64 ns) and device queries only run for calls
     // that could actually take this path
     if (!has_su_sv) return false;
+#if defined(USE_ROCM)
+    if (!((K >= 2 && K <= 4) || K == 6)) return false;
+#else
     if (K < 2 || K > 4) return false;
+#endif
     if (K != 4 && cb == 0) return false;
     if (size_m > EXL3_GEMV_MAX_M) return false;
     if (size_k % 128 || size_n % 128) return false;
