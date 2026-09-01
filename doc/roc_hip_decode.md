@@ -1,78 +1,102 @@
-# ROCm HIP EXL3 decode port — design notes
+# Experimental gfx12 ROCm decode backend
 
-Branch: `hip-decode-backend` (worktree `~/Code/_wt/exllamav3-hip`, based on `origin/dev` @ v1.4.5)
-Scope: **decode only** (autoregressive GEMV). Not the quantizer, not rows>144 GEMM, not bc_* CUDA-graph attention.
-Canonical plan: `~/Code/_notes/plans/2026-08-31-exllamav3-hip-decode-backend.md`
+This page documents the implemented Heterogeneous-compute Interface for Portability (HIP) decode path. It accelerates EXL3 matrix-vector multiplication (GEMV) on RDNA4 and provides correctness fallbacks outside that envelope.
 
-## Why the decode GEMV is the whole game for decode
+## What runs on gfx12
 
-From `exllamav3/modules/quant/exl3.py`:
+The runtime gate in `exllamav3.modules.quant.exl3.LinearEXL3` sends a layer to HIP GEMV only when:
+
+- ROCm is active and `ext.exl3_gemv_supported(device)` is true;
+- the GPU is `gfx1200` or `gfx1201`;
+- the decode batch is `rows <= 8`;
+- `in_features` and `out_features` are both multiples of 128;
+- `K` is 2, 3, or 4;
+- the existing codebook flags match the instantiated family (`mcg` / `mul1` when required).
+
+On those gfx12 devices, the real EXL3 decode kernel uses `v_wmma_f32_16x16x16_f16` with fp32 accumulation. That is the supported ROCm acceleration path here; it is not a general matrix fused multiply-add (MFMA) backend.
+
+## What falls back
+
+Anything outside the envelope above uses the existing reconstruct path:
+
+- rows `> 8`
+- unsupported bitrate / codebook combinations
+- `EXL3_GEMV=0`
+- non-gfx12 ROCm devices
+
+The fallback is `reconstruct + hgemm`. That path is correctness-first. It is not a fused performance kernel, and it does not try to match CUDA decode throughput.
+
+The rest of the ROCm shims in `ext_fallbacks.py` follow the same rule: they preserve behavior with PyTorch implementations for correctness, not speed.
+
+## Why the HIP launches are split
+
+HIP does not use the CUDA cooperative-grid decode path.
+
+Instead it runs three stream-ordered launches:
+
+1. input Hadamard
+2. ordinary GEMV
+3. output Hadamard
+
+The earlier cooperative-launch experiment was removed after the Heterogeneous System Architecture (HSA) runtime crashed during shutdown. CUDA keeps its separate cooperative path with `grid.sync()`.
+
+## Why LDS staging is mandatory on gfx12
+
+The gfx12 implementation stages decoded trellis words and wave matrix multiply-accumulate (WMMA) operands through warp-private local data share (LDS).
+
+That is not an optimization choice. On gfx12, feeding WMMA from the shuffle path caused hardware exceptions, so the HIP kernel disables that path.
+
+## What is still deferred
+
+Out of scope for this backend slice:
+
+- large-throughput matrix-matrix multiplication (GEMM, `rows > 144`)
+- int8 GEMV
+- CDNA MFMA
+- the quantizer
+- CUDA graphs / `bc_*`
+
+## Validation snapshot
+
+Current local verification on gfx1201 includes:
+
+- 37 GEMV tests
+- 88 cache / reconstruct tests
+- 61 multi-head latent attention (MLA) / DeepSeek sparse attention (DSA) tests
+- a forced-identical-context 16-step logits oracle
+
+The logits oracle reports:
+
+- top-1 agreement: 16/16
+- top-5 token-set agreement: 16/16
+- representative max absolute logit delta: 0.4043
+- worst-step mean delta: 0.0661
+- overall mean delta: 0.0399
+- fallback-only `-inf` positions carry <1e-6 softmax mass per step
+
+Warmed Qwen3.8-27B decode on gfx1201 (three 64-token trials) measured:
+
+- HIP GEMV median: 14.534 tok/s
+- reconstruct fallback median: 4.603 tok/s
+- speedup: 3.16x
+
+That benchmark is one model, one prompt, one GPU. It is a useful proof point, not a general performance claim.
+
+## Test-fixture note
+
+During development, a local Qwen3.5-9B EXL3 fixture had a trellis labeled `mcg` that decoded like `mul1`. Treat that result as a bad fixture, not a backend failure or a general warning about Qwen models.
+
+## Build and test
+
+```sh
+cd exllamav3
+export HIPCXX=hipcc PYTORCH_ROCM_ARCH=gfx1201 MAX_JOBS=4
+pip install . --no-build-isolation
+python -c "from exllamav3 import ext; assert ext.exllamav3_ext.exl3_gemv_supported(0)"
+
+EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 \
+  python -m pytest tests/test_hip_gemv_decode.py -q
+
+EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 \
+  python tests/hip_gemv_logits_oracle.py
 ```
-rows <= AUTO_RECONSTRUCT_THRESHOLD (144)  -> GEMV path (exl3_gemv)   <- ALL autoregressive decode
-rows >  144                               -> reconstruct + hgemm       <- large prefill (deferred)
-```
-The GEMV kernel (`exllamav3_ext/quant/exl3_gemv_kernel.cuh`) is therefore the decode
-hot path. It is a QTIP-style small-m matvec:
-- warps split k, stream `B` (the packed trellis) to registers via `ld.global.cs` (DCS) behind a prefetch ring,
-- resolve the two-word bit windows of the trellis in-warp via `__shfl_sync`,
-- one fp16 `mma.m16n8k16` per 16x16 weight tile, fp16-accumulate, then fold to fp32 on a cadence,
-- cross-warp reduction over k-splits in shared memory,
-- **cooperative launch** with two `grid.sync()` delimiters for the input hadamard (A) and output hadamard (C) stages.
-
-CFG0 "narrow" (512 threads, 2 n-tiles/warp, 16 k-splits) for attention projection sizes;
-CFG1 "wide" (256 threads, 4 n-tiles/warp, 8 k-splits) for large-n FFN. MMODE0 = m==1 fast path.
-
-## NVIDIA mm a that must become AMD MFMA
-
-The single PTX site to port:
-```cpp
-"mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {c0,c1}, {a0..a3}, {b0,b1}, {c0,c1}"
-```
-- `A` = m16 x k16 fp16 (fed as two `FragB` = 4 fp16/lane: `a01`, `a23`),
-- `B` = k16 x n8 fp16 (`FragB` = 2 fp16/lane),
-- `C` = m16 x n8 fp16-accumulate (`FragC_h` = Vec<half2,2>, 4 fp16/lane).
-- The kernel computes one 16x16 tile as **two** of these along n (top 8 cols `ch[t][0]`, bottom 8 cols `ch[t][1]`).
-
-### AMD shape mapping (the design decision)
-There is no fp16-accumulate MFMA and no n8 variant on AMD. The natural target is:
-
-```
-v_mfma_f32_16x16x16_f16        (M=16, N=16, K=16, fp16 in, fp32 accumulate)
-```
-Key differences versus the CUDA code:
-1. **One MFMA covers the whole 16x16 tile (N=16)** — replaces the *two* m16n8k16 calls (`ch[t][0]`, `ch[t][1]` collapse into one `HipFragC`). Simpler.
-2. **Accumulation is fp32 natively** — the CUDA kernel's fp16-accumulate-with-cadence-fold (`ch` + `acc0` + `FOLD`) is replaced by a single fp32 accumulator. Numerically **at least as accurate**; removes the fold logic.
-3. **Fragment layout differs** — A/B/C are distributed across the 32 lanes differently than NVIDIA. The `__shfl_sync` trellis-word streaming still resolves the same decoded half values; only the register arrangement into the MFMA differs. This is the bit-level work that **must be finalized on a device** (see Oracle).
-4. `mma_ab_h`'s special m==1 handling (only the active row's 4 fp16 are nonzero) maps to feeding a mostly-zero A fragment — same trick, driven by the oracle-verified layout.
-
-Target builtin (compiler/toolkit-version dependent — finalize at build):
-`__builtin_amdgcn_mfma_f32_16x16x16_f16` (or hipWMMA/rocWMMA gate tile API; prefer raw builtin for parity with the CUDA kernels).
-
-## Port map
-
-| Piece | Action | Confidence |
-|---|---|---|
-| `exl3_dq.cuh` | near-verbatim (funnelshift) | portable |
-| `codebook.cuh` | replace `lop3.b32` with portable bitwise; keep `__dp4a` | portable |
-| `hadamard_inner.cuh` | near-verbatim | portable |
-| `__shfl_sync` / `__ldcs` streaming | HIP-native | portable |
-| `mma_ab_h` → `mma_ab_h_hip` | MFMA rewrite + fragment mapping | device-time TODO |
-| cooperative `grid.sync()` | prefer splitting hadamard-I / hadamard-O into separate launches to avoid cooperative-sync dependence on ROCm (robustness win) | decision |
-| `reconstruct.cu`, `hgemm.cu` | deferred; hipBLASLt/rocBLAS for hgemm | deferred |
-| bc_* / CUDA-graph attention | route to Triton (amdgpu) | deferred |
-
-## Oracle strategy (why we need no CUDA GPU)
-
-PR #283 guarantees a pure-PyTorch fallback for every missing kernel. The existing engine's
-`reconstruct=true` path (PyTorch reconstruct + rocBLAS fp16 gemm) is a known-correct
-reference. Therefore **HIP decode GEMV must reproduce `reconstruct=true` output** to fp16
-tolerance — the exact same pattern `test_qgemm.py` uses to compare its two internal paths.
-Tests in `tests/test_hip_gemv_decode.py` implement this and also re-enable the PR-#283-excluded
-kernel tests as they come online.
-
-## Open questions / device-time TODOs
-- [ ] Exact MFMA A-fragment lane↔element layout to keep the m==1 fast path cheap; verify with oracle.
-- [ ] Cooperative launch availability & robustness on gfx1201; fallback to split hadamard launches.
-- [ ] `__builtin_amdgcn_mfma_f32_16x16x16_f16` calling convention on the installed ROCm/HIP toolkit.
-- [ ] Build environment: PyTorch ROCm wheel, `hipcc`, no flash_attn for HIP (Triton path carries attention).
-- [ ] Perf gate decode tok/s vs ~14 tok/s #283 baseline vs CUDA reference.
