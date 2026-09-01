@@ -89,6 +89,8 @@
 #include "generator/rep_pen.cuh"
 #include "generator/cache.cuh"
 
+#include "ngram.cuh"
+
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -291,6 +293,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
     m.def("pack_signs", &pack_signs, "pack_signs");
+
+    m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
+    m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
+    m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
 
     m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
     m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
