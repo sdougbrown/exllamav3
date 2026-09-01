@@ -36,6 +36,320 @@ kernel, as do other architectures (Ada/Blackwell are memory-bound here and keep 
 kernel), bpw != 4, and m > 8.
 */
 
+#if defined(USE_ROCM)
+
+namespace {
+
+constexpr int MOE_HIDDEN = 2560;
+constexpr int MOE_TOP_K = 10;
+constexpr int MOE_THREADS = 512;
+constexpr float HAD_SCALE = 0.088388347648f;
+
+template <bool PRE_SCALE, bool FP32>
+__global__ __launch_bounds__(32)
+void moe_had_rows_kernel
+(
+    const void* input,
+    void* output,
+    const int64_t* selected,
+    const int64_t* scale_tables_0,
+    const int64_t* scale_tables_1,
+    int rows_per_projection,
+    int width,
+    int experts,
+    bool repeated_input
+)
+{
+    const int matrix = blockIdx.x;
+    const int slot = matrix % rows_per_projection;
+    const int projection = matrix / rows_per_projection;
+    const int64_t expert = selected[slot];
+    const int64_t* scale_table = projection == 0 ? scale_tables_0 : scale_tables_1;
+    const size_t output_offset = (size_t) matrix * width + blockIdx.y * 128;
+    const bool valid_expert = expert >= 0 && expert < experts;
+    const int64_t scale_ptr = valid_expert ? scale_table[expert] : 0;
+    if (!scale_ptr)
+    {
+        if constexpr (FP32)
+        {
+            float* output_ptr = reinterpret_cast<float*>(output) + output_offset;
+            for (int idx = threadIdx.x; idx < 128; idx += blockDim.x) output_ptr[idx] = 0.0f;
+        }
+        else
+        {
+            half* output_ptr = reinterpret_cast<half*>(output) + output_offset;
+            for (int idx = threadIdx.x; idx < 128; idx += blockDim.x) output_ptr[idx] = __float2half_rn(0.0f);
+        }
+        return;
+    }
+
+    const half* scale = reinterpret_cast<const half*>(scale_ptr);
+    const size_t input_row = repeated_input ? 0 : matrix;
+    const size_t input_offset = input_row * width + blockIdx.y * 128;
+
+    if constexpr (FP32)
+        had_ff_r_128_inner<PRE_SCALE, !PRE_SCALE>
+        (
+            reinterpret_cast<const float*>(input) + input_offset,
+            reinterpret_cast<float*>(output) + output_offset,
+            scale,
+            HAD_SCALE
+        );
+    else
+        had_hf_r_128_inner<PRE_SCALE, !PRE_SCALE>
+        (
+            reinterpret_cast<const half*>(input) + input_offset,
+            reinterpret_cast<half*>(output) + output_offset,
+            scale,
+            HAD_SCALE
+        );
+}
+
+__global__ void moe_silu_mul_kernel(const half* gate, const half* up, half* output, int count)
+{
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < count; idx += blockDim.x * gridDim.x)
+    {
+        const float g = __half2float(gate[idx]);
+        const half activated = __float2half_rn(g / (1.0f + expf(-g)));
+        output[idx] = __hmul(activated, up[idx]);
+    }
+}
+
+template <bool FP32, bool TWO_PROJECTIONS>
+__global__ __launch_bounds__(MOE_THREADS)
+void moe_grouped_gemv_k3_kernel
+(
+    const half* A,
+    const int64_t* selected,
+    const int64_t* B_table_0,
+    const int64_t* B_table_1,
+    void* C,
+    int size_k,
+    int size_n,
+    int experts
+)
+{
+    const int slot = blockIdx.y;
+    const int projection = TWO_PROJECTIONS ? blockIdx.z : 0;
+    const int64_t expert = selected[slot];
+    const int64_t* B_table = projection == 0 ? B_table_0 : B_table_1;
+    const size_t matrix = (size_t) projection * MOE_TOP_K + slot;
+    void* C_row = FP32
+        ? static_cast<void*>(reinterpret_cast<float*>(C) + matrix * size_n)
+        : static_cast<void*>(reinterpret_cast<half*>(C) + matrix * size_n);
+    const bool valid_expert = expert >= 0 && expert < experts;
+    const int64_t B_ptr = valid_expert ? B_table[expert] : 0;
+    if (!B_ptr)
+    {
+        const int col = blockIdx.x * 32 + threadIdx.x;
+        if (threadIdx.x < 32 && col < size_n)
+        {
+            if constexpr (FP32) reinterpret_cast<float*>(C_row)[col] = 0.0f;
+            else reinterpret_cast<half*>(C_row)[col] = __float2half_rn(0.0f);
+        }
+        return;
+    }
+
+    const uint16_t* B = reinterpret_cast<const uint16_t*>(B_ptr);
+    const half* A_row = A + matrix * size_k;
+    exl3_gemv_kernel_body<3, FP32, 2, 0, 0, true>
+    (A_row, B, C_row, 1, size_k, size_n, nullptr, nullptr, nullptr, nullptr);
+}
+
+__global__ void moe_weighted_reduce_kernel
+(
+    const float* rows,
+    const int64_t* selected,
+    const half* weights,
+    float* output,
+    int width
+)
+{
+    for (int col = blockIdx.x * blockDim.x + threadIdx.x;
+         col < width; col += blockDim.x * gridDim.x)
+    {
+        // Match the established bsz1 fallback's expert-sorted accumulation order. Ties
+        // retain their routing-slot order, so duplicate assignments remain distinct.
+        unsigned used = 0;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int rank = 0; rank < MOE_TOP_K; ++rank)
+        {
+            int best_slot = -1;
+            int64_t best_expert = INT64_MAX;
+            #pragma unroll
+            for (int slot = 0; slot < MOE_TOP_K; ++slot)
+            {
+                const bool available = !(used & (1u << slot));
+                const int64_t expert = selected[slot];
+                if (available && (expert < best_expert ||
+                    (expert == best_expert && (best_slot < 0 || slot < best_slot))))
+                {
+                    best_expert = expert;
+                    best_slot = slot;
+                }
+            }
+            used |= 1u << best_slot;
+            const float weighted = __fmul_rn(
+                rows[(size_t) best_slot * width + col], __half2float(weights[best_slot]));
+            sum = __fadd_rn(sum, weighted);
+        }
+        output[col] = sum;
+    }
+}
+
+void check_ptr_table
+(
+    const at::Tensor& table,
+    int64_t experts,
+    const at::Device& device,
+    const char* name
+)
+{
+    TORCH_CHECK_DTYPE(table, kLong);
+    TORCH_CHECK(table.device() == device && table.is_contiguous() && table.dim() == 1 &&
+                table.numel() == experts, name, " must be a contiguous same-device pointer table");
+}
+
+void check_moe_alignment(const at::Tensor& tensor, const char* name)
+{
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+                "exl3_moe_gfx12_k3: ", name, " must be 16-byte aligned");
+}
+
+} // namespace
+
+void exl3_moe_gfx12_k3
+(
+    const at::Tensor& A,
+    at::Tensor& output,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    const at::Tensor& gate_trellis,
+    const at::Tensor& gate_suh,
+    const at::Tensor& gate_svh,
+    const at::Tensor& up_trellis,
+    const at::Tensor& up_suh,
+    const at::Tensor& up_svh,
+    const at::Tensor& down_trellis,
+    const at::Tensor& down_suh,
+    const at::Tensor& down_svh,
+    at::Tensor& gu_had,
+    at::Tensor& gu_out,
+    at::Tensor& down_had,
+    at::Tensor& down_out
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    int device;
+    cuda_check(hipGetDevice(&device));
+    TORCH_CHECK(exl3_gemv_supported(device), "exl3_moe_gfx12_k3 requires gfx1200/gfx1201");
+
+    TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.dtype() == at::kHalf &&
+                A.numel() == MOE_HIDDEN && A.size(-1) == MOE_HIDDEN,
+                "exl3_moe_gfx12_k3 requires one contiguous fp16 row of width 2560");
+    TORCH_CHECK(output.device() == A.device() && output.is_contiguous() && output.dtype() == at::kFloat &&
+                output.numel() == MOE_HIDDEN,
+                "exl3_moe_gfx12_k3 output must be contiguous fp32[1, 2560]");
+    TORCH_CHECK(selected.device() == A.device() && selected.is_contiguous() && selected.dtype() == at::kLong &&
+                selected.numel() == MOE_TOP_K,
+                "exl3_moe_gfx12_k3 selected must be contiguous device int64[1, 10]");
+    TORCH_CHECK(weights.device() == A.device() && weights.is_contiguous() && weights.dtype() == at::kHalf &&
+                weights.numel() == MOE_TOP_K,
+                "exl3_moe_gfx12_k3 weights must be contiguous device fp16[1, 10]");
+
+    const int64_t experts = gate_trellis.numel();
+    TORCH_CHECK(experts > 0, "exl3_moe_gfx12_k3 requires nonempty expert tables");
+    check_ptr_table(gate_trellis, experts, A.device(), "gate_trellis");
+    check_ptr_table(gate_suh, experts, A.device(), "gate_suh");
+    check_ptr_table(gate_svh, experts, A.device(), "gate_svh");
+    check_ptr_table(up_trellis, experts, A.device(), "up_trellis");
+    check_ptr_table(up_suh, experts, A.device(), "up_suh");
+    check_ptr_table(up_svh, experts, A.device(), "up_svh");
+    check_ptr_table(down_trellis, experts, A.device(), "down_trellis");
+    check_ptr_table(down_suh, experts, A.device(), "down_suh");
+    check_ptr_table(down_svh, experts, A.device(), "down_svh");
+
+    const int intermediate = down_had.numel() / MOE_TOP_K;
+    TORCH_CHECK(intermediate == 640 || intermediate == 768,
+                "exl3_moe_gfx12_k3 intermediate width must be 640 or 768");
+    TORCH_CHECK(gu_had.device() == A.device() && gu_had.is_contiguous() && gu_had.dtype() == at::kHalf &&
+                gu_had.numel() == 2 * MOE_TOP_K * MOE_HIDDEN,
+                "gu_had must be contiguous fp16[2, 10, 2560]");
+    TORCH_CHECK(gu_out.device() == A.device() && gu_out.is_contiguous() && gu_out.dtype() == at::kHalf &&
+                gu_out.numel() == 2 * MOE_TOP_K * intermediate,
+                "gu_out has the wrong shape");
+    TORCH_CHECK(down_had.device() == A.device() && down_had.is_contiguous() && down_had.dtype() == at::kHalf &&
+                down_had.numel() == MOE_TOP_K * intermediate,
+                "down_had has the wrong shape");
+    TORCH_CHECK(down_out.device() == A.device() && down_out.is_contiguous() && down_out.dtype() == at::kFloat &&
+                down_out.numel() == MOE_TOP_K * MOE_HIDDEN,
+                "down_out must be contiguous fp32[10, 2560]");
+
+    check_moe_alignment(A, "A");
+    check_moe_alignment(output, "output");
+    check_moe_alignment(gu_had, "gu_had");
+    check_moe_alignment(gu_out, "gu_out");
+    check_moe_alignment(down_had, "down_had");
+    check_moe_alignment(down_out, "down_out");
+
+    // MultiLinear constructs these same-device tables once and keeps their source tensors
+    // alive. Entries remain an internal raw-pointer trust boundary: checking every pointer on
+    // the host here would synchronize and copy all tables on every decode call.
+    const int64_t* selected_ptr = reinterpret_cast<const int64_t*>(selected.data_ptr());
+    const half* weights_ptr = reinterpret_cast<const half*>(weights.data_ptr());
+    const int64_t* gt = reinterpret_cast<const int64_t*>(gate_trellis.data_ptr());
+    const int64_t* gsuh = reinterpret_cast<const int64_t*>(gate_suh.data_ptr());
+    const int64_t* gsvh = reinterpret_cast<const int64_t*>(gate_svh.data_ptr());
+    const int64_t* ut = reinterpret_cast<const int64_t*>(up_trellis.data_ptr());
+    const int64_t* usuh = reinterpret_cast<const int64_t*>(up_suh.data_ptr());
+    const int64_t* usvh = reinterpret_cast<const int64_t*>(up_svh.data_ptr());
+    const int64_t* dt = reinterpret_cast<const int64_t*>(down_trellis.data_ptr());
+    const int64_t* dsuh = reinterpret_cast<const int64_t*>(down_suh.data_ptr());
+    const int64_t* dsvh = reinterpret_cast<const int64_t*>(down_svh.data_ptr());
+
+    dim3 had_gu_grid(2 * MOE_TOP_K, MOE_HIDDEN / 128);
+    moe_had_rows_kernel<true, false><<<had_gu_grid, 32, 0, stream>>>
+    (A.data_ptr(), gu_had.data_ptr(), selected_ptr, gsuh, usuh,
+     MOE_TOP_K, MOE_HIDDEN, experts, true);
+
+    dim3 gu_grid(intermediate / 32, MOE_TOP_K, 2);
+    moe_grouped_gemv_k3_kernel<false, true><<<gu_grid, MOE_THREADS, 0, stream>>>
+    (reinterpret_cast<const half*>(gu_had.data_ptr()), selected_ptr, gt, ut,
+     gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts);
+
+    moe_had_rows_kernel<false, false><<<dim3(2 * MOE_TOP_K, intermediate / 128), 32, 0, stream>>>
+    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, gsvh, usvh,
+     MOE_TOP_K, intermediate, experts, false);
+
+    const int activation_count = MOE_TOP_K * intermediate;
+    const half* gu_ptr = reinterpret_cast<const half*>(gu_out.data_ptr());
+    moe_silu_mul_kernel<<<CEIL_DIVIDE(activation_count, 256), 256, 0, stream>>>
+    (gu_ptr, gu_ptr + activation_count, reinterpret_cast<half*>(down_had.data_ptr()), activation_count);
+
+    moe_had_rows_kernel<true, false><<<dim3(MOE_TOP_K, intermediate / 128), 32, 0, stream>>>
+    (down_had.data_ptr(), down_had.data_ptr(), selected_ptr, dsuh, dsuh,
+     MOE_TOP_K, intermediate, experts, false);
+
+    dim3 down_grid(MOE_HIDDEN / 32, MOE_TOP_K, 1);
+    moe_grouped_gemv_k3_kernel<true, false><<<down_grid, MOE_THREADS, 0, stream>>>
+    (reinterpret_cast<const half*>(down_had.data_ptr()), selected_ptr, dt, dt,
+     down_out.data_ptr(), intermediate, MOE_HIDDEN, experts);
+
+    moe_had_rows_kernel<false, true><<<dim3(MOE_TOP_K, MOE_HIDDEN / 128), 32, 0, stream>>>
+    (down_out.data_ptr(), down_out.data_ptr(), selected_ptr, dsvh, dsvh,
+     MOE_TOP_K, MOE_HIDDEN, experts, false);
+
+    moe_weighted_reduce_kernel<<<CEIL_DIVIDE(MOE_HIDDEN, 256), 256, 0, stream>>>
+    (reinterpret_cast<const float*>(down_out.data_ptr()), selected_ptr, weights_ptr,
+     reinterpret_cast<float*>(output.data_ptr()), MOE_HIDDEN);
+    cuda_check(hipPeekAtLastError());
+}
+
+#endif // USE_ROCM
+
 static int exl3_gemv_env_mode()
 {
     const char* env = std::getenv("EXL3_GEMV");

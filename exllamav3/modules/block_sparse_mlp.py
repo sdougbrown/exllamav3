@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
@@ -59,6 +60,15 @@ class FusedBuffers:
     temp_state_u: torch.Tensor
     temp_intermediate_g: torch.Tensor
     temp_intermediate_u: torch.Tensor
+
+
+@dataclass
+class HIPGroupedBuffers:
+    gu_had: torch.Tensor
+    gu_out: torch.Tensor
+    down_had: torch.Tensor
+    down_out: torch.Tensor
+    output: torch.Tensor
 
 
 def _routing_std_torch(cfg, y, params, include_bias = False):
@@ -663,6 +673,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             case _: raise ValueError(f"Unknown router type {router_type}")
 
         self.tp_reduce = False
+        self.tp_mode = None
 
         self.shared_experts_post_norm = shared_experts_post_norm
         self.router_pre_norm = router_pre_norm
@@ -676,6 +687,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bc = None
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
+        self.support_hip_grouped = False
+        self.hip_grouped_buffers = None
+        self.hip_grouped_lora_blocked = False
         self._cpu_init_state()
 
     @override
@@ -689,6 +703,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return [s, [g + u, d]]
         else:
             return [[g + u, d]]
+
+
+    def invalidate_hip_grouped_for_lora(self, target: Linear):
+        if target in self.gates or target in self.ups or target in self.downs:
+            self.hip_grouped_lora_blocked = True
+            self.support_hip_grouped = False
 
 
     def load_local(self, **kwargs):
@@ -732,10 +752,39 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             not self.config.infer_params.no_reconstruct
         )
 
+        # Dedicated ROCm decode route. Keep this exact until additional shapes and split
+        # semantics have their own oracle coverage; in particular, expert-parallel and
+        # intermediate-split modules must continue through the established fallback.
+        full_expert_layer = (
+            len(self.ups) == self.num_experts and
+            (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
+            (self.routing_first is None or (
+                self.routing_first == 0 and self.routing_last == self.num_experts
+            )) and
+            self.cpu_split_first is None
+        )
+        hip_grouped_device = False
+        if bool(torch.version.hip) and hasattr(ext, "exl3_moe_gfx12_k3"):
+            device_index = torch.device(self.device).index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            hip_grouped_device = ext.exl3_gemv_supported(device_index)
+        self.support_hip_grouped = (
+            hip_grouped_device and self.is_quantized and self.gated and self.activation_fn == "silu" and
+            self.hidden_size == 2560 and self.intermediate_size_padded in (640, 768) and
+            self.num_experts_per_tok == 10 and self.interm_dtype == torch.half and
+            self.act_limit == 0 and self.tp_mode is None and not self.hip_grouped_lora_blocked and
+            full_expert_layer and
+            all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
+            all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs) and
+            not self.config.infer_params.no_reconstruct
+        )
+
         # Make fused modules (only used by the quantized fast paths). Gateless experts have no
         # gate MultiLinear; the up module doubles as a placeholder wherever the fast paths want
         # gate pointer tables (never dereferenced, the gate GEMMs are skipped)
-        if (self.support_quant_paths or self.support_bc_bsz1) and not self.config.infer_params.no_reconstruct:
+        if (self.support_quant_paths or self.support_bc_bsz1 or self.support_hip_grouped) \
+                and not self.config.infer_params.no_reconstruct:
             self.multi_gate = MultiLinear(self.device, self.gates, allow_bias = True) if self.gated else None
             self.multi_up = MultiLinear(self.device, self.ups, allow_bias = True)
             self.multi_down = MultiLinear(self.device, self.downs, allow_bias = True)
@@ -751,6 +800,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 hasattr(ext, "exl3_moe") and hasattr(ext, "exl3_moe_max_concurrency") and
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
                 self.support_quant_paths
+            )
+            self.support_hip_grouped = self.support_hip_grouped and all(
+                multi.K == 3 and multi.mul1 and not multi.mcg
+                for multi in (self.multi_gate, self.multi_up, self.multi_down)
             )
 
         # Temp buffers for graph, dq and fused-bsz1 paths
@@ -812,6 +865,20 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             out_trim = out_trim,
         )
         self.experts_cfg = cfg
+
+        if self.support_hip_grouped:
+            self.hip_grouped_buffers = HIPGroupedBuffers(
+                gu_had = g_tensor_cache.get(
+                    device, (2, numex, H), torch.half, "moe_gfx12_gu_had"),
+                gu_out = g_tensor_cache.get(
+                    device, (2, numex, I), torch.half, "moe_gfx12_gu_out"),
+                down_had = g_tensor_cache.get(
+                    device, (numex, I), torch.half, "moe_gfx12_down_had"),
+                down_out = g_tensor_cache.get(
+                    device, (numex, H), torch.float, "moe_gfx12_down_out"),
+                output = g_tensor_cache.get(
+                    device, (1, H), torch.float, "moe_gfx12_output"),
+            )
 
         if (self.support_quant_paths or self.support_bc_bsz1) \
                 and not self.config.infer_params.no_reconstruct:
@@ -1019,6 +1086,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.cpu_unload()
         self.bc = None
         self.fused_mode_buffers = None
+        self.support_hip_grouped = False
+        self.hip_grouped_buffers = None
+        self.hip_grouped_lora_blocked = False
         if self.multi_gate is not None:
             self.multi_gate.unload()
             self.multi_gate = None
@@ -1105,6 +1175,37 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
+
+        # gfx12 grouped decode path: selected IDs and weights stay on-device, and every
+        # selected slot remains distinct so duplicates and routing order retain their semantics.
+        elif (
+            bsz == 1 and self.support_hip_grouped and self.tp_mode is None and self.act_limit == 0 and
+            os.environ.get("EXL3_HIP_GROUPED_MOE", "1") != "0" and
+            os.environ.get("EXL3_GEMV", "1") != "0" and
+            not params.get("activate_all_experts") and
+            not params.get("reconstruct") and not params.get("autosplit_measure")
+        ):
+            buffers = self.hip_grouped_buffers
+            ext.exl3_moe_gfx12_k3(
+                y,
+                buffers.output,
+                selected_experts,
+                routing_weights,
+                self.multi_gate.ptrs_trellis,
+                self.multi_gate.ptrs_suh,
+                self.multi_gate.ptrs_svh,
+                self.multi_up.ptrs_trellis,
+                self.multi_up.ptrs_suh,
+                self.multi_up.ptrs_svh,
+                self.multi_down.ptrs_trellis,
+                self.multi_down.ptrs_suh,
+                self.multi_down.ptrs_svh,
+                buffers.gu_had,
+                buffers.gu_out,
+                buffers.down_had,
+                buffers.down_out,
+            )
+            final_hidden_states = buffers.output.view(x.shape)
 
         # Torch/C++/fused path
         elif (
@@ -1672,6 +1773,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         )
 
         module.device = device
+        module.tp_mode = unit
         module.e_score_correction_bias = consumer.recv(exported["e_score_correction_bias"], cuda = True)
         module.per_expert_scale = consumer.recv(exported["per_expert_scale"], cuda = True)
         if exported.get("tid2eid") is not None and device == output_device:
