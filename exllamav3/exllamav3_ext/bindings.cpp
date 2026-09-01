@@ -7,6 +7,7 @@
 #include "stloader.h"
 #include "cuda_host.h"
 #include "hadamard.h"
+#include "hc_mix.cuh"
 
 #if !defined(USE_ROCM)
 
@@ -62,7 +63,6 @@
 #include "libtorch/dsv4_attn.h"
 #include "dsv4_compress.cuh"
 #include "dsa_topk.cuh"
-#include "hc_mix.cuh"
 #include "ple.cuh"
 #include "ngram.cuh"
 
@@ -117,6 +117,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
     m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
 
+    m.def("hc_mix_supported", &hc_mix_supported, "hc_mix_supported");
+    m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("hc_head", &hc_head, "hc_head");
+    m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
+    m.def("hc_apply", &hc_apply, "hc_apply");
+    m.def("gr_mix", &gr_mix, "gr_mix");
+
 #if !defined(USE_ROCM)
     m.def("rms_norm", &rms_norm, "rms_norm",
         py::arg("x"), py::arg("w"), py::arg("y"), py::arg("epsilon"),
@@ -137,16 +144,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
     m.def("dsa_topk", &dsa_topk, "dsa_topk");
-    m.def("hc_mix", &hc_mix, "hc_mix");
     m.def("ple_gate", &ple_gate, "ple_gate");
     m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
-    m.def("hc_head", &hc_head, "hc_head");
-    m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
-    m.def("hc_apply", &hc_apply, "hc_apply");
-    m.def("gr_mix", &gr_mix, "gr_mix");
     m.def("routing_std", &routing_std, "routing_std");
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 

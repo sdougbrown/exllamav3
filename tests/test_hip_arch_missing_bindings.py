@@ -326,3 +326,61 @@ def test_hyperhead_and_bighead_decline_missing_fast_bindings(monkeypatch):
     assert bighead_scalar.fn_bighead_scalar_attn(args) is None
     baseline = torch_attn.fn_torch_sdpa_fallback_cache(args)
     assert baseline.shape == q.shape and torch.isfinite(baseline).all()
+
+
+def test_hyperconnection_native_routes_fall_back_when_wave32_is_unsupported(monkeypatch):
+    torch.manual_seed(9)
+    B, S, H, D, rank = 1, 2, 4, 8, 3
+
+    def unexpected_native(*_args, **_kwargs):
+        raise AssertionError("unsupported wave size must not enter hc_mix kernels")
+
+    unsupported_ext = SimpleNamespace(
+        hc_mix_supported=lambda _device: False,
+        hc_mix_num_chunks=unexpected_native,
+        hc_mix=unexpected_native,
+        hc_head=unexpected_native,
+        hc_apply=unexpected_native,
+        gr_mix=unexpected_native,
+    )
+    monkeypatch.setattr(hc, "ext", unsupported_ext)
+
+    module = object.__new__(hc.HyperConnection)
+    module.hc_mult = H
+    module.hidden_size = D
+    module.sinkhorn_iters = 2
+    module.hc_eps = module.rms_eps = 1e-5
+    module.norm = _IdentityNorm()
+    module.fn = torch.randn((2 * H + H * H, H * D), device=DEVICE)
+    module.fn_h = None
+    module.base = torch.randn((2 * H + H * H,), device=DEVICE)
+    module.scale = torch.randn((3,), device=DEVICE)
+    streams = torch.randn((B, S, H, D), device=DEVICE)
+    post, comb, _ = module.mix(streams, {})
+    y = torch.randn((B, S, D), dtype=torch.half, device=DEVICE)
+    result = module.apply_(streams, y, post, comb, {})
+    assert result.shape == streams.shape
+
+    gated = object.__new__(hc.GatedResidual)
+    gated.hc_mult = H
+    gated.hidden_size = D
+    gated.rms_eps = 1e-5
+    gated.use_combine = True
+    gated.norm_w = torch.randn((H, D), device=DEVICE)
+    gated.down_h = torch.randn((rank, H * D), dtype=torch.half, device=DEVICE)
+    gated.up_h = torch.randn((H * D, rank), dtype=torch.half, device=DEVICE)
+    gated.inject_h = torch.randn((H, H * D), dtype=torch.half, device=DEVICE)
+    gated_post, gated_mixed = gated._mix(streams)
+    assert gated_post.shape == (B * S, H) and gated_mixed.shape == (B * S, D)
+    gated_result = gated.apply_(streams, y, gated_post.view(B, S, H), None, {})
+    assert gated_result.shape == streams.shape
+
+    head = object.__new__(hc.HyperHead)
+    head.mean = False
+    head.norm = _IdentityNorm()
+    head.fn = torch.randn((H, H * D), device=DEVICE)
+    head.fn_h = None
+    head.base = torch.randn((H,), device=DEVICE)
+    head.scale = torch.randn((1,), device=DEVICE)
+    head.rms_eps = head.hc_eps = 1e-5
+    assert head.forward(streams, {}).shape == (B, S, D)
