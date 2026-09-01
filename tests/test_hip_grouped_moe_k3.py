@@ -487,8 +487,7 @@ def test_flash_multirow_route_and_decline_guards(flash_model, device_index, rows
         assert mlp.multi_down.linears == mlp.downs
         x = torch.randn((1, rows, HIDDEN), dtype=torch.float16, device=device)
 
-        # add_sigmoid_gate_proj may be native or the layer-2 PyTorch fallback; the spy wraps
-        # whichever ext resolves to, and block_sparse_mlp looks it up through ext at call time
+        assert getattr(ext.add_sigmoid_gate_proj, "__module__", None) == "exllamav3_ext"
         calls, restore = _route_spies()
         try:
             with torch.profiler.profile(

@@ -7,13 +7,14 @@
 #include "stloader.h"
 #include "cuda_host.h"
 #include "hadamard.h"
+#include "hc_mix.cuh"
+#include "activation.cuh"
 
 #if !defined(USE_ROCM)
 
 #include "norm.cuh"
 #include "hgemm.cuh"
 #include "rope.cuh"
-#include "activation.cuh"
 #include "softcap.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
@@ -113,6 +114,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_host_get_device_pointer", &cuda_host_get_device_pointer, py::arg("ptr"));
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
     m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
+
+    py::class_<ConvRewindJob>(m, "ConvRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int, int, int>());
+    py::class_<StateRewindJob>(m, "StateRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int64_t>());
+    m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
+
+    m.def("hc_mix_supported", &hc_mix_supported, "hc_mix_supported");
+    m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("hc_head", &hc_head, "hc_head");
+    m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
+    m.def("hc_apply", &hc_apply, "hc_apply");
+    m.def("gr_mix", &gr_mix, "gr_mix");
+    m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
 
 #if !defined(USE_ROCM)
     m.def("rms_norm", &rms_norm, "rms_norm",
@@ -228,7 +245,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("deinterleave_qg", &deinterleave_qg, "deinterleave_qg");
     m.def("mul_sigmoid_broadcast_", &mul_sigmoid_broadcast_, "mul_sigmoid_broadcast_");
     m.def("mul_softplus_broadcast_", &mul_softplus_broadcast_, "mul_softplus_broadcast_");
-    m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
