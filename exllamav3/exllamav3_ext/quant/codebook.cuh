@@ -2,12 +2,13 @@
 
 // This used to force integer MAD on sm_86 via inline asm, which outperformed the IMUL emitted by older
 // nvcc versions on the RTX 3090. As of CUDA 13.2 the workaround has inverted: the plain multiply is ~4%
-// faster end-to-end at m=1. Kept as a hook in case it regresses again.
+// faster end-to-end at m=1. Kept as a hook (CUDA-only; the inline PTX does not compile under hipcc)
+// in case it regresses again.
 template <uint32_t w>
 __device__ __forceinline__
 uint32_t mul_const_u32(uint32_t x)
 {
-    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860)
+    #if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860)
         uint32_t r;
         asm volatile (
             "{ .reg .u32 z,t;"
@@ -44,8 +45,10 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
 // Ditto mcg (cb 1)
 __device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1)
 {
-    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+    // lop3.b32(x, 0x8fff8fff, 0x3b603b60, 0x6a) -> x ^= 0x0b600b60: the truth table 0x6a = 0b01101010
+    // implements a ^ (b & c) per output bit, and 0x8fff8fff & 0x3b603b60 = 0x0b600b60
+    x0 ^= 0x0b600b60u;
+    x1 ^= 0x0b600b60u;
     half2_uint32 xu0(x0);
     half2_uint32 xu1(x1);
     half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
@@ -60,7 +63,7 @@ __device__ inline half decode_3inst(uint32_t x)
     {
         x *= 89226354u;
         x += 64248484u;
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        x ^= 0x0b600b60u;   // lop3.b32(x, 0x8fff8fff, 0x3b603b60, 0x6a) -> x ^ (0x8fff8fff & 0x3b603b60)
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
@@ -69,7 +72,7 @@ __device__ inline half decode_3inst(uint32_t x)
         x *= 0xCBAC1FEDu;
         // x = mul_const_u32<0xCBAC1FEDu>(x);
 
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        x ^= 0x0b600b60u;   // lop3.b32(x, 0x8fff8fff, 0x3b603b60, 0x6a) -> x ^ (0x8fff8fff & 0x3b603b60)
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
@@ -98,8 +101,8 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
         x1 *= 89226354u;
         x0 += 64248484u;
         x1 += 64248484u;
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+        x0 ^= 0x0b600b60u;   // lop3.b32(x, 0x8fff8fff, 0x3b603b60, 0x6a) -> x ^ (0x8fff8fff & 0x3b603b60)
+        x1 ^= 0x0b600b60u;
         half2_uint32 xu0(x0);
         half2_uint32 xu1(x1);
         half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
