@@ -91,7 +91,14 @@ Warmed decode measurements on gfx1201:
 
 Each median is three trials after a 32-token warmup, using one model, prompt, and GPU. The K6-reconstruct arm preserves direct GEMV for K2-K4 and falls back only for K6.
 
-Compared with the earlier all-reconstruct baseline, direct K2-K4 and K6 GEMV measures 3.53x faster on Qwen3.8-27B (4.603 to 16.250 tok/s). Qwen3.5-9B measures 3.19x faster (14.847 to 47.311 tok/s). These cross-run ratios show the cumulative backend improvement; the table above is the controlled incremental K6 comparison.
+Reusing each assembled WMMA A fragment across adjacent N tiles provides another measured gain:
+
+| Model | Before A reuse | With A reuse | Uplift |
+| --- | ---: | ---: | ---: |
+| Qwen3.8-27B | 16.315 tok/s | 17.325 tok/s | 6.2% |
+| Qwen3.5-9B | 47.315 tok/s | 51.917 tok/s | 9.7% |
+
+Compared with the earlier all-reconstruct baseline, the current backend measures 3.76x faster on Qwen3.8-27B (4.603 to 17.325 tok/s). Qwen3.5-9B measures 3.50x faster (14.847 to 51.917 tok/s). These cross-run ratios show the cumulative backend improvement; the tables above are controlled incremental comparisons.
 
 Steady-state profiles after prefill show the K6 vocabulary head changing from reconstruct plus rocBLAS hgemm to one direct kernel:
 
@@ -100,7 +107,7 @@ Steady-state profiles after prefill show the K6 vocabulary head changing from re
 | Qwen3.8-27B | 8 | 80.543 ms | 18.791 ms | 483.397 ms → 423.119 ms |
 | Qwen3.5-9B | 12 | 97.071 ms | 21.174 ms | 292.792 ms → 217.324 ms |
 
-The next dominant variant on Qwen3.8-27B is K4 mul1/fp16 wide GEMV at 38.66% of self GPU time. On Qwen3.5-9B, it is K4 MCG/fp32 narrow GEMV at 31.09%.
+A-fragment reuse reduces total self GPU time from 423.119 to 400.882 ms for the eight-step Qwen3.8 profile. The dominant K4 mul1/fp16 wide kernel falls from 163.596 to 154.410 ms. For the twelve-step Qwen3.5 profile, time falls from 217.324 to 197.155 ms. Its K4 MCG/fp32 narrow kernel falls from 67.561 to 57.072 ms.
 
 ## MCG compatibility
 

@@ -150,6 +150,23 @@ __device__ __forceinline__ HipFp16x8 assemble_b_frag_gfx12(const FragB& b_hi, co
 
 // mma m16n8k16 x2 (n=16)  ->  one v_wmma_f32_16x16x16_f16
 // A from a01/a23, B from b_hi(=f0, cols 0..7) + b_lo(=f1, cols 8..15), fp32 accumulate.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+template <typename FragC_t>
+__device__ __forceinline__ void mma_ab_h_hip_gfx12_preassembled_a(
+    const HipFp16x8& a,
+    const FragB& b_hi,
+    const FragB& b_lo,
+    FragC_t& c)
+{
+    static_assert(sizeof(FragC_t) == sizeof(HipFp32x8),
+                  "gfx12 path accumulates in 8 fp32 per lane (FragC8)");
+    HipFp16x8 b = assemble_b_frag_gfx12(b_hi, b_lo);
+    HipFp32x8 d = *reinterpret_cast<HipFp32x8*>(&c);
+    d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, d);
+    *reinterpret_cast<HipFp32x8*>(&c) = d;
+}
+#endif
+
 template <typename FragC_t>
 __device__ __forceinline__ void mma_ab_h_hip(
     const FragB& a01,
@@ -159,13 +176,8 @@ __device__ __forceinline__ void mma_ab_h_hip(
     FragC_t& c)
 {
 #if defined(__gfx1200__) || defined(__gfx1201__)
-    static_assert(sizeof(FragC_t) == sizeof(HipFp32x8),
-                  "gfx12 path accumulates in 8 fp32 per lane (FragC8)");
     HipFp16x8 a = assemble_a_frag_gfx12(a01, a23);
-    HipFp16x8 b = assemble_b_frag_gfx12(b_hi, b_lo);
-    HipFp32x8 d = *reinterpret_cast<HipFp32x8*>(&c);
-    d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, d);
-    *reinterpret_cast<HipFp32x8*>(&c) = d;
+    mma_ab_h_hip_gfx12_preassembled_a(a, b_hi, b_lo, c);
 #elif defined(__gfx90a__) || defined(__gfx94__) || defined(__gfx950__)
     // CDNA MFMA layout is not oracle-verified. This inert body exists only so a fat ROCm
     // build can compile; exl3_gemv_try_launch rejects CDNA at runtime.
