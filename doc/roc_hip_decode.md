@@ -98,7 +98,9 @@ Reusing each assembled WMMA A fragment across adjacent N tiles provides another 
 | Qwen3.8-27B | 16.315 tok/s | 17.325 tok/s | 6.2% |
 | Qwen3.5-9B | 47.315 tok/s | 51.917 tok/s | 9.7% |
 
-Compared with the earlier all-reconstruct baseline, the current backend measures 3.76x faster on Qwen3.8-27B (4.603 to 17.325 tok/s). Qwen3.5-9B measures 3.50x faster (14.847 to 51.917 tok/s). These cross-run ratios show the cumulative backend improvement; the tables above are controlled incremental comparisons.
+Specializing the m=1 reduction for its single valid output row raises Qwen3.8-27B from 17.285 to 18.115 tok/s (4.8%). Qwen3.5-9B rises from 51.880 to 54.411 tok/s (4.9%). This reduces kernel LDS use from 28,672 to 14,336 bytes and raises occupancy from two to four blocks per compute unit.
+
+Compared with the earlier all-reconstruct baseline, the current backend measures 3.94x faster on Qwen3.8-27B (4.603 to 18.115 tok/s). Qwen3.5-9B measures 3.66x faster (14.847 to 54.411 tok/s). These cross-run ratios show the cumulative backend improvement; the tables and percentages above are controlled incremental comparisons.
 
 Steady-state profiles after prefill show the K6 vocabulary head changing from reconstruct plus rocBLAS hgemm to one direct kernel:
 
@@ -108,6 +110,8 @@ Steady-state profiles after prefill show the K6 vocabulary head changing from re
 | Qwen3.5-9B | 12 | 97.071 ms | 21.174 ms | 292.792 ms → 217.324 ms |
 
 A-fragment reuse reduces total self GPU time from 423.119 to 400.882 ms for the eight-step Qwen3.8 profile. The dominant K4 mul1/fp16 wide kernel falls from 163.596 to 154.410 ms. For the twelve-step Qwen3.5 profile, time falls from 217.324 to 197.155 ms. Its K4 MCG/fp32 narrow kernel falls from 67.561 to 57.072 ms.
+
+The one-row reduction lowers the Qwen3.8 wide K4 kernel again, from 154.413 to 140.053 ms in a controlled profile. The corresponding Qwen3.5 wide K4 kernel falls from 51.207 to 42.012 ms; its narrow kernel is effectively unchanged.
 
 ## MCG compatibility
 
