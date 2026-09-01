@@ -66,20 +66,19 @@ def _roc_available():
     return True
 
 
-def _require_gfx1201():
+def _require_gfx12():
     if not _roc_available():
         pytest.skip("ROCm build / device not available")
     if not hasattr(ext, "exl3_gemv_supported") or not ext.exl3_gemv_supported(0):
         pytest.skip("synthetic GEMV oracle is limited to gfx1200/gfx1201")
     arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if not arch.startswith("gfx1201"):
-        pytest.skip(f"synthetic GEMV oracle is bounded to gfx1201, got {arch or 'unknown'}")
+    if not arch.startswith(("gfx1200", "gfx1201")):
+        pytest.skip(f"HIP GEMV oracle requires gfx1200/gfx1201, got {arch or 'unknown'}")
 
 
 @pytest.fixture(scope="module")
 def model():
-    if not _roc_available():
-        pytest.skip("ROCm build / device not available")
+    _require_gfx12()
     if not os.path.isdir(MODEL):
         pytest.skip(f"Test model not found: {MODEL} (set EXL3_TEST_MODEL)")
     config = Config.from_directory(MODEL)
@@ -196,7 +195,7 @@ def _load_then_compare(model, linear_key, norm_key, batch_size):
 @torch.inference_mode()
 def test_hip_gemv_direct_binding_accepts_rank3_inputs():
     """The direct HIP binding must accept arbitrary-rank contiguous leading dims."""
-    _require_gfx1201()
+    _require_gfx12()
     size_k = size_n = 128
     A = torch.randn((1, 1, size_k), dtype=torch.float16, device="cuda") * 1e-3
     B = torch.full((size_k // 16, size_n // 16, 4 * 16), 0x1111, dtype=torch.int16, device="cuda")
@@ -232,7 +231,7 @@ def test_hip_gemv_direct_binding_accepts_rank3_inputs():
 @torch.inference_mode()
 def test_hip_gemv_synthetic_oracle(K, mcg, mul1):
     """Every HIP-instantiated bitrate/codebook family matches the reconstruct oracle."""
-    _require_gfx1201()
+    _require_gfx12()
     torch.manual_seed(1234 + K + 10 * mcg + 100 * mul1)
     size_k = size_n = 128
     # These nonzero repeated cycles are valid finite trellises for their codebooks. Random

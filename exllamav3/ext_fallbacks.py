@@ -34,10 +34,18 @@ def silu_oai_mul(
     z: torch.Tensor,
     act_limit: float = 0.0,
 ) -> None:
-    # OAI variant: silu(x * y) — see activation.cu
-    r = F.silu(x * y)
+    # GPT-OSS clamped SwiGLU: clamp the gate from above and the up projection
+    # symmetrically before applying the 1.702-scaled sigmoid and up-path bias.
+    if x.dtype not in (torch.float16, torch.float32) or y.dtype != x.dtype or z.dtype != torch.float16:
+        raise TypeError("silu_oai_mul expects matching float16/float32 inputs and float16 output")
+    gate = x.float()
+    up = y.float()
     if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
+        gate = gate.clamp(max = act_limit)
+        up = up.clamp(min = -act_limit, max = act_limit)
+    r = (up + 1.0) * gate * torch.sigmoid(1.702 * gate)
+    if x.dtype == torch.float32 and z.dtype == torch.float16:
+        r = r.clamp(min = -65504.0, max = 65504.0)
     z.copy_(r)
 
 def gelu_mul(
@@ -76,13 +84,24 @@ def relu_mul(
 def xielu(
     x: torch.Tensor,
     y: torch.Tensor,
-    z: torch.Tensor,
-    act_limit: float = 0.0,
+    alpha_p: torch.Tensor,
+    alpha_n: torch.Tensor,
 ) -> None:
-    r = (torch.tanh(x.clamp(min = -2.3562, max = 2.3562)) * x) * y
-    if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
-    z.copy_(r)
+    if x.dtype != torch.float32 or y.dtype != torch.float16:
+        raise TypeError("xielu expects float32 input and float16 output")
+    if any(a.device.type != "cpu" or a.numel() < 1 for a in (alpha_p, alpha_n)):
+        raise ValueError("alpha_p and alpha_n must be nonempty CPU tensors")
+    if any(a.dtype not in (torch.float32, torch.float16, torch.bfloat16) for a in (alpha_p, alpha_n)):
+        raise TypeError("unsupported alpha_p or alpha_n dtype")
+    p = F.softplus(alpha_p.reshape(-1)[0].float(), threshold = 20.0).item()
+    n = F.softplus(alpha_n.reshape(-1)[0].float(), threshold = 20.0).item() + 0.5
+    eps = torch.scalar_tensor(-9.9838e-7, dtype = torch.float32, device = x.device)
+    r = torch.where(
+        x > 0,
+        p * x.square() + 0.5 * x,
+        (torch.expm1(torch.minimum(x, eps)) - x) * n + 0.5 * x,
+    )
+    y.copy_(r.clamp(min = -65504.0, max = 65504.0))
 
 
 # -- In-place gate ops (activation.cu) -----------------------------------------
@@ -90,18 +109,43 @@ def xielu(
 def mul_sigmoid_(o: torch.Tensor, g: torch.Tensor) -> None:
     o.mul_(torch.sigmoid(g))
 
+def _validate_broadcast_gate(o: torch.Tensor, g: torch.Tensor) -> None:
+    if o.dtype != torch.float16 or g.dtype != torch.float16:
+        raise TypeError("broadcast gate expects float16 tensors")
+    if o.ndim != 4 or g.ndim != 3 or o.shape[:-1] != g.shape:
+        raise ValueError("broadcast gate expects x [B, S, H, D] and gate [B, S, H]")
+
+
 def mul_sigmoid_broadcast_(o: torch.Tensor, g: torch.Tensor) -> None:
-    o.mul_(torch.sigmoid(g))
+    _validate_broadcast_gate(o, g)
+    o.mul_(torch.sigmoid(g).unsqueeze(-1))
+
 
 def mul_softplus_broadcast_(o: torch.Tensor, g: torch.Tensor) -> None:
-    o.mul_(F.softplus(g.float(), threshold = 11).to(o.dtype))
+    _validate_broadcast_gate(o, g)
+    o.copy_((o.float() * F.softplus(g.float()).unsqueeze(-1)).to(o.dtype))
 
-def add_sigmoid_gate(g: torch.Tensor, o: torch.Tensor) -> None:
-    o.add_(g).mul_(torch.sigmoid(o))
 
-def add_sigmoid_gate_proj(x: torch.Tensor, g: torch.Tensor, o: torch.Tensor) -> None:
-    o.copy_(x + g)
-    o.mul_(torch.sigmoid(o))
+def add_sigmoid_gate(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> None:
+    if any(t.dtype != torch.float32 for t in (x, y, z)):
+        raise TypeError("add_sigmoid_gate expects float32 tensors")
+    if y.shape[-1:] != (1,) or x.shape[:-1] != y.shape[:-1] or z.shape != x.shape:
+        raise ValueError("add_sigmoid_gate expects x/z [..., D] and gate [..., 1]")
+    z.add_(x * torch.sigmoid(y))
+
+
+def add_sigmoid_gate_proj(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    z: torch.Tensor,
+    w: torch.Tensor,
+) -> None:
+    if x.dtype != torch.float32 or z.dtype != torch.float32 or y.dtype != torch.float16 or w.dtype != torch.float16:
+        raise TypeError("add_sigmoid_gate_proj expects float32 x/z and float16 y/w")
+    if x.shape != y.shape or z.shape != x.shape or w.ndim != 2 or w.shape != (x.shape[-1], 1):
+        raise ValueError("add_sigmoid_gate_proj expects x/y/z [..., D] and w [D, 1]")
+    gate = torch.matmul(y.float(), w.float())
+    z.add_(x * torch.sigmoid(gate))
 
 
 # -- Attention helpers (activation.cu) ----------------------------------------
@@ -112,10 +156,16 @@ def deinterleave_qg(
     g: torch.Tensor,
     head_dim: int,
 ) -> None:
-    bsz, qlen = qg.shape[0], qg.shape[1]
-    chunks = qg.view(bsz, qlen, -1, head_dim * 2)
-    q.copy_(chunks[..., :head_dim].reshape(q.shape))
-    g.copy_(chunks[..., head_dim:].reshape(g.shape))
+    if any(t.dtype != torch.float16 for t in (qg, q, g)):
+        raise TypeError("deinterleave_qg expects float16 tensors")
+    if head_dim <= 0 or q.numel() != g.numel() or q.numel() * 2 != qg.numel():
+        raise ValueError("deinterleave_qg size mismatch")
+    if qg.shape[-1] % (2 * head_dim):
+        raise ValueError("qg last dimension must contain whole interleaved heads")
+    heads = qg.shape[-1] // (2 * head_dim)
+    chunks = qg.reshape(*qg.shape[:-1], heads, 2 * head_dim)
+    q.copy_(chunks[..., :head_dim].reshape_as(q))
+    g.copy_(chunks[..., head_dim:].reshape_as(g))
 
 
 # -- Norm ops (norm.cu) --------------------------------------------------------
@@ -131,23 +181,41 @@ def rms_norm(
     add_residual: bool,
     w_groups: int = 1,
 ) -> None:
-    # w_groups: v1.4.5 multi-group RMS norm. For w_groups==1 (the common case this
-    # fallback targets) the per-row weighting below is exact; multi-group weighting
-    # would need per-group scale application and is approximated here.
-    xf = x.float()
+    if x.dtype not in (torch.float16, torch.float32) or y.dtype not in (torch.float16, torch.float32):
+        raise TypeError("rms_norm expects float16/float32 input and output")
+    if w is not None and w.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("rms_norm expects float16/bfloat16 weight")
+    if x.shape != y.shape or w_groups < 1:
+        raise ValueError("rms_norm input/output shape or w_groups mismatch")
+    if span_heads and w_groups != 1:
+        raise ValueError("rms_norm w_groups and span_heads are exclusive")
+    xn = x.flatten(-2) if span_heads else x
+    yn = y.flatten(-2) if span_heads else y
+    dim = xn.shape[-1]
+    rows = xn.numel() // dim
+    xf = xn.reshape(rows, dim).float()
+    if x.dtype == torch.float16:
+        xf = xf.clamp(min = -65504.0, max = 65504.0)
+    xf = xf * torch.rsqrt(xf.square().mean(dim = -1, keepdim = True) + eps)
+    xf = xf * constant_scale
     if w is not None:
-        wf = (w + constant_bias).float() if constant_bias != 0.0 else w.float()
-    else:
-        wf = None
-    var = xf.pow(2).mean(dim = -1, keepdim = True) + eps
-    xf = xf * torch.rsqrt(var) * constant_scale
-    if wf is not None:
-        xf = xf * wf
+        wf = w.float()
+        if constant_bias != 0.0:
+            wf = wf + constant_bias
+        if w_groups == 1:
+            if w.numel() != dim:
+                raise ValueError("rms_norm weight must have dim elements")
+            xf = xf * wf.reshape(1, dim)
+        else:
+            if w.numel() != w_groups * dim:
+                raise ValueError("rms_norm weight must have w_groups * dim elements")
+            row_groups = torch.arange(rows, device = x.device) % w_groups
+            xf = xf * wf.reshape(w_groups, dim).index_select(0, row_groups)
+    result = xf.reshape_as(yn)
     if add_residual:
-        # RES_POST semantics (norm.cu): y += norm(x) * w, preserving original y.
-        y.add_(xf.to(y.dtype))
+        yn.copy_((yn.float() + result).to(yn.dtype))
     else:
-        y.copy_(xf.to(y.dtype))
+        yn.copy_(result.to(yn.dtype))
 
 def rms_norm_res_in(
     x: torch.Tensor,
@@ -158,10 +226,21 @@ def rms_norm_res_in(
     constant_bias: float,
     constant_scale: float,
 ) -> None:
-    r.add_(x)
+    if x.dtype not in (torch.float16, torch.float32) or r.dtype not in (torch.float16, torch.float32):
+        raise TypeError("rms_norm_res_in expects float16/float32 input and residual")
+    if y.dtype != torch.float16 or (w is not None and w.dtype not in (torch.float16, torch.bfloat16)):
+        raise TypeError("rms_norm_res_in expects float16 output and float16/bfloat16 weight")
+    if x.shape != y.shape or x.shape != r.shape:
+        raise ValueError("rms_norm_res_in tensor shapes must match")
+    x_add = x.float()
+    if x.dtype == torch.float16:
+        x_add = x_add.clamp(min = -65504.0, max = 65504.0)
+    r.copy_((r.float() + x_add).to(r.dtype))
     rf = r.float()
     if w is not None:
-        wf = (w + constant_bias).float() if constant_bias != 0.0 else w.float()
+        if w.numel() != x.shape[-1]:
+            raise ValueError("rms_norm_res_in weight must have dim elements")
+        wf = w.float() + constant_bias if constant_bias != 0.0 else w.float()
     else:
         wf = None
     var = rf.pow(2).mean(dim = -1, keepdim = True) + eps
@@ -181,38 +260,44 @@ def gated_rms_norm(
     gate_first: bool,
     gate_act: int = 0,
 ) -> None:
-    gate = F.silu if gate_act == 0 else F.gelu  # ACT_SILU=0 / ACT_GELU=1
-    xf = x.float()
-    gf = g.float()
-    if gate_first:
-        hidden = xf * gate(gf)
-        if w_groups > 1:
-            wf = w.view(w_groups, -1).float()
-            hidden_2d = hidden.view(-1, wf.shape[1])
-            var = hidden_2d.pow(2).mean(dim = -1, keepdim = True) + eps
-            hidden_2d = hidden_2d * torch.rsqrt(var)
-            hidden = (wf * hidden_2d).view(hidden.shape)
-        else:
-            var = hidden.pow(2).mean(-1, keepdim = True) + eps
-            hidden = hidden * torch.rsqrt(var)
-            hidden = w.float() * hidden
-    else:
-        var = xf.pow(2).mean(-1, keepdim = True) + eps
-        xf = xf * torch.rsqrt(var)
-        if w_groups > 1:
-            hidden = w.view(w_groups, -1).float() * xf.view(-1, w.shape[-1] // w_groups if w.dim() > 1 else w.shape[0] // w_groups)
-        else:
-            hidden = w.float() * xf
-        hidden = hidden * gate(gf)
-    y.copy_(hidden.to(y.dtype))
+    if x.dtype != torch.bfloat16 or y.dtype not in (torch.float16, torch.float32):
+        raise TypeError("gated_rms_norm expects bfloat16 input and float16/float32 output")
+    if w.dtype not in (torch.bfloat16, torch.float32) or g.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError("gated_rms_norm weight/gate dtype mismatch")
+    if x.shape != y.shape or x.shape != g.shape or w_groups < 1:
+        raise ValueError("gated_rms_norm input/output shape or w_groups mismatch")
+    if gate_act not in (0, 1):
+        raise ValueError("gated_rms_norm gate_act must be 0 (SiLU) or 1 (sigmoid)")
+    dim = x.shape[-1]
+    rows = x.numel() // dim
+    if w.numel() != w_groups * dim:
+        raise ValueError("gated_rms_norm weight must have w_groups * dim elements")
+
+    xf = x.reshape(rows, dim).float()
+    gf = g.reshape(rows, dim).float()
+    gate = torch.sigmoid(gf) if gate_act == 1 else F.silu(gf)
+    norm_input = xf * gate if gate_first else xf
+    hidden = norm_input * torch.rsqrt(
+        norm_input.square().mean(dim = -1, keepdim = True) + eps
+    )
+    wf = w.float().reshape(w_groups, dim)
+    if constant_bias != 0.0:
+        wf = wf + constant_bias
+    row_groups = torch.arange(rows, device = x.device) % w_groups
+    hidden = hidden * wf.index_select(0, row_groups)
+    if not gate_first:
+        hidden = hidden * gate
+    y.copy_(hidden.reshape_as(y).to(y.dtype))
 
 
 # -- Softcap (softcap.cu) ------------------------------------------------------
 
-def softcap(x: torch.Tensor, cap: float) -> torch.Tensor:
-    if cap == 0.0:
-        return x
-    return torch.tanh(x / cap) * cap
+def softcap(x: torch.Tensor, y: torch.Tensor, cap: float) -> None:
+    if x.dtype not in (torch.float16, torch.float32) or y.dtype != x.dtype:
+        raise TypeError("softcap expects matching float16 or float32 tensors")
+    if x.shape != y.shape:
+        raise ValueError("softcap input and output shapes must match")
+    y.copy_(torch.tanh(x.float() / cap).mul_(cap).to(y.dtype))
 
 
 # -- Quantized cache (cache/q_cache.cu) ----------------------------------------
@@ -461,15 +546,26 @@ def _dequant_cache_paged(
     max_tokens = pages_per_seq * page_size
     chunks_per_token = (groups + 3) // 4
     tokens_per_block = 256 // chunks_per_token
-    for first in range(0, max_tokens, max(1, _CACHE_ROW_CHUNK // max(bsz, 1))):
-        count = min(max(1, _CACHE_ROW_CHUNK // max(bsz, 1)), max_tokens - first)
+    limits = (cache_seqlens.to(torch.long) + bonus_len).clamp(min = 0, max = max_tokens)
+    if sliding_window > 0:
+        window_starts = ((limits - sliding_window).clamp_min(0) // tokens_per_block) * tokens_per_block
+    else:
+        window_starts = torch.zeros_like(limits)
+
+    # This correctness fallback trades one bounded device-to-host synchronization for loop
+    # bounds that cover only the required cache extent. The lower bound retains the native
+    # launch block containing each sequence's window; compact destinations remain logical.
+    host_bounds = torch.stack((window_starts.amin(), limits.amax())).cpu().tolist()
+    first_required, last_required = host_bounds
+    rows_per_chunk = max(1, _CACHE_ROW_CHUNK // max(bsz, 1))
+    for first in range(first_required, last_required, rows_per_chunk):
+        count = min(rows_per_chunk, last_required - first)
         source, logical = _paged_positions(torch.zeros_like(cache_seqlens), block_table, page_size, first, count)
         batch = torch.arange(bsz, device = k_in.device, dtype = torch.long).unsqueeze(1).expand(bsz, count).reshape(-1)
-        limit = cache_seqlens.to(torch.long).repeat_interleave(count) + bonus_len
+        limit = limits.repeat_interleave(count)
         valid = logical < limit
         if sliding_window > 0:
-            window_start = ((limit - sliding_window).clamp_min(0) // tokens_per_block) * tokens_per_block
-            valid &= logical >= window_start
+            valid &= logical >= window_starts.repeat_interleave(count)
         destination = (batch * pages_per_seq * page_size + logical) if compact_out else source
         for packed, scales, out in ((k_in, k_in_scales, k_out), (v_in, v_in_scales, v_out)):
             bits = packed.shape[-1] // groups
