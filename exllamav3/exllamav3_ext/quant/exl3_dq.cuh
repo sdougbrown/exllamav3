@@ -168,15 +168,15 @@ __device__ __forceinline__ void dq8_aligned_4bits(const uint32_t* ptr, int t_off
     i0 = (i1 + 31) & 31;
     a = ptr[i0];
     b = ptr[i1];
-    FSHF_IMM(s, b, a, 20);
+    s = __funnelshift_r(b, a, 20);   // FSHF_IMM (shf.r.wrap.b32)
     w7 = b & 0xffff;
-    BFE16_IMM(w6, b, 4);
-    BFE16_IMM(w5, b, 8);
-    BFE16_IMM(w4, b, 12);
-    BFE16_IMM(w3, b, 16);
+    w6 = (b >> 4) & 0xffff;          // BFE16_IMM (bfe.u32 len=16)
+    w5 = (b >> 8) & 0xffff;
+    w4 = (b >> 12) & 0xffff;
+    w3 = (b >> 16) & 0xffff;
     w2 = s & 0xffff;
-    BFE16_IMM(w1, s, 4);
-    BFE16_IMM(w0, s, 8);
+    w1 = (s >> 4) & 0xffff;
+    w0 = (s >> 8) & 0xffff;
     frag0[0] = decode_3inst_2<cb>(w0, w1);
     frag0[1] = decode_3inst_2<cb>(w2, w3);
     frag1[0] = decode_3inst_2<cb>(w4, w5);
@@ -193,13 +193,13 @@ __device__ __forceinline__ void dq8_aligned_2bits(const uint32_t* ptr, int t_off
     b = ptr[i1];
     b = fshift(b, a, ((~t_offset) & 8) << 1);
     w7 = b & 0xffff;
-    BFE16_IMM(w6, b, 2);
-    BFE16_IMM(w5, b, 4);
-    BFE16_IMM(w4, b, 6);
-    BFE16_IMM(w3, b, 8);
-    BFE16_IMM(w2, b, 10);
-    BFE16_IMM(w1, b, 12);
-    BFE16_IMM(w0, b, 14);
+    w6 = (b >> 2) & 0xffff;   // BFE16_IMM (bfe.u32 len=16)
+    w5 = (b >> 4) & 0xffff;
+    w4 = (b >> 6) & 0xffff;
+    w3 = (b >> 8) & 0xffff;
+    w2 = (b >> 10) & 0xffff;
+    w1 = (b >> 12) & 0xffff;
+    w0 = (b >> 14) & 0xffff;
     frag0[0] = decode_3inst_2<cb>(w0, w1);
     frag0[1] = decode_3inst_2<cb>(w2, w3);
     frag1[0] = decode_3inst_2<cb>(w4, w5);
@@ -216,13 +216,13 @@ __device__ __forceinline__ void dq8_aligned_1bit(const uint32_t* ptr, int t_offs
     b = ptr[i1];
     b = fshift(b, a, ((~t_offset) & 24));
     w7 = b & 0xffff;
-    BFE16_IMM(w6, b, 1);
-    BFE16_IMM(w5, b, 2);
-    BFE16_IMM(w4, b, 3);
-    BFE16_IMM(w3, b, 4);
-    BFE16_IMM(w2, b, 5);
-    BFE16_IMM(w1, b, 6);
-    BFE16_IMM(w0, b, 7);
+    w6 = (b >> 1) & 0xffff;   // BFE16_IMM (bfe.u32 len=16)
+    w5 = (b >> 2) & 0xffff;
+    w4 = (b >> 3) & 0xffff;
+    w3 = (b >> 4) & 0xffff;
+    w2 = (b >> 5) & 0xffff;
+    w1 = (b >> 6) & 0xffff;
+    w0 = (b >> 7) & 0xffff;
     frag0[0] = decode_3inst_2<cb>(w0, w1);
     frag0[1] = decode_3inst_2<cb>(w2, w3);
     frag1[0] = decode_3inst_2<cb>(w4, w5);
