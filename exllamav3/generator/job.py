@@ -819,7 +819,7 @@ class Job:
             return emit(results, emit_eos = True, eos_reason = "stop_token", stop_token = token)
 
         # Stop if we reach max_new_tokens
-        if self.new_tokens >= self.max_new_tokens - self.generator.num_draft_tokens:
+        if self.new_tokens >= self.max_new_tokens:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "max_new_tokens")
 
         # End on filter completed
@@ -1093,7 +1093,7 @@ class Job:
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
                 self.max_rq_tokens = y - x
         else:
-            self.max_rq_tokens = self.max_new_tokens + 1
+            self.max_rq_tokens = self.max_new_tokens + self.generator.num_draft_tokens + 1
 
         # Compatibility checks
         if self.banned_strings and self.generator.recurrent_cache is not None:

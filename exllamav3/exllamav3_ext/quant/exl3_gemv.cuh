@@ -12,8 +12,9 @@
 bool exl3_gemv_supported(int device);
 
 #if defined(USE_ROCM)
-// gfx12 decode-only grouped MoE path for the Qwen3.8 Flash K3/mul1 expert shape.
-// Routing IDs and weights remain device-resident; duplicate slots are preserved.
+// gfx12 decode/verification grouped MoE path for the Qwen3.8 Flash K3/mul1 expert shape.
+// Supports 1..5 token rows; routing IDs and weights remain device-resident and duplicate
+// assignment slots are preserved independently per token.
 void exl3_moe_gfx12_k3
 (
     const at::Tensor& A,

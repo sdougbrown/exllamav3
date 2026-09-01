@@ -64,7 +64,7 @@ Current local verification on gfx1201 includes:
 - 88 cache / reconstruct tests
 - 61 multi-head latent attention (MLA) / DeepSeek sparse attention (DSA) tests
 - 34 native ROCm hyperconnection route, numerical, stream, validation, and fallback tests
-- 43 grouped K3 MoE route, numerical, safety, LoRA, and fallback tests, plus an opt-in full Flash oracle
+- 63 grouped K3 MoE route, numerical, multirow, safety, LoRA, and fallback tests, plus opt-in full Flash and MTP oracles
 - 44 native ROCm shared-gate fusion, stream, validation, and fallback tests
 - 25 gfx12 batch-one router numerical, tie, stream, validation, fallback, and real-layer tests
 - forced-identical-context 16-step logits oracles for mul1 and MCG models
@@ -142,9 +142,15 @@ A gfx12 batch-one standard router replaces each remaining 2560-by-512 rocBLAS pr
 
 The grouped path's first real-model layer difference is 1.49e-8 maximum in fp32 output. Qwen4Exp recurrent state amplifies numerical noise. A 16-step fallback repeat measured a 3.63 maximum logit delta and 0.270 mean delta. The grouped pass measured 4.44 and 0.274. Both retained 15/16 top-1 agreement with the reference pass and at least 4/5 top-five overlap. The opt-in full-model oracle includes that fallback control and verifies grouped execution on both gfx1201 devices.
 
-The 30.4 tok/s target-only short-context median is above the historical 19.43 tok/s llama.cpp target-only result for this host. It is not directly comparable to llama.cpp's MTP or long-context sparse-QSA measurements, and those remain faster or unqualified respectively.
+The 30.4 tok/s target-only short-context median is above the historical 19.43 tok/s llama.cpp target-only result for this host.
 
-This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP has not been enabled, and sparse QSA beyond the short-context dense threshold still needs ROCm qualification. The remaining short-context bottlenecks are launch count, K5 projections, and grouped K3 expert work. Warmed 511-token prefill reached 341 tok/s, near the historical 361 tok/s llama.cpp pp512 result; the first cold prompt measured 205 tok/s. Long-context performance still needs separate measurement before comparison with sparse QSA serving results.
+The checkpoint also includes its complete 6,200-tensor MTP head; no separate EXL3 draft download is required. The draft adds approximately 1.25 GB on GPU0. Grouped K3 execution now supports verification windows of up to five rows. This moves MTP3 from 17.50 to 49.79 tok/s in a controlled on/off comparison. It also preserves duplicate routing slots and deterministic per-token reductions.
+
+Across three warmed 64-token trials, target-only measured 38.34 tok/s. MTP1/2/3/4 measured 47.91, 50.19, 53.56, and 43.30 tok/s respectively. MTP3 is the recommended short-context setting. Its three trials accepted 40–43 draft tokens and rejected 20–32 while producing coherent output. Speculative jobs now honor the same maximum output length as target-only jobs instead of reserving an unused full draft window.
+
+The MTP3 result is above the historical 45–50 tok/s llama.cpp short-context MTP band, but the prompt and active-context lengths differ. Long-context sparse-QSA performance remains unqualified.
+
+This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP3 is validated at short context, but long-context acceptance and sparse QSA beyond the dense threshold still need ROCm qualification. The remaining short-context bottlenecks are launch count, K5 projections, and grouped K3 expert work. Warmed 511-token prefill reached 341 tok/s, near the historical 361 tok/s llama.cpp pp512 result; the first cold prompt measured 205 tok/s. Long-context performance still needs separate measurement before comparison with sparse QSA serving results.
 
 ## MCG compatibility
 
