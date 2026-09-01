@@ -57,11 +57,11 @@ def test_rms_norm(batch_size, dim, in_dtype, out_dtype, epsilon):
 
     ref_y = reference_rms_norm(x, w, epsilon, y.dtype)
 
-    ext.rms_norm(x, w, y, epsilon)
+    ext.rms_norm(x, w, y, epsilon, 0.0, 1.0, False, False)
     torch.testing.assert_close(y, ref_y, rtol = 1e-3, atol = 1e-3)
 
     if in_dtype == out_dtype:
-        ext.rms_norm(x, w, x, epsilon)
+        ext.rms_norm(x, w, x, epsilon, 0.0, 1.0, False, False)
         torch.testing.assert_close(x, y, rtol = 1e-3, atol = 1e-3)
 
 bm_batch = 8192
@@ -87,7 +87,7 @@ def test_rms_norm_benchmark(benchmark, batch_size, dim, in_dtype, out_dtype):
     def run():
         torch.cuda.synchronize()
         for _ in range(bm_batch // batch_size):
-            ext.rms_norm(x, w, y, epsilon)
+            ext.rms_norm(x, w, y, epsilon, 0.0, 1.0, False, False)
         torch.cuda.synchronize()
 
     benchmark(run)
