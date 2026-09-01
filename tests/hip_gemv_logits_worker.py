@@ -24,11 +24,15 @@ def _roc_available():
 def _require_gfx12():
     if not _roc_available():
         raise SystemExit("ROCm build / device not available")
-    if not hasattr(ext, "exl3_gemv_supported") or not ext.exl3_gemv_supported(0):
-        raise SystemExit("synthetic GEMV oracle is limited to gfx1200/gfx1201")
     arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if not arch.startswith(("gfx1200", "gfx1201")):
+    if arch.split(":", 1)[0] not in ("gfx1200", "gfx1201"):
         raise SystemExit(f"HIP GEMV oracle requires gfx1200/gfx1201, got {arch or 'unknown'}")
+    assert hasattr(ext, "exl3_gemv"), \
+        "gfx12 target build is missing the required ext.exl3_gemv binding"
+    assert hasattr(ext, "exl3_gemv_supported"), \
+        "gfx12 target build is missing the required ext.exl3_gemv_supported binding"
+    assert ext.exl3_gemv_supported(0), \
+        f"ext.exl3_gemv_supported rejected gfx12 device 0 ({arch})"
 
 
 STEPS = 16

@@ -81,7 +81,7 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
 {
     if (mode == 0) return -1;
 #if defined(USE_ROCM)
-    if (!((K >= 2 && K <= 4) || K == 6)) return -1;
+    if (K < 2 || K > 6) return -1;
 #else
     if (K < 2 || K > 4) return -1;
 #endif
@@ -126,6 +126,7 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID(4, 0) SEL_GRID(4, 1) SEL_GRID(4, 2)
     SEL_GRID(2, 1) SEL_GRID(2, 2)
     SEL_GRID(3, 1) SEL_GRID(3, 2)
+    SEL_GRID(5, 1) SEL_GRID(5, 2)
     SEL_GRID(6, 1) SEL_GRID(6, 2)
     #undef SEL_GRID
     #undef SEL
@@ -171,7 +172,7 @@ bool exl3_gemv_try_launch
     // that could actually take this path
     if (!has_su_sv) return false;
 #if defined(USE_ROCM)
-    if (!((K >= 2 && K <= 4) || K == 6)) return false;
+    if (K < 2 || K > 6) return false;
 #else
     if (K < 2 || K > 4) return false;
 #endif
