@@ -150,9 +150,21 @@ Across three warmed 64-token trials, target-only measured 38.34 tok/s. MTP1/2/3/
 
 The MTP3 result is above the historical 45–50 tok/s llama.cpp short-context MTP band, but the prompt and active-context lengths differ. At a 4,095-token active context, target-only decode measured 31.62 tok/s. MTP3 fell to 17.56 tok/s with only one accepted draft token out of 96 proposals. Keep MTP disabled beyond short context until its acceptance is improved.
 
-Sparse-QSA target decode measured 32.38 tok/s at 11,999 tokens, with fresh prefill at 547.5 tok/s. Retrieval quality is not yet qualified. A synthetic 12K passkey prompt failed under both sparse QSA and a forced-dense control, so it did not isolate the selector.
+Sparse-QSA target decode measured 32.38 tok/s at 11,999 tokens. The original 256-token prefill chunks reached 547.5 tok/s. Matching the reference llama.cpp microbatch size with `max_chunk_size=512` raised 12K prefill to 643.1 tok/s; 1,024-token chunks regressed to 627.4 tok/s.
 
-This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP3 is validated at short context, but long-context acceptance and sparse QSA beyond the dense threshold still need ROCm qualification. The remaining short-context bottlenecks are launch count, K5 projections, and grouped K3 expert work. Warmed 511-token prefill reached 341 tok/s, near the historical 361 tok/s llama.cpp pp512 result; the first cold prompt measured 205 tok/s. Long-context retrieval quality still needs a representative control before comparison with sparse-QSA serving results.
+With 512-token chunks, synthetic prefill remained stable as context grew:
+
+| Active context | Prefill | Target decode |
+| ---: | ---: | ---: |
+| 11,999 | 643.1 tok/s | 32.45 tok/s |
+| 32,767 | 598.0 tok/s | 28.33 tok/s |
+| 65,535 | 592.8 tok/s | 28.65 tok/s |
+| 131,071 | 568.6 tok/s | 29.07 tok/s |
+| 179,999 | 563.6 tok/s | 31.69 tok/s |
+
+The 180K result retained 87.6% of the 12K prefill rate instead of falling toward 300 tok/s. Retrieval quality is not yet qualified. A synthetic 12K passkey prompt failed under both sparse QSA and a forced-dense control, so it did not isolate the selector.
+
+This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP3 is validated at short context, but long-context acceptance and sparse QSA beyond the dense threshold still need ROCm qualification. The remaining short-context bottlenecks are launch count, K5 projections, and grouped K3 expert work. Warmed 511-token prefill reached 349 tok/s with 512-token chunks, near the historical 361 tok/s llama.cpp pp512 result. Long-context retrieval quality still needs a representative control before comparison with sparse-QSA serving results.
 
 ## MCG compatibility
 
