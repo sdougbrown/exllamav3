@@ -15,9 +15,18 @@
 
 #if defined(__HIPCC__)
 
+// HIP fp16 types. cuda_fp16.h is not available under HIPCC; this is the HIP equivalent.
+// (hipify maps cuda_fp16.h -> hip_fp16.h; some toolchains keep it under hip/.)
+#include <hip/hip_fp16.h>
+
 // ---- fp16 helpers / little glue (HIP provides __funnelshift_r, __dp4a, __shfl_*) ----
 
 using half = __half;
+
+// NOTE on fp32 accumulate: the CUDA m16n8k16 f16.f16.f16.f16 path accumulates in fp16 and
+// folds to fp32 on a cadence (FOLD). The HIP MFMA target v_mfma_f32_16x16x16_f16 has only an
+// fp32-native accumulator, so the port keeps the output in FragC (fp32) and drops the fold.
+// The fragment shape therefore is FragC, NOT FragC_h.
 
 template <typename T, int n>
 struct HipVec
@@ -48,7 +57,10 @@ using FragC_h = HipVec<half2, 2>;         // legacy fp16-accum shape, kept for s
 // (a01, a23) and zeros the rest; that m==1 fast-path trick must be re-derived for the
 // AMD A-fragment lane layout (TODO below).
 //
-// B operand: k16 x n16 fp16 (full tile; was n8 per call).
+// B operand: k16 x n16 fp16 (full 16x16 weight tile). In the CUDA kernel that tile is the two
+// FragB decoded outputs f0/f1 (8 fp16 per lane; f0 = cols 0..7, f1 = cols 8..15), so it is passed
+// here as two FragB (b_hi/b_lo) for shape-parity with the decode helpers, but together they are
+// ONE MFMA B operand (8 fp16 per lane).
 // C operand: 16x16 fp32 accumulator, 4 float per lane.
 // -----------------------------------------------------------------------------------
 __device__ __forceinline__ void mma_ab_h_hip(
