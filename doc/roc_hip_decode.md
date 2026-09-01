@@ -60,31 +60,40 @@ Out of scope for this backend slice:
 
 Current local verification on gfx1201 includes:
 
-- 37 GEMV tests
+- 39 GEMV matrix, routing, and codebook tests
 - 88 cache / reconstruct tests
 - 61 multi-head latent attention (MLA) / DeepSeek sparse attention (DSA) tests
-- a forced-identical-context 16-step logits oracle
+- forced-identical-context 16-step logits oracles for mul1 and MCG models
 
-The logits oracle reports:
+The Qwen3.8-27B mul1 oracle reports:
 
 - top-1 agreement: 16/16
-- top-5 overlap: at least 4/5 tokens at every step (exact-set agreement can vary at near-tie boundaries)
+- top-5 overlap: at least 4/5 tokens at every step
 - representative max absolute logit delta: 0.4043
 - worst-step mean delta: 0.0661
 - overall mean delta: 0.0399
 - fallback-only `-inf` positions carry <1e-6 softmax mass per step
 
-Warmed Qwen3.8-27B decode on gfx1201 (three 64-token trials) measured:
+The Qwen3.5-9B MCG oracle reports:
 
-- HIP GEMV median: 14.534 tok/s
-- reconstruct fallback median: 4.603 tok/s
-- speedup: 3.16x
+- top-1 agreement: 16/16
+- exact top-5 agreement: 16/16 steps
+- max absolute logit delta: 0.21875
+- worst-step mean delta: 0.01867
+- overall mean delta: 0.00903
 
-That benchmark is one model, one prompt, one GPU. It is a useful proof point, not a general performance claim.
+Warmed decode measurements on gfx1201:
 
-## Test-fixture note
+| Model | Trial size | HIP GEMV median | Reconstruct median | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3.8-27B | 64 tokens | 14.534 tok/s | 4.603 tok/s | 3.16x |
+| Qwen3.5-9B | 128 tokens | 36.114 tok/s | 14.847 tok/s | 2.43x |
 
-During development, a local Qwen3.5-9B EXL3 fixture had a trellis labeled `mcg` that decoded like `mul1`. Treat that result as a bad fixture, not a backend failure or a general warning about Qwen models.
+These are single-model, single-prompt measurements on one GPU. They are useful proof points, not general performance claims.
+
+## MCG compatibility
+
+The Qwen3.5-9B fixture exposed an incorrect portable translation of the original PTX `lop3` expression. The fix restores the exact LUT `0x6a` semantics for plain and MCG procedural codebooks. A zero-state reconstruction test now checks the codebook value independently of both GEMV and the reconstruct implementation.
 
 ## Build and test
 
@@ -98,5 +107,9 @@ EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 \
   python -m pytest tests/test_hip_gemv_decode.py -q
 
 EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 \
+  python tests/hip_gemv_logits_oracle.py
+
+# Repeat with an MCG fixture.
+EXL3_TEST_MODEL=/path/to/Qwen3.5-9B-exl3 \
   python tests/hip_gemv_logits_oracle.py
 ```

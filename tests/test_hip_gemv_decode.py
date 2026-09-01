@@ -50,11 +50,8 @@ TEST_KEYS = [
     ("model.language_model.layers.0.linear_attn.in_proj_qkv", "model.language_model.layers.0.input_layernorm"),
 ]
 
-# NOTE on the model choice: ~/Models/Qwen3.5-9B-exl3 (exl3 qcfg v0.0.22, codebook "mcg") is
-# NOT usable as an oracle: its trellis decodes to NaN/inf under the engine's own reconstruct
-# path (pre-existing, independent of the GEMV work) because the bitstream is mul1-encoded
-# while the metadata says mcg. Qwen3.8-27B-exl3 (v1.4.2) reconstructs cleanly and is the
-# working reference model.
+# The default Qwen3.8 fixture uses the mul1 codebook. Set EXL3_TEST_MODEL to the
+# Qwen3.5-9B fixture to exercise the MCG codebook with the same oracle matrix.
 DEFAULT_MODEL = os.path.expanduser("~/Models/Qwen3.8-27B-exl3")
 MODEL = os.environ.get("EXL3_TEST_MODEL", DEFAULT_MODEL)
 
@@ -217,6 +214,34 @@ def test_hip_gemv_direct_binding_accepts_rank3_inputs():
 
 
 @pytest.mark.parametrize(
+    "mcg, multiplier, addend",
+    [
+        pytest.param(False, 89226354, 64248484, id="plain"),
+        pytest.param(True, 0xCBAC1FED, 0, id="mcg"),
+    ],
+)
+@torch.inference_mode()
+def test_procedural_codebook_matches_lop3_zero_state(mcg, multiplier, addend):
+    """The portable codebook expression must match the original PTX lop3 LUT 0x6a.
+
+    A zero packed trellis decodes every weight from state zero, making the expected
+    fp16 codebook value independent of the trellis layout and reconstruction path.
+    """
+    _require_gfx12()
+    K = 4
+    packed = torch.zeros((8, 8, K * 16), dtype=torch.int16, device="cuda")
+    weight = torch.empty((128, 128), dtype=torch.float16, device="cuda")
+    ext.reconstruct(weight, packed, K, mcg, False)
+
+    product = (0 * multiplier + addend) & 0xFFFFFFFF
+    lop3 = 0x3B603B60 ^ (product & 0x8FFF8FFF)
+    halves = torch.frombuffer(bytearray(lop3.to_bytes(4, "little")), dtype=torch.float16)
+    expected = halves.sum(dtype=torch.float16)
+
+    torch.testing.assert_close(weight, torch.full_like(weight, expected), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
     "K, mcg, mul1",
     [
         pytest.param(4, False, False, id="k4-plain"),
@@ -314,7 +339,7 @@ def test_hip_gemv_rows_over_limit_falls_back(model):
     try:
         linear.load(device="cuda")
         assert linear.inner.K == 4
-        assert linear.inner.mul1 and not linear.inner.mcg
+        assert linear.inner.mcg != linear.inner.mul1
         x = torch.randn((1, 9, linear.in_features), dtype=torch.float16, device="cuda")
         calls, restore = _spy_ext_route()
         try:
@@ -351,7 +376,7 @@ def test_hip_gemv_env_opt_out_falls_back(model, monkeypatch):
 
 @torch.inference_mode()
 def test_hip_gemv_ineligible_falls_back(model):
-    """The 27B lm_head is EXL3 at 6 bpw (K=6 > 4): the GEMV kernel is not eligible and
+    """The fixture's lm_head is EXL3 at 6 bpw (K=6 > 4): the GEMV kernel is not eligible and
     reconstruct=False MUST take the reconstruct fallback (exl3_gemv never called)."""
     assert hasattr(ext, "exl3_gemv")
     linear = model.find_module("lm_head")
