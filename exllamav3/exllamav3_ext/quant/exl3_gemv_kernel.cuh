@@ -22,14 +22,23 @@
 // the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
 
 #include <cooperative_groups.h>
+#include "hadamard_inner.cuh"   // also pulls in ../compat.cuh -> compat_rocm.cuh (FragB, shims) on ROCm
+#if defined(USE_ROCM) || defined(__HIPCC__)
+// gfx12 (RDNA4) tensor-core path: v_wmma_f32_16x16x16_f16 via the on-device-oracle-verified
+// primitive. Must come after hadamard_inner.cuh so compat_rocm.cuh's FragB is already in
+// scope (hip_mma.cuh defers to it when present).
+#include "../hip/hip_mma.cuh"
+#else
 #include "../ptx.cuh"
+#endif
 #include "exl3_dq.cuh"
 #include "exl3_kernel_map.cuh"
-#include "hadamard_inner.cuh"
 
 #define EXL3_GEMV_MAX_M 8
 
 namespace exl3_gemv_ns {
+
+#if !defined(USE_ROCM) && !defined(__HIPCC__)
 
 // mma.m16n8k16 with the A operand supplied as two FragB halves, fp16 accumulate
 __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, const FragB& b, FragC_h& c)
@@ -47,6 +56,8 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
            "r"(bb[0]), "r"(bb[1])
     );
 }
+
+#endif  // !USE_ROCM && !__HIPCC__
 
 // mul1 codebook pair decode via dp4a byte sum (bit-identical to the vabsdiff4 form)
 __device__ __forceinline__ half2 decode_pair_cb2_dp4a_(uint32_t x0, uint32_t x1)
@@ -143,10 +154,18 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
-    constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
     constexpr int THREADS = WK * 32;
-    constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
     constexpr int COLS = WNT * 16;
+
+#if defined(USE_ROCM) || defined(__HIPCC__)
+    // HIP: the WMMA fp32 C fragment holds rows 0..7 in lanes 0..15 (one column per lane,
+    // 8 rows across the 8 registers), so the reduction is always 8 rows regardless of mode;
+    // the output stage only reads rows < size_m
+    constexpr int ROWS = EXL3_GEMV_MAX_M;
+#else
+    constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
+    constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
+#endif
 
     constexpr int TWORDS = 8 * bits;                        // uint32 per 16x16 tile
     constexpr int LOADS = bits == 2 ? WNT / 2 : WNT;        // warp loads per k-slice
@@ -216,7 +235,13 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     }
 
     __shared__ float sh_red[WK][ROWS][COLS];
+#if defined(USE_ROCM) || defined(__HIPCC__)
+    // HIP: staged extraction always on (gfx12 WMMA operands must not come from __shfl_sync;
+    // see hip_mma.cuh). SMEM_STAGE is ignored and the staging buffer is unconditional.
+    __shared__ uint32_t sh_stage[WK][LOADS * LSTRIDE];
+#else
     [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
+#endif
 
     for (int group = blockIdx.x; group < num_groups; group += gridDim.x)
     {
@@ -225,10 +250,18 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         // Prefetch ring (indices must be compile-time or pf lands in local memory)
         auto ld_b = [&] (int i, int l) -> uint32_t
         {
+#if defined(USE_ROCM) || defined(__HIPCC__)
+            // no DCS load on HIP; plain load
+            if constexpr (bits == 3)
+                return lane < 24 ? *(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+            else
+                return *(bp + (size_t) i * slice_stride + l * LSTRIDE);
+#else
             if constexpr (bits == 3)
                 return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
             else
                 return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+#endif
         };
 
         uint32_t pf[PF][LOADS];
@@ -239,8 +272,14 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 for (int l = 0; l < LOADS; ++l)
                     pf[d][l] = ld_b(d, l);
 
+#if defined(USE_ROCM) || defined(__HIPCC__)
+        // fp32 accumulator: gfx12 WMMA accumulates in fp32 natively, one 16x16 tile per
+        // call, no cadence fold needed
+        FragC8 acc[WNT] = {};
+#else
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
+#endif
 
         for (int ib = 0; ib < myn; ib += PF)
         {
@@ -262,6 +301,15 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     pf[d][l] = ld_b(i + PF, l);
             }
 
+#if defined(USE_ROCM) || defined(__HIPCC__)
+            // Staged extraction: write the tile words to warp-private smem, then decode
+            __syncwarp();
+            #pragma unroll
+            for (int l = 0; l < LOADS; ++l)
+                if (bits != 3 || lane < 24)
+                    sh_stage[warp][l * LSTRIDE + lane] = bw[l];
+            __syncwarp();
+#else
             if constexpr (SMEM_STAGE)
             {
                 __syncwarp();
@@ -271,6 +319,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                         sh_stage[warp][l * LSTRIDE + lane] = bw[l];
                 __syncwarp();
             }
+#endif
 
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
@@ -284,6 +333,20 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             for (int t = 0; t < WNT; ++t)
             {
                 FragB f0, f1;
+#if defined(USE_ROCM) || defined(__HIPCC__)
+                const uint32_t* tp = &sh_stage[warp][t * TWORDS];
+                if constexpr (bits == 4)
+                    exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
+                else if constexpr (bits == 2)
+                    exl3_gemv_ns::dq8_regs_2bits<cb>(tp[x_src_a], tp[x_src_b], lane << 3, f0, f1);
+                else
+                    exl3_gemv_ns::dq8_regs_3bits<cb>(tp[x_src_a], tp[x_src_b], x_s2, f0, f1);
+
+                // One WMMA covers the full 16x16 tile: f0 = cols 0..7 (b_hi), f1 = cols 8..15
+                // (b_lo); operands are reassembled through the LDS staging inside hip_mma.cuh,
+                // never via lane shuffles
+                mma_ab_h_hip(a01, a23, f0, f1, acc[t]);
+#else
                 if constexpr (SMEM_STAGE)
                 {
                     const uint32_t* tp = &sh_stage[warp][t * TWORDS];
@@ -317,8 +380,10 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
                 exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
                 exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+#endif
             }
 
+#if !defined(USE_ROCM) && !defined(__HIPCC__)
             if ((d + 1) % FOLD == 0 || i + 1 == myn)
             {
                 #pragma unroll
@@ -331,9 +396,24 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                         ch[t][f][0] = hzero;
                     }
             }
+#endif
         }
         }
 
+#if defined(USE_ROCM) || defined(__HIPCC__)
+        // Cross-warp reduction over the k splits, HIP C-fragment layout (oracle-verified):
+        //   C(lane, reg) = C[row = (lane>>4)*8 + reg][col = lane & 15]
+        // m <= 8 keeps all valid rows in the first half-warp: lanes 0..15 each hold one
+        // column of the tile across all 8 row registers
+        if (lane < 16)
+        {
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+                #pragma unroll
+                for (int r = 0; r < EXL3_GEMV_MAX_M; ++r)
+                    sh_red[warp][r][t * 16 + lane] = acc[t][r];
+        }
+#else
         // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
         // tile*16 + frag*8 + 2*(l%4) (+1)
         {
@@ -353,6 +433,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     }
             }
         }
+#endif
         __syncthreads();
 
         const int rows_out = MMODE == 0 ? 1 : min(size_m, ROWS);

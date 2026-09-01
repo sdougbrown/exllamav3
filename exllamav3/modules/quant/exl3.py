@@ -11,7 +11,23 @@ AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
+# Max rows served by the HIP decode GEMV kernel (EXL3_GEMV_MAX_M in
+# exllamav3_ext/quant/exl3_gemv_kernel.cuh); larger decode batches fall back to reconstruct
+EXL3_GEMV_HIP_MAX_M = 8
+
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
+_hip_gemv_support_cache: dict[int, bool] = {}
+
+
+def _hip_gemv_supported(device: torch.device) -> bool:
+    """Cache the extension's runtime architecture check for the HIP-only decode route."""
+    if not torch.version.hip or not hasattr(ext, "exl3_gemv_supported"):
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _hip_gemv_support_cache:
+        _hip_gemv_support_cache[index] = ext.exl3_gemv_supported(index)
+    return _hip_gemv_support_cache[index]
+
 
 class LinearEXL3:
 
@@ -136,8 +152,37 @@ class LinearEXL3:
                 if self.bc is not None:
                     dtype = out_dtype or self.default_out_dtype
                     return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
+                # ROCm HIP decode GEMV (tensor-core path). NVIDIA builds are untouched:
+                # torch.version.hip is None there. Only the shapes the kernel hard-requires
+                # are routed here; everything else falls through to reconstruct + hgemm.
+                if (torch.version.hip and os.environ.get("EXL3_GEMV", "1") != "0"
+                        and hasattr(ext, "exl3_gemv") and _hip_gemv_supported(x.device)
+                        and rows <= EXL3_GEMV_HIP_MAX_M
+                        and self.in_features % 128 == 0
+                        and self.out_features % 128 == 0
+                        and 2 <= self.K <= 4
+                        and (self.K == 4 or self.mcg or self.mul1)):
+                    return self.hip_gemv(x, out_dtype)
 
         return self.reconstruct_hgemm(x, out_dtype)
+
+
+    def hip_gemv(self, x: torch.Tensor, out_dtype):
+        # ROCm decode GEMV: same output contract as reconstruct_hgemm (shape[:-1] +
+        # out_features, contiguous, bias applied). A_had is the fp16 workspace the
+        # kernel's input-Hadamard stage writes into before the main loop.
+        shape = x.shape
+        rows = x.numel() // shape[-1]
+        out_shape = shape[:-1] + (self.out_features,)
+        x_flat = x.view(rows, self.in_features)
+        y = torch.empty(out_shape, dtype=out_dtype or self.default_out_dtype, device=x.device)
+        y_flat = y.view(rows, self.out_features)
+        A_had = g_tensor_cache.get(
+            x.device, (rows, self.in_features), torch.half, "exl3_gemv_a_had")
+        ext.exl3_gemv(x_flat, self.trellis, y_flat, self.suh, A_had, self.svh, self.mcg, self.mul1)
+        if self.bias is not None:
+            y += self.bias
+        return y
 
 
     def unpack_bf(self, bitfield: torch.Tensor):
