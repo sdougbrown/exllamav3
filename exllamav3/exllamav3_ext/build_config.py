@@ -11,7 +11,7 @@ ROCM_EXCLUDE_FILES = {
     'norm.cu', 'activation.cu', 'attention.cu', 'routing.cu',
     'softcap.cu', 'histogram.cu', 'sam.cpp',
     'cache/q_cache.cu',
-    'quant/exl3_gemm.cu', 'quant/exl3_gemv.cu', 'quant/exl3_gemv_int8.cu',
+    'quant/exl3_gemm.cu', 'quant/exl3_gemv_int8.cu',
     'quant/exl3_moe.cu', 'quant/exl3_kernel_map.cu',
     'quant/coop_autotune.cu', 'quant/quantize.cu', 'quant/util.cu',
     'generator/sampling_fused.cu',
