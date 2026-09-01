@@ -90,7 +90,7 @@ def _spy_ext_route():
     """Temporarily wrap ext.exl3_gemv / ext.reconstruct / ext.reconstruct_slice /
     ext.reconstruct_had_slice / ext.hgemm with call-counting spies so a silent
     fallback into ANY reconstruction path cannot slip through. Returns (calls, restore)."""
-    calls = {"gemv": 0, "reconstruct": 0, "hgemm": 0}
+    calls = {"gemv": 0, "reconstruct": 0, "reconstruct_slice": 0, "reconstruct_had_slice": 0, "hgemm": 0}
     real_gemv = ext.exl3_gemv
     real_reconstruct = ext.reconstruct
     real_reconstruct_slice = getattr(ext, "reconstruct_slice", None)
@@ -106,11 +106,11 @@ def _spy_ext_route():
         return real_reconstruct(*args, **kwargs)
 
     def reconstruct_slice_spy(*args, **kwargs):
-        calls["reconstruct"] += 1
+        calls["reconstruct_slice"] += 1
         return real_reconstruct_slice(*args, **kwargs)
 
     def reconstruct_had_slice_spy(*args, **kwargs):
-        calls["reconstruct"] += 1
+        calls["reconstruct_had_slice"] += 1
         return real_reconstruct_had_slice(*args, **kwargs)
 
     def hgemm_spy(*args, **kwargs):
@@ -167,6 +167,10 @@ def _load_then_compare(model, linear_key, norm_key, batch_size):
             f"{linear_key} (m={batch_size}): reconstruct=False did not call ext.exl3_gemv"
         assert calls["reconstruct"] == 0, \
             f"{linear_key} (m={batch_size}): reconstruct=False silently fell back to ext.reconstruct"
+        assert calls["reconstruct_slice"] == 0, \
+            f"{linear_key} (m={batch_size}): reconstruct=False silently fell back to ext.reconstruct_slice"
+        assert calls["reconstruct_had_slice"] == 0, \
+            f"{linear_key} (m={batch_size}): reconstruct=False silently fell back to ext.reconstruct_had_slice"
         assert calls["hgemm"] == 0, \
             f"{linear_key} (m={batch_size}): reconstruct=False silently reached ext.hgemm (reconstruct fallback)"
 
@@ -187,6 +191,30 @@ def _load_then_compare(model, linear_key, norm_key, batch_size):
         linear.unload()
         if norm:
             norm.unload()
+
+
+@torch.inference_mode()
+def test_hip_gemv_direct_binding_accepts_rank3_inputs():
+    """The direct HIP binding must accept arbitrary-rank contiguous leading dims."""
+    _require_gfx1201()
+    size_k = size_n = 128
+    A = torch.randn((1, 1, size_k), dtype=torch.float16, device="cuda") * 1e-3
+    B = torch.full((size_k // 16, size_n // 16, 4 * 16), 0x1111, dtype=torch.int16, device="cuda")
+    suh = (torch.randint(0, 2, (size_k,), device="cuda") * 2 - 1).to(torch.float16)
+    svh = (torch.randint(0, 2, (size_n,), device="cuda") * 2 - 1).to(torch.float16)
+
+    actual = torch.empty((1, 1, size_n), dtype=torch.float16, device="cuda")
+    A_had = torch.empty_like(A)
+    ext.exl3_gemv(A, B, actual, suh, A_had, svh, False, False)
+
+    A_ref = torch.empty_like(A)
+    weight = torch.empty((size_k, size_n), dtype=torch.float16, device="cuda")
+    expected = torch.empty_like(actual)
+    ext.had_r_128(A.view(1, size_k), A_ref.view(1, size_k), suh, None, 1.0)
+    ext.reconstruct(weight, B, 4, False, False)
+    ext.hgemm(A_ref.view(1, size_k), weight, expected.view(1, size_n))
+    ext.had_r_128(expected.view(1, size_n), expected.view(1, size_n), None, svh, 1.0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
 
 
 @pytest.mark.parametrize(
@@ -270,6 +298,8 @@ def test_hip_gemv_route_only(model):
             restore()
         assert calls["gemv"] == 1, f"expected exactly one exl3_gemv call, got {calls['gemv']}"
         assert calls["reconstruct"] == 0
+        assert calls["reconstruct_slice"] == 0
+        assert calls["reconstruct_had_slice"] == 0
         assert calls["hgemm"] == 0, "reconstruct=False must not reach ext.hgemm"
         assert y.shape[-1] == linear.out_features
         assert torch.isfinite(y.float()).all()
@@ -337,7 +367,8 @@ def test_hip_gemv_ineligible_falls_back(model):
         finally:
             restore()
         assert calls["gemv"] == 0, "K=6 module must not route to the GEMV kernel"
-        assert calls["reconstruct"] > 0, "K=6 module must fall back to reconstruct"
+        reconstruct_calls = calls["reconstruct"] + calls["reconstruct_slice"] + calls["reconstruct_had_slice"]
+        assert reconstruct_calls > 0, "K=6 module must fall back to a reconstruct path"
         assert torch.isfinite(y.float()).all()
     finally:
         linear.unload()

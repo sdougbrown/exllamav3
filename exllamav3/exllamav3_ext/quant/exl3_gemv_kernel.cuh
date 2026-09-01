@@ -14,14 +14,17 @@
 //   cadence; per-block cross-warp reduction over the k splits through shared memory
 //
 // Same launch signature as exl3_gemm_kernel so kernel args and graph parameter patching are
-// interchangeable. Cooperative launch: one grid.sync after the input Hadamard stage and one before
-// the output stage, no other cross-block coordination. 2, 3 and 4 bpw.
+// interchangeable. CUDA uses a cooperative launch with one grid.sync after the input Hadamard
+// stage and one before the output stage. HIP launches the Hadamard stages separately and runs only
+// the main GEMV loop here. 2, 3 and 4 bpw.
 //
 // CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention-projection sizes;
 // CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. MMODE 0 is
 // the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
 
+#if !defined(USE_ROCM) && !defined(__HIPCC__)
 #include <cooperative_groups.h>
+#endif
 #include "hadamard_inner.cuh"   // also pulls in ../compat.cuh -> compat_rocm.cuh (FragB, shims) on ROCm
 #if defined(USE_ROCM) || defined(__HIPCC__)
 // gfx12 (RDNA4) tensor-core path: v_wmma_f32_16x16x16_f16 via the on-device-oracle-verified
@@ -172,6 +175,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     constexpr int LSTRIDE = bits == 3 ? 24 : 32;            // uint32 per load
     static_assert(bits != 2 || WNT % 2 == 0, "2 bpw packs two tiles per warp load");
 
+#if !defined(USE_ROCM) && !defined(__HIPCC__)
     auto grid = cooperative_groups::this_grid();
 
     // Input scales and Hadamard transform, same as exl3_gemm_kernel
@@ -192,6 +196,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         grid.sync();
         A = A_had;
     }
+#endif
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -452,6 +457,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         __syncthreads();
     }
 
+#if !defined(USE_ROCM) && !defined(__HIPCC__)
     // Output scales and Hadamard transform, same semantics as the inner GEMM epilogue
     {
         grid.sync();
@@ -480,4 +486,5 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 );
         }
     }
+#endif
 }
