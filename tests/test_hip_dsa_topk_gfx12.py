@@ -74,14 +74,21 @@ def _force_fallback(monkeypatch):
         yield
 
 
-@pytest.mark.parametrize("rows,width", [
-    (1, 3072), (32, 3072), (64, 32768),
-    (1024, 512), (1024, 513), (1025, 512), (1025, 513),
+@pytest.mark.parametrize("rows,width,cutoff", [
+    (1, 513, 511), (32, 3072, 1023), (64, 32768, 1023),
+    (1024, 512, 511), (1024, 513, 511), (1025, 512, 511), (1025, 513, 511),
 ])
 @torch.inference_mode()
-def test_gfx12_qsa_topk_matches_fp16_bit_key_oracle(device, rows, width):
-    scores = _scores(device, rows, width)
-    assert scores.stride(0) == -(-width // 128) * 128
+def test_gfx12_qsa_topk_matches_fp16_bit_key_oracle(device, rows, width, cutoff):
+    scores = torch.full((rows, width), -float("inf"), device = device, dtype = torch.half)
+    for row in range(rows):
+        scores[row, :max(0, cutoff - 8)] = 1.0
+        start = max(0, cutoff - 8)
+        end = min(width, cutoff + 9)
+        if end > start:
+            scores[row, start:end] = 0.0
+        if cutoff + 9 < width:
+            scores[row, cutoff + 9:] = -1.0
     expected = _fp16_bit_key_stable_oracle(scores)
     actual = torch.empty_like(expected)
     ext.dsa_topk(scores, actual, K)
@@ -138,7 +145,7 @@ def test_gfx12_qsa_topk_ties_and_special_values_match_fp16_bit_key_oracle(device
     assert not torch.isin(actual[2], torch.arange(K, 1024, device = device, dtype = torch.int32)).any()
 
 
-@pytest.mark.parametrize("valid_count", [0, 1, 511])
+@pytest.mark.parametrize("valid_count", [0, 1, 511, 512])
 @torch.inference_mode()
 def test_gfx12_qsa_topk_low_valid_counts_have_exact_indices_and_padding(device, valid_count):
     raw = torch.full((1, 1024), -1024, device = device, dtype = torch.int16)  # -inf
@@ -154,6 +161,9 @@ def test_gfx12_qsa_topk_low_valid_counts_have_exact_indices_and_padding(device, 
     exact[:valid_count] = torch.arange(valid_count, device = device, dtype = torch.int32)
     assert torch.equal(expected[0], exact)
     assert torch.equal(actual, expected)
+    if valid_count == 512:
+        assert (actual[0] != -1).all()
+        assert torch.equal(actual[0], torch.arange(K, device = device, dtype = torch.int32))
 
 
 @pytest.mark.parametrize("bad", [
@@ -286,6 +296,39 @@ def test_gfx12_qsa_topk_uses_the_nondefault_current_stream(device):
     stream.synchronize()
     assert done.query()
     assert torch.equal(consumed, expected)
+
+
+@torch.inference_mode()
+def test_gfx12_qsa_topk_native_is_byte_identical_across_repeated_launches(device):
+    source = _scores(device, 4, 1024)
+    expected = _fp16_bit_key_stable_oracle(source)
+
+    default_outputs = []
+    for _ in range(4):
+        actual = torch.empty_like(expected)
+        ext.dsa_topk_gfx12(source, actual)
+        default_outputs.append(actual.clone())
+    torch.cuda.synchronize(device)
+    for output in default_outputs:
+        assert torch.equal(output, expected)
+        assert torch.equal(output, default_outputs[0])
+
+    with torch.cuda.device(device):
+        stream = torch.cuda.Stream(device = device)
+    stream_outputs = []
+    with torch.cuda.stream(stream):
+        for _ in range(4):
+            actual = torch.empty_like(expected)
+            ext.dsa_topk_gfx12(source, actual)
+            stream_outputs.append(actual.clone())
+        done = torch.cuda.Event()
+        done.record()
+    stream.synchronize()
+    assert done.query()
+    for output in stream_outputs:
+        assert torch.equal(output, expected)
+        assert torch.equal(output, stream_outputs[0])
+    assert torch.equal(default_outputs[0], stream_outputs[0])
 
 
 @torch.inference_mode()

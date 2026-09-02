@@ -44,6 +44,34 @@ __device__ __forceinline__ void find_descending_bucket(const int* hist, int targ
     result[1] = total;
 }
 
+__device__ __forceinline__ int block_exclusive_scan(
+    int value, int lane, int warp, int* warp_sums, int* warp_offsets)
+{
+    int inclusive = value;
+    #pragma unroll
+    for (int offset = 1; offset < WAVE_SIZE; offset <<= 1)
+    {
+        const int other = __shfl_up_sync(0xffffffffu, inclusive, offset);
+        if (lane >= offset) inclusive += other;
+    }
+    if (lane == WAVE_SIZE - 1) warp_sums[warp] = inclusive;
+    __syncthreads();
+
+    if (warp == 0)
+    {
+        int warp_inclusive = warp_sums[lane];
+        #pragma unroll
+        for (int offset = 1; offset < WAVE_SIZE; offset <<= 1)
+        {
+            const int other = __shfl_up_sync(0xffffffffu, warp_inclusive, offset);
+            if (lane >= offset) warp_inclusive += other;
+        }
+        warp_offsets[lane] = warp_inclusive - warp_sums[lane];
+    }
+    __syncthreads();
+    return warp_offsets[warp] + inclusive - value;
+}
+
 __global__ __launch_bounds__(THREADS)
 void dsa_topk_gfx12_kernel(const half* __restrict__ scores, int* __restrict__ out, int width, int stride)
 {
@@ -53,6 +81,8 @@ void dsa_topk_gfx12_kernel(const half* __restrict__ scores, int* __restrict__ ou
 
     __shared__ int hist[256];
     __shared__ int search[2];
+    __shared__ int warp_sums[THREADS / WAVE_SIZE];
+    __shared__ int warp_offsets[THREADS / WAVE_SIZE];
 
     if (tid < 256) hist[tid] = 0;
     __syncthreads();
@@ -86,24 +116,41 @@ void dsa_topk_gfx12_kernel(const half* __restrict__ scores, int* __restrict__ ou
         ties_needed = K - count_above_high - search[1];
     }
 
-    // The score histograms are fully parallel; this short ordered pass deliberately has one
-    // owner so the public API's ascending-index tie and output order remain exact.
-    if (tid == 0)
+    // Each thread owns one contiguous range, so prefixing its local output count produces
+    // ascending global indices. A separate tie prefix lets only the earliest threshold ties
+    // survive without serializing the full row scan.
+    const int range_begin = static_cast<int>(static_cast<int64_t>(width) * tid / THREADS);
+    const int range_end = static_cast<int>(static_cast<int64_t>(width) * (tid + 1) / THREADS);
+    const int lane = tid % WAVE_SIZE;
+    const int warp = tid / WAVE_SIZE;
+    int high_count = 0;
+    int tie_count = 0;
+    for (int index = range_begin; index < range_end; ++index)
     {
-        int emitted = 0;
-        for (int index = 0; index < width; ++index)
-        {
-            const uint16_t key = topk_key(__half_as_ushort(row_scores[index]));
-            if (key > threshold && key > KEY_NEG_INF)
-                row_out[emitted++] = index;
-            else if (key == threshold && key > KEY_NEG_INF && ties_needed)
-            {
-                row_out[emitted++] = index;
-                --ties_needed;
-            }
-        }
-        for (int index = emitted; index < K_PAD; ++index) row_out[index] = -1;
+        const uint16_t key = topk_key(__half_as_ushort(row_scores[index]));
+        if (key > threshold && key > KEY_NEG_INF) ++high_count;
+        else if (key == threshold && key > KEY_NEG_INF) ++tie_count;
     }
+
+    const int tie_offset = block_exclusive_scan(tie_count, lane, warp, warp_sums, warp_offsets);
+    const int local_ties = max(0, min(tie_count, ties_needed - tie_offset));
+    const int selected_count = high_count + local_ties;
+    int output = block_exclusive_scan(selected_count, lane, warp, warp_sums, warp_offsets);
+
+    int seen_ties = 0;
+    for (int index = range_begin; index < range_end; ++index)
+    {
+        const uint16_t key = topk_key(__half_as_ushort(row_scores[index]));
+        if (key > threshold && key > KEY_NEG_INF)
+            row_out[output++] = index;
+        else if (key == threshold && key > KEY_NEG_INF)
+        {
+            if (seen_ties < local_ties) row_out[output++] = index;
+            ++seen_ties;
+        }
+    }
+    if (tid == THREADS - 1)
+        for (; output < K_PAD; ++output) row_out[output] = -1;
 }
 
 bool is_gfx12_wave32(int device)
