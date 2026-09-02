@@ -178,6 +178,26 @@ The 180K result retained 87.6% of the 12K prefill rate instead of falling toward
 
 This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP3 works beyond the sparse threshold, but its workload-dependent acceptance and sparse-QSA retrieval quality still need broader qualification. The remaining short-context bottlenecks are now the grouped K3 WMMA body, recurrent GDN, and the remaining reconstructed K5 projections. Warmed 511-token prefill reached 896.61 tok/s with both throughput changes. Long-context retrieval quality still needs a representative control before comparison with sparse-QSA serving results.
 
+## Q8 QSA cache route
+
+`CacheLayer_qsa_quant` keeps the main K/V in the existing packed `CacheLayer_quant` format while the raw and pooled selector side planes stay fp16. That preserves selection semantics.
+
+On gfx1201, the eager sparse Triton path dequantizes only the selected rows online through the existing H32/cache loaders. It does not reconstruct a full fp16 cache first for eligible linear Q8/Q8 layers with whole 32-value head groups. Other quant widths, companded Q8, and partial head groups still use the full-dequant fallback. Unknown classes fail fast, and QSA TP fails early. Q8 also declines to eager when BC graph integration would be required; the existing fp16 BC/CUDA ABI stays unchanged.
+
+| Cache | FP16 | Q8 | Reduction |
+| --- | ---: | ---: | ---: |
+| 128K / 12 layers | 3,724,541,952 B | 2,214,592,512 B | 40.54% |
+
+A warm 8K synthetic full-model A/B measured 7.224 s for FP16 and 7.880 s for Q8, about 9.1% slower. The quantized run dispatched the online Q8 path 144 times and never used the fp16 gather; the inverse fp16 run dispatched 144 fp16 gathers and no Q8 gathers.
+
+For true capacity qualification, a pool of 393,216 with two concurrent prompts at 196,096 tokens each ran under Q8+MTP3 for 392.036 s and reached 1000.40 tok/s aggregate prefill. Both prompts generated 7 tokens. The eligible Q8 sparse route included 9,828 512-row calls, and the process exited cleanly.
+
+The storage budget was 6,643,777,536 B (6.188 GiB) for target Q8 planes, 916,783,184 B (0.854 GiB) for recurrent state, and 553,648,128 B (0.516 GiB) for the Q8 MTP draft plane, 7.557 GiB total. Allocated VRAM was 30.265/28.838 GiB and reserved VRAM was 30.676/29.109 GiB.
+
+These repeated-token prompts exercise capacity and routing only; they do not qualify language quality or retrieval.
+
+The focused suite passed 241 tests. The 13-test QSA file also passed after the final test-only correction. This does not qualify NVIDIA runtime behavior.
+
 ## MCG compatibility
 
 The Qwen3.5-9B fixture exposed an incorrect portable translation of the original PTX `lop3` expression. The fix restores the exact LUT `0x6a` semantics for plain and MCG procedural codebooks. A zero-state reconstruction test now checks the codebook value independently of both GEMV and the reconstruct implementation.
