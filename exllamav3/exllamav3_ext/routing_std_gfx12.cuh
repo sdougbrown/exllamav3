@@ -4,8 +4,9 @@
 
 #include <ATen/Tensor.h>
 
-// Decode-only standard MoE router for gfx1200/gfx1201. The gate is supplied as a
-// persistent contiguous (experts, hidden) transpose so the bsz-1 GEMV is coalesced.
+// Decode-only standard MoE router for up to eight gfx1200/gfx1201 rows. The gate is
+// supplied as a persistent contiguous (experts, hidden) transpose so each GEMV is coalesced.
+// The bsz1 name is retained as a compatibility binding.
 void routing_std_gfx12_bsz1
 (
     const at::Tensor& hidden,
