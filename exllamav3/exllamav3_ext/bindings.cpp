@@ -76,6 +76,7 @@
 #include "rope.cuh"
 #include "gdn.cuh"
 #include "routing_std_gfx12.cuh"
+#include "dsa_topk_gfx12.cuh"
 #include "add.cuh"
 
 #include "quant/pack.cuh"
@@ -296,6 +297,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "exl3_moe_gfx12_k3_prefill");
     m.def("routing_std_gfx12_bsz1", &routing_std_gfx12_bsz1,
           "routing_std_gfx12_bsz1");
+    m.def("dsa_topk_gfx12", &dsa_topk_gfx12, "dsa_topk_gfx12");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
     m.def("pack_signs", &pack_signs, "pack_signs");

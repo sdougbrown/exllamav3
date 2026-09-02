@@ -655,6 +655,38 @@ def dequant_cache_paged_window(
 
 # -- DSA top-k (dsa_topk.cu) ---------------------------------------------------
 
+
+def dsa_topk_gfx12_supported(
+    scores: torch.Tensor,
+    indices: torch.Tensor,
+    k: int,
+    t_ptr: torch.Tensor | None = None,
+    t_seq: int = 0,
+) -> bool:
+    """Whether this is the fixed-K QSA shape handled by the gfx12 HIP kernel."""
+    if not torch.version.hip or t_ptr is not None or t_seq != 0:
+        return False
+    if not isinstance(scores, torch.Tensor) or not isinstance(indices, torch.Tensor):
+        return False
+    if scores.device.type != "cuda" or indices.device != scores.device:
+        return False
+    if scores.dtype != torch.float16 or indices.dtype != torch.int32:
+        return False
+    if scores.ndim != 2 or indices.ndim != 2 or scores.shape[0] != indices.shape[0]:
+        return False
+    if k != 512 or indices.shape[1] != 512 or scores.shape[1] < 512:
+        return False
+    if (scores.shape[1] > 2**31 - 1 or scores.stride(0) > 2**31 - 1 or
+            scores.stride(1) != 1 or scores.stride(0) < scores.shape[1] or scores.stride(0) % 128):
+        return False
+    if not indices.is_contiguous():
+        return False
+    device = torch.cuda.current_device() if scores.device.index is None else scores.device.index
+    props = torch.cuda.get_device_properties(device)
+    arch = getattr(props, "gcnArchName", "").split(":", 1)[0]
+    return arch in ("gfx1200", "gfx1201") and getattr(props, "warp_size", 0) == 32
+
+
 def dsa_topk(
     scores: torch.Tensor,
     indices: torch.Tensor,
