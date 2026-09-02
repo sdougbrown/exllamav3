@@ -11,6 +11,8 @@
 #include "graph.cuh"
 #include "gdn.cuh"
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 using bfloat16 = __nv_bfloat16;
 #define MAX_K_HEADS 32
@@ -919,7 +921,27 @@ void cuda_recurrent_gated_delta_rule_gr
                     "slots must be on the same device as mixed_qkv");
     }
 
-    int v_split = (bsz == 1 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
+    // The 512-thread gfx12 kernel has enough prefill occupancy with two V partitions;
+    // using four only repeats q/k normalization and synchronization. Keep the established
+    // four-way layout on other architectures and for decode/MTP.
+#if defined(USE_ROCM)
+    const char* arch = at::cuda::getCurrentDeviceProperties()->gcnArchName;
+    const bool gfx12 = !std::strncmp(arch, "gfx1200", 7) || !std::strncmp(arch, "gfx1201", 7);
+    int prefill_v_split = gfx12 ? 2 : 4;
+    if (const char* split_env = std::getenv("EXL3_HIP_GDN_PREFILL_VSPLIT"))
+    {
+        int requested = std::atoi(split_env);
+        if (requested == 1 || requested == 2 || requested == 4)
+            prefill_v_split = requested;
+    }
+#endif
+    int v_split = (bsz == 1 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64)
+#if defined(USE_ROCM)
+        ? (seqlen > 5 ? prefill_v_split : 4)
+#else
+        ? 4
+#endif
+        : 1;
     TORCH_CHECK(v_head_dim % v_split == 0, "v_head_dim must be divisible by v_split");
 
     dim3 blocks(bsz, num_v_heads, v_split);  // group * num_k_heads
@@ -962,11 +984,13 @@ void cuda_recurrent_gated_delta_rule_gr
         if (!history)
         {
             if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 4, true>)
+            else if (v_split == 2) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 2, true>)
             else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 1, true>)
         }
         else
         {
             if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 4, true>)
+            else if (v_split == 2) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 2, true>)
             else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 1, true>)
         }
     }
@@ -975,11 +999,13 @@ void cuda_recurrent_gated_delta_rule_gr
         if (k_head_dim == 128 && v_head_dim == 128)
         {
             if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 4>)
+            else if (v_split == 2) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 2>)
             else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 1>)
         }
         else if (threads.x <= 128)
         {
             if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, false, 4>)
+            else if (v_split == 2) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, false, 2>)
             else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, false, 1>)
         }
         else if (threads.x <= 256)
@@ -991,11 +1017,13 @@ void cuda_recurrent_gated_delta_rule_gr
         if (k_head_dim == 128 && v_head_dim == 128)
         {
             if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 4>)
+            else if (v_split == 2) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 2>)
             else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 1>)
         }
         else if (threads.x <= 128)
         {
             if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, true, 4>)
+            else if (v_split == 2) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, true, 2>)
             else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, true, 1>)
         }
         else if (threads.x <= 256)
