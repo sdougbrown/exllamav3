@@ -292,6 +292,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemv_supported", &exl3_gemv_supported, "exl3_gemv_supported");
     m.def("exl3_moe_gfx12_k3", &exl3_moe_gfx12_k3, "exl3_moe_gfx12_k3");
+    m.def("exl3_moe_gfx12_k3_prefill", &exl3_moe_gfx12_k3_prefill,
+          "exl3_moe_gfx12_k3_prefill");
     m.def("routing_std_gfx12_bsz1", &routing_std_gfx12_bsz1,
           "routing_std_gfx12_bsz1");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
