@@ -40,6 +40,8 @@ except ImportError:
 
 if has_triton:
 
+    from .triton_paged import _qc_load_kt, _qc_load_v, _rot_h32
+
     @triton.jit(do_not_specialize = ["R"])
     def _qsa_stage_kernel(
         qk,                  # (R, (H_i + 1) * D) fp16 fused index_qk_proj output
@@ -239,6 +241,99 @@ if has_triton:
             tl.store(partial_ml + ml_base + rows * 2 + 1, l)
 
 
+    @triton.jit(do_not_specialize = ["k_len", "num_pages_per_seq", "num_splits", "split_len"])
+    def _qsa_sparse_split_quant_kernel(
+        q,                   # (bsz, 1, n_q_heads, head_dim) fp16, normed + roped
+        k_cache,             # Q8 (pages, page_size, n_kv_heads, head_dim)
+        v_cache,
+        block_table,
+        indices,             # (bsz, K_pad) i32 selected token positions, -1 padded
+        partial_o,
+        partial_ml,
+        k_scales,            # fp16 per-32-value scales
+        v_scales,
+        h32,                 # (32, 32) normalized Hadamard
+        k_len,               # runtime: valid width of the index rows
+        num_pages_per_seq,
+        num_splits,
+        split_len,
+        n_q_heads: tl.constexpr,
+        n_kv_heads: tl.constexpr,
+        page_size: tl.constexpr,
+        head_dim: tl.constexpr,
+        K_pad: tl.constexpr,
+        scale: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        PAGED: tl.constexpr = 1,
+    ):
+        """Q8 gathered GQA flash-decoding phase 1 over selected token indices."""
+        pid = tl.program_id(0)
+        split = tl.program_id(1)
+
+        group_size = n_q_heads // n_kv_heads
+        h_blocks = tl.cdiv(group_size, BLOCK_H)
+        h_block = pid % h_blocks
+        bh = pid // h_blocks
+        batch = bh // n_kv_heads
+        kv_head = bh - batch * n_kv_heads
+
+        rows = tl.arange(0, BLOCK_H)
+        row_h_local = h_block * BLOCK_H + rows
+        q_head = kv_head * group_size + row_h_local
+        valid_row = row_h_local < group_size
+
+        offs_d = tl.arange(0, head_dim)
+        q_base = (batch * n_q_heads + q_head) * head_dim
+        q_tile = tl.load(q + q_base[:, None] + offs_d[None, :], mask = valid_row[:, None], other = 0.0)
+        q_tile = _rot_h32(q_tile, h32, BLOCK_H, head_dim)
+
+        n_start = split * split_len
+        n_end = tl.minimum(n_start + split_len, k_len)
+
+        m = tl.full((BLOCK_H,), -float("inf"), tl.float32)
+        l = tl.full((BLOCK_H,), 0.0, tl.float32)
+        acc = tl.zeros((BLOCK_H, head_dim), tl.float32)
+
+        for n0 in range(n_start, n_end, BLOCK_N):
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            idx = tl.load(indices + batch * K_pad + offs_n, mask = offs_n < n_end, other = -1)
+            valid_n = (idx >= 0) & (offs_n < n_end)
+            idx_c = tl.where(valid_n, idx, 0)
+            if PAGED:
+                phys = tl.load(block_table + batch * num_pages_per_seq + idx_c // page_size,
+                               mask = valid_n, other = 0)
+                tok = phys * page_size + idx_c % page_size
+            else:
+                tok = idx_c
+
+            k_tile = _qc_load_kt(k_cache, k_scales, tok, kv_head, offs_d, valid_n,
+                                 8, n_kv_heads, head_dim)
+            scores = tl.dot(q_tile, k_tile) * scale
+
+            valid = valid_row[:, None] & valid_n[None, :]
+            scores = tl.where(valid, scores, -float("inf"))
+
+            m_new = tl.maximum(m, tl.max(scores, axis = 1))
+            m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
+            p = tl.exp(scores - m_exp[:, None])
+            p = tl.where(valid, p, 0.0)
+            alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+            l = l * alpha + tl.sum(p, axis = 1)
+
+            v_tile = _qc_load_v(v_cache, v_scales, tok, kv_head, offs_d, valid_n,
+                                8, n_kv_heads, head_dim)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
+            m = m_new
+
+        if split < num_splits:
+            po_base = (pid * num_splits + split) * BLOCK_H * head_dim
+            tl.store(partial_o + po_base + rows[:, None] * head_dim + offs_d[None, :], acc)
+            ml_base = (pid * num_splits + split) * BLOCK_H * 2
+            tl.store(partial_ml + ml_base + rows * 2, m)
+            tl.store(partial_ml + ml_base + rows * 2 + 1, l)
+
+
     _sm_counts = {}
 
     def _get_sms(dev):
@@ -256,6 +351,7 @@ if has_triton:
         sm_scale: float,
         block_table: torch.Tensor | None = None,   # (R, num_pages) int32, one row per query row
         page_size: int = 0,
+        qc: tuple[torch.Tensor, torch.Tensor, int, int] | None = None,
     ) -> torch.Tensor:
         """Eager gathered GQA attention, one index list per query row: the sparse prefill /
         eager-fallback form of the BC sparse decode kernels. block_table = None runs the flat
@@ -273,8 +369,15 @@ if has_triton:
         K_pad = indices.shape[1]
         dev = q.device
         paged = block_table is not None
+        if qc is not None:
+            k_scales, v_scales, k_bits, v_bits = qc
+            if (k_bits, v_bits) != (8, 8):
+                raise ValueError("qsa_sparse_attend_rows online quantization requires Q8 K/V")
+            from .triton_paged import _get_h32
+            h32 = _get_h32(q.device)
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous() \
             and indices.is_contiguous()
+        assert qc is None or (k_scales.is_contiguous() and v_scales.is_contiguous())
         assert not paged or (block_table.is_contiguous() and block_table.shape[0] == R)
 
         splits = max(1, min(2 * _get_sms(dev) // programs, -(-K_pad // (4 * BLOCK_N)), 128))
@@ -287,18 +390,35 @@ if has_triton:
         # Triton JIT launches on the CURRENT device; with a model split across GPUs this
         # layer's device need not be current
         with torch.cuda.device(dev):
-            _qsa_sparse_split_kernel[(programs, splits)](
-                q, k, v, block_table if paged else indices, indices, partial_o, partial_ml,
-                K_pad, block_table.shape[1] if paged else 0, splits, split_len,
-                n_q_heads = H, n_kv_heads = kvh, page_size = page_size if paged else 1,
-                head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
-                BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
-                num_warps = 4, num_stages = 2,
-            )
-            _paged_attn_decode_combine_kernel[(programs,)](
-                partial_o, partial_ml, o, partial_ml, splits, partial_ml,
-                QCV = 0, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
-                head_dim = hd, BLOCK_M = 1, BLOCK_H = BLOCK_H, BLOCK_ROWS = BLOCK_H,
-                num_warps = 4, num_stages = 1,
-            )
+            if qc is None:
+                _qsa_sparse_split_kernel[(programs, splits)](
+                    q, k, v, block_table if paged else indices, indices, partial_o, partial_ml,
+                    K_pad, block_table.shape[1] if paged else 0, splits, split_len,
+                    n_q_heads = H, n_kv_heads = kvh, page_size = page_size if paged else 1,
+                    head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
+                    BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
+                    num_warps = 4, num_stages = 2,
+                )
+                _paged_attn_decode_combine_kernel[(programs,)](
+                    partial_o, partial_ml, o, partial_ml, splits, partial_ml,
+                    QCV = 0, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
+                    head_dim = hd, BLOCK_M = 1, BLOCK_H = BLOCK_H, BLOCK_ROWS = BLOCK_H,
+                    num_warps = 4, num_stages = 1,
+                )
+            else:
+                _qsa_sparse_split_quant_kernel[(programs, splits)](
+                    q, k, v, block_table if paged else indices, indices, partial_o, partial_ml,
+                    k_scales, v_scales, h32,
+                    K_pad, block_table.shape[1] if paged else 0, splits, split_len,
+                    n_q_heads = H, n_kv_heads = kvh, page_size = page_size if paged else 1,
+                    head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
+                    BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
+                    num_warps = 4, num_stages = 2,
+                )
+                _paged_attn_decode_combine_kernel[(programs,)](
+                    partial_o, partial_ml, o, h32, splits, q,
+                    QCV = 8, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
+                    head_dim = hd, BLOCK_M = 1, BLOCK_H = BLOCK_H, BLOCK_ROWS = BLOCK_H,
+                    num_warps = 4, num_stages = 1,
+                )
         return o

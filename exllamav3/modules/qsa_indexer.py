@@ -565,6 +565,10 @@ class QSAIndexer(Module):
                 torch.where(ok, tok, tok.new_full((), -1)).int()
         return out.view(bsz * seq, k_pad)
 
+    def uses_sparse_cache(self, cache_seqlens_cpu: torch.Tensor, seqlen: int) -> bool:
+        """Whether this cached call exceeds the dense-exact QSA threshold."""
+        return int(cache_seqlens_cpu.max().item()) + seqlen > self.sparse_threshold()
+
     def sparse_attend(
         self,
         layer,
@@ -588,11 +592,40 @@ class QSAIndexer(Module):
         indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
             .reshape(bsz * seq, -1).contiguous()
-        o = qsa_sparse_attend_rows(
-            q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
-            layer.k.view(-1, attn.num_kv_heads, attn.head_dim),
-            layer.v.view(-1, attn.num_kv_heads, attn.head_dim),
-            indices, attn.sm_scale,
-            block_table = bt_rows, page_size = layer.k.shape[1],
-        )
+        from ..cache.quant import CacheLayer_quant
+        q_rows = q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous()
+        if (isinstance(layer, CacheLayer_quant) and layer.compand_a == 0.0 and
+                (layer.k_bits, layer.v_bits) == (8, 8) and attn.head_dim % 32 == 0):
+            # Packed rows are H32-rotated by CacheLayer_quant. The gathered kernel uses the
+            # shared paged-attention loaders, rotating Q/output once and dequantizing only the
+            # selected rows. The indexer planes remain the fp16 tensors read above. H32 operates
+            # independently on each 32-value group, so it cannot handle partial head groups.
+            words_k = layer.qk.shape[-1] // attn.num_kv_heads
+            words_v = layer.qv.shape[-1] // attn.num_kv_heads
+            groups = layer.sk.shape[-1] // attn.num_kv_heads
+            o = qsa_sparse_attend_rows(
+                q_rows,
+                layer.qk.view(-1, attn.num_kv_heads, words_k),
+                layer.qv.view(-1, attn.num_kv_heads, words_v),
+                indices, attn.sm_scale,
+                block_table = bt_rows, page_size = layer.qk.shape[1],
+                qc = (
+                    layer.sk.view(-1, attn.num_kv_heads, groups),
+                    layer.sv.view(-1, attn.num_kv_heads, groups),
+                    layer.k_bits, layer.v_bits,
+                ),
+            )
+        else:
+            # Preserve existing cache behavior for unqualified widths or head geometry: use its
+            # established dequantization route, then the fp16 gathered kernel. Linear Q8/Q8
+            # with complete 32-value head groups never takes this path; companded Q8 remains on
+            # its existing safe route.
+            k, v = layer.get_kv((cache_seqlens_cpu + seq).to(layer.device), block_table)
+            o = qsa_sparse_attend_rows(
+                q_rows,
+                k.view(-1, attn.num_kv_heads, attn.head_dim),
+                v.view(-1, attn.num_kv_heads, attn.head_dim),
+                indices, attn.sm_scale,
+                block_table = bt_rows, page_size = k.shape[1],
+            )
         return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
