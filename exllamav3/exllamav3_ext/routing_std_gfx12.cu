@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 namespace {
 
@@ -20,20 +21,25 @@ constexpr int GEMV_WAVES = 8;
 constexpr int ROUTER_HIDDEN = 2560;
 constexpr int ROUTER_EXPERTS = 512;
 constexpr int ROUTER_TOP_K = 10;
-constexpr float NEG_INF = -1.0e30f;
+constexpr int MAX_ROUTER_ROWS = 8;
+constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
 
 __device__ __forceinline__
 void wave_reduce_best(float& key, int& idx)
 {
+    bool valid = idx >= 0;
     #pragma unroll
     for (int offset = WAVE_SIZE / 2; offset > 0; offset >>= 1)
     {
         const float other_key = __shfl_down(key, offset, WAVE_SIZE);
         const int other_idx = __shfl_down(idx, offset, WAVE_SIZE);
-        if (other_key > key)
+        const bool other_valid = other_idx >= 0;
+        if (other_valid && (!valid || other_key > key ||
+                            (other_key == key && other_idx < idx)))
         {
             key = other_key;
             idx = other_idx;
+            valid = true;
         }
     }
     key = __shfl(key, 0, WAVE_SIZE);
@@ -66,9 +72,12 @@ void routing_gemv_gfx12_bsz1_kernel
     half* __restrict__ scores
 )
 {
+    const int row = blockIdx.y;
     const int wave = threadIdx.x / WAVE_SIZE;
     const int lane = threadIdx.x % WAVE_SIZE;
     const int expert = blockIdx.x * GEMV_WAVES + wave;
+    hidden += static_cast<size_t>(row) * ROUTER_HIDDEN;
+    scores += static_cast<size_t>(row) * ROUTER_EXPERTS;
     if (expert >= ROUTER_EXPERTS) return;
 
     const half2* hidden2 = reinterpret_cast<const half2*>(hidden);
@@ -113,6 +122,9 @@ void routing_std_topk_gfx12_bsz1_kernel
     const int tid = threadIdx.x;
     const int lane = tid % WAVE_SIZE;
     const int wave = tid / WAVE_SIZE;
+    scores += static_cast<size_t>(blockIdx.x) * ROUTER_EXPERTS;
+    topk_indices += static_cast<size_t>(blockIdx.x) * ROUTER_TOP_K;
+    topk_weights += static_cast<size_t>(blockIdx.x) * ROUTER_TOP_K;
     const float logit = __half2float(scores[tid]);
 
     float max_logit = wave_reduce_max(logit);
@@ -138,7 +150,11 @@ void routing_std_topk_gfx12_bsz1_kernel
             candidates_key[wave * ROUTER_TOP_K + rank] = best_key;
             candidates_idx[wave * ROUTER_TOP_K + rank] = best_idx;
         }
-        if (idx == best_idx) key = NEG_INF;
+        if (idx == best_idx)
+        {
+            key = NEG_INF;
+            idx = -1;
+        }
     }
     __syncthreads();
 
@@ -168,7 +184,11 @@ void routing_std_topk_gfx12_bsz1_kernel
                     candidates_key[wave * ROUTER_TOP_K + rank] = best_key;
                     candidates_idx[wave * ROUTER_TOP_K + rank] = best_idx;
                 }
-                if (idx == best_idx) key = NEG_INF;
+                if (idx == best_idx)
+                {
+                    key = NEG_INF;
+                    idx = -1;
+                }
             }
         }
         __syncthreads();
@@ -187,10 +207,15 @@ void routing_std_topk_gfx12_bsz1_kernel
             wave_reduce_best(best_key, best_idx);
             if (lane == rank)
             {
-                selected_exp[rank] = expf(best_key - global_max);
+                selected_exp[rank] = best_key == global_max ?
+                    1.0f : expf(best_key - global_max);
                 selected_idx[rank] = best_idx;
             }
-            if (idx == best_idx) key = NEG_INF;
+            if (idx == best_idx)
+            {
+                key = NEG_INF;
+                idx = -1;
+            }
         }
         __syncwarp();
 
@@ -256,24 +281,29 @@ void routing_std_gfx12_bsz1
     TORCH_CHECK(is_gfx12_wave32(device),
                 "routing_std_gfx12_bsz1 requires gfx1200/gfx1201 with wave32");
 
-    check_tensor(hidden, hidden.device(), at::kHalf, {1, ROUTER_HIDDEN}, "hidden", 16);
+    TORCH_CHECK(hidden.dim() == 2,
+                "routing_std_gfx12_bsz1: hidden must be a 2D tensor");
+    const int64_t rows = hidden.size(0);
+    TORCH_CHECK(rows > 0 && rows <= MAX_ROUTER_ROWS,
+                "routing_std_gfx12_bsz1 supports 1 through ", MAX_ROUTER_ROWS, " rows");
+    check_tensor(hidden, hidden.device(), at::kHalf, {rows, ROUTER_HIDDEN}, "hidden", 16);
     check_tensor(gate_t, hidden.device(), at::kHalf,
                  {ROUTER_EXPERTS, ROUTER_HIDDEN}, "gate_t", 16);
-    check_tensor(scores, hidden.device(), at::kHalf, {1, ROUTER_EXPERTS}, "scores", 16);
+    check_tensor(scores, hidden.device(), at::kHalf, {rows, ROUTER_EXPERTS}, "scores", 16);
     check_tensor(topk_indices, hidden.device(), at::kLong,
-                 {1, ROUTER_TOP_K}, "topk_indices", 16);
+                 {rows, ROUTER_TOP_K}, "topk_indices", 16);
     check_tensor(topk_weights, hidden.device(), at::kHalf,
-                 {1, ROUTER_TOP_K}, "topk_weights", 16);
+                 {rows, ROUTER_TOP_K}, "topk_weights", 16);
 
     hipStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();
-    routing_gemv_gfx12_bsz1_kernel<<<ROUTER_EXPERTS / GEMV_WAVES,
+    routing_gemv_gfx12_bsz1_kernel<<<dim3(ROUTER_EXPERTS / GEMV_WAVES, rows),
                                      GEMV_WAVES * WAVE_SIZE, 0, stream>>>
     (
         reinterpret_cast<const half*>(hidden.data_ptr()),
         reinterpret_cast<const half*>(gate_t.data_ptr()),
         reinterpret_cast<half*>(scores.data_ptr())
     );
-    routing_std_topk_gfx12_bsz1_kernel<<<1, ROUTER_EXPERTS, 0, stream>>>
+    routing_std_topk_gfx12_bsz1_kernel<<<rows, ROUTER_EXPERTS, 0, stream>>>
     (
         reinterpret_cast<const half*>(scores.data_ptr()),
         reinterpret_cast<int64_t*>(topk_indices.data_ptr()),

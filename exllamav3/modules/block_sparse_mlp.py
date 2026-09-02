@@ -28,6 +28,7 @@ ROUTING_ACT_SQRTSP = 1
 _HIP_ROUTER_HIDDEN = 2560
 _HIP_ROUTER_EXPERTS = 512
 _HIP_ROUTER_TOP_K = 10
+_HIP_ROUTER_MAX_ROWS = 8
 _HIP_GROUPED_MAX_ROWS = 5
 _HIP_PREFILL_MAX_ROWS = 512
 _HIP_PREFILL_MAX_EXPERT_ROWS = _HIP_PREFILL_MAX_ROWS * _HIP_ROUTER_TOP_K
@@ -61,10 +62,10 @@ def _hip_router_config_supported(cfg):
 def _hip_router_call_supported(bsz, cfg, y, params):
     return (
         os.environ.get("EXL3_HIP_ROUTER", "1") != "0" and
-        bsz == 1 and not params.get("activate_all_experts") and
+        1 <= bsz <= _HIP_ROUTER_MAX_ROWS and not params.get("activate_all_experts") and
         _hip_router_config_supported(cfg) and
         y.dtype == torch.half and y.is_contiguous() and
-        tuple(y.shape) == (1, _HIP_ROUTER_HIDDEN)
+        tuple(y.shape) == (bsz, _HIP_ROUTER_HIDDEN)
     )
 
 
@@ -76,6 +77,31 @@ def _prepare_hip_router_gate_t(cfg):
         # One persistent E x H allocation per router (~2.5 MiB at 512 x 2560), created
         # with the layer on its assigned device and released with routing_cfg on unload.
         cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+
+
+def _prepare_hip_router_buffers(cfg):
+    if _hip_router_config_supported(cfg) and getattr(cfg, "router_logits_gfx12", None) is None:
+        # RoutingCFG owns one persistent multirow workspace. Loaded modules already share
+        # non-reentrant workspaces, so Generator batches are stream-ordered rather than callers
+        # needing separate buffers for speculative streams.
+        device = cfg.gate_tensor.device
+        cfg.router_logits_gfx12 = torch.empty(
+            (_HIP_ROUTER_MAX_ROWS, _HIP_ROUTER_EXPERTS), device=device, dtype=torch.half)
+        cfg.selected_experts_gfx12 = torch.empty(
+            (_HIP_ROUTER_MAX_ROWS, _HIP_ROUTER_TOP_K), device=device, dtype=torch.long)
+        cfg.routing_weights_gfx12 = torch.empty(
+            (_HIP_ROUTER_MAX_ROWS, _HIP_ROUTER_TOP_K), device=device, dtype=torch.half)
+
+
+def _hip_router_buffers(cfg, rows):
+    if rows == 1:
+        return cfg.router_logits_bsz1, cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    _prepare_hip_router_buffers(cfg)
+    return (
+        cfg.router_logits_gfx12[:rows],
+        cfg.selected_experts_gfx12[:rows],
+        cfg.routing_weights_gfx12[:rows],
+    )
 
 
 def _esb_h(cfg):
@@ -106,6 +132,9 @@ class RoutingCFG:
     per_expert_scale: torch.Tensor | None
     router_bias: torch.Tensor | None = None
     tid2eid: torch.Tensor | None = None
+    router_logits_gfx12: torch.Tensor | None = None
+    routing_weights_gfx12: torch.Tensor | None = None
+    selected_experts_gfx12: torch.Tensor | None = None
 
 @dataclass
 class FusedBuffers:
@@ -159,14 +188,15 @@ def _routing_std_torch(cfg, y, params, include_bias = False):
 def routing_std(bsz, cfg, y, params):
     if _hip_router_call_supported(bsz, cfg, y, params):
         _prepare_hip_router_gate_t(cfg)
+        scores, selected_experts, routing_weights = _hip_router_buffers(cfg, bsz)
         ext.routing_std_gfx12_bsz1(
             y,
             cfg.gate_tensor_t,
-            cfg.router_logits_bsz1,
-            cfg.selected_experts_bsz1,
-            cfg.routing_weights_bsz1,
+            scores,
+            selected_experts,
+            routing_weights,
         )
-        return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+        return selected_experts, routing_weights
     if not hasattr(ext, "routing_std"):
         return _routing_std_torch(cfg, y, params)
     if bsz == 1:
@@ -1301,8 +1331,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
 
         # gfx12 grouped decode/verification path: selected IDs and weights stay on-device,
-        # and every row-major assignment slot remains distinct. Router-native remains bsz1;
-        # the standard router above intentionally falls back to torch for verification rows.
+        # and every row-major assignment slot remains distinct. The router handles up to eight
+        # rows; grouped expert execution remains limited to its separately validated envelope.
         elif (
             1 <= bsz <= _HIP_GROUPED_MAX_ROWS and self.support_hip_grouped and
             self.tp_mode is None and self.act_limit == 0 and
