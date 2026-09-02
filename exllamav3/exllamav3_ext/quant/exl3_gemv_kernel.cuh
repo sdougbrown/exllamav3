@@ -19,8 +19,9 @@
 // the main GEMV loop here. 2, 3 and 4 bpw.
 //
 // CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention-projection sizes;
-// CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. MMODE 0 is
-// the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
+// CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. CFG 2
+// ("prefill", 128 threads, 4 n-tiles/warp, 4 k-splits) serves the 16-row grouped-MoE body.
+// MMODE 0 is the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
 
 #if !defined(USE_ROCM) && !defined(__HIPCC__)
 #include <cooperative_groups.h>
@@ -165,9 +166,10 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     static_assert(bits == 2 || bits == 3 || bits == 4,
                   "CUDA exl3_gemv_kernel supports 2, 3 and 4 bpw");
 #endif
-    constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
-    constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
-    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
+    static_assert(CFG >= 0 && CFG <= 2, "unsupported GEMV configuration");
+    constexpr int WK   = CFG == 0 ? 16 : CFG == 1 ? 8 : 4;  // k-split (warps per block)
+    constexpr int WNT  = CFG == 0 ? 2 : 4;                    // adjacent n-tiles per warp
+    constexpr int PF   = CFG == 0 ? 4 : 2;                    // prefetch ring depth
     constexpr int THREADS = WK * 32;
     constexpr int COLS = WNT * 16;
 
@@ -546,7 +548,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
 #if defined(USE_ROCM) || defined(__HIPCC__)
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256)
+__global__ __launch_bounds__(CFG == 0 ? 512 : CFG == 1 ? 256 : 128)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
     exl3_gemv_kernel_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE>

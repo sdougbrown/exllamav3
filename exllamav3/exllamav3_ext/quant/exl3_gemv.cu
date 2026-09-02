@@ -317,7 +317,7 @@ void moe_prefill_had_rows_kernel
 }
 
 template <bool FP32, bool TWO_PROJECTIONS, int CFG>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256)
+__global__ __launch_bounds__(CFG == 0 ? 512 : CFG == 1 ? 256 : 128)
 void moe_prefill_grouped_gemv_k3_kernel
 (
     const half* A,
@@ -733,7 +733,7 @@ void exl3_moe_gfx12_k3_prefill
 
     const int chunk_slots = CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + experts;
     dim3 gu_grid(intermediate / 64, chunk_slots, 2);
-    moe_prefill_grouped_gemv_k3_kernel<false, true, 1><<<gu_grid, 256, 0, stream>>>
+    moe_prefill_grouped_gemv_k3_kernel<false, true, 2><<<gu_grid, 128, 0, stream>>>
     (reinterpret_cast<const half*>(gu_had.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr,
      gt, ut,
      gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
@@ -754,7 +754,7 @@ void exl3_moe_gfx12_k3_prefill
      assignments, intermediate, experts, false);
 
     dim3 down_grid(MOE_HIDDEN / 64, chunk_slots, 1);
-    moe_prefill_grouped_gemv_k3_kernel<true, false, 1><<<down_grid, 256, 0, stream>>>
+    moe_prefill_grouped_gemv_k3_kernel<true, false, 2><<<down_grid, 128, 0, stream>>>
     (reinterpret_cast<const half*>(gu_out.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr,
      dt, dt,
      down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
