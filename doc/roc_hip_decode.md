@@ -144,6 +144,10 @@ The grouped path's first real-model layer difference is 1.49e-8 maximum in fp32 
 
 The gfx12 throughput route extends the same direct K3 arithmetic to 6–512 prefill rows. It sorts assignments by expert, processes up to 16 rows per wide WMMA tile, and reduces through the inverse permutation in deterministic expert order. The shared workspaces add approximately 119 MiB per device. Five controlled pp511 trials improved from a 357.93 tok/s fallback median to 855.11 tok/s, a 138.9% gain. Under the profiler, HIP launches fell from 136,043 to 13,305; aggregate GPU time fell from 986 to 484 ms.
 
+The gfx12 GDN prefill kernel uses two V partitions instead of the decode-oriented four. This retains the four-way layout for sequences up to five rows and leaves NVIDIA unchanged. A controlled pp511 sweep was noise-level, 894.48 versus 896.61 tok/s. Profiled recurrent-kernel time fell from 97.45 to 78.34 ms, while aggregate GPU time fell from 484 to 468 ms. An alternating 12K sweep improved from a 660.69 to 675.48 tok/s median, a 2.24% gain.
+
+AITER can complement the runtime one operation at a time; Triton is not an all-or-nothing dependency. The installed AITER exposes chunked GDN, paged-attention, and GEMM APIs. Its GDN API requires expanding this checkpoint's 16 shared q/k heads to 48 value heads. Both tested chunk variants accumulated non-finite full-model state. Its A16W16 assembly path also has no gfx1201 kernel or Triton GEMM configuration. No AITER route is enabled.
+
 The 30.4 tok/s target-only short-context median is above the historical 19.43 tok/s llama.cpp target-only result for this host.
 
 The checkpoint also includes its complete 6,200-tensor MTP head; no separate EXL3 draft download is required. The draft adds approximately 1.25 GB on GPU0. Grouped K3 execution now supports verification windows of up to five rows. This moves MTP3 from 17.50 to 49.79 tok/s in a controlled on/off comparison. It also preserves duplicate routing slots and deterministic per-token reductions.
@@ -168,7 +172,7 @@ With 512-token chunks, synthetic prefill remained stable as context grew:
 
 The 180K result retained 87.6% of the 12K prefill rate instead of falling toward 300 tok/s. Retrieval quality is not yet qualified. A synthetic 12K passkey prompt failed under both sparse QSA and a forced-dense control, so it did not isolate the selector.
 
-This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP3 works beyond the sparse threshold, but its workload-dependent acceptance and sparse-QSA retrieval quality still need broader qualification. The remaining short-context bottlenecks are the grouped K3 WMMA body, recurrent GDN, and K5 projections. Warmed 511-token prefill reached 855.11 tok/s with the throughput MoE route. Long-context retrieval quality still needs a representative control before comparison with sparse-QSA serving results.
+This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP3 works beyond the sparse threshold, but its workload-dependent acceptance and sparse-QSA retrieval quality still need broader qualification. The remaining short-context bottlenecks are the grouped K3 WMMA body, recurrent GDN, and reconstructed K5 projections. Warmed 511-token prefill reached 896.61 tok/s with both throughput changes. Long-context retrieval quality still needs a representative control before comparison with sparse-QSA serving results.
 
 ## MCG compatibility
 
