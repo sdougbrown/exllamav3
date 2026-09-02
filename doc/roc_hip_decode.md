@@ -142,6 +142,8 @@ A gfx12 batch-one standard router replaces each remaining 2560-by-512 rocBLAS pr
 
 The grouped path's first real-model layer difference is 1.49e-8 maximum in fp32 output. Qwen4Exp recurrent state amplifies numerical noise. A 16-step fallback repeat measured a 3.63 maximum logit delta and 0.270 mean delta. The grouped pass measured 4.44 and 0.274. Both retained 15/16 top-1 agreement with the reference pass and at least 4/5 top-five overlap. The opt-in full-model oracle includes that fallback control and verifies grouped execution on both gfx1201 devices.
 
+The gfx12 throughput route extends the same direct K3 arithmetic to 6–512 prefill rows. It sorts assignments by expert, processes up to 16 rows per wide WMMA tile, and reduces through the inverse permutation in deterministic expert order. The shared workspaces add approximately 119 MiB per device. Five controlled pp511 trials improved from a 357.93 tok/s fallback median to 855.11 tok/s, a 138.9% gain. Under the profiler, HIP launches fell from 136,043 to 13,305; aggregate GPU time fell from 986 to 484 ms.
+
 The 30.4 tok/s target-only short-context median is above the historical 19.43 tok/s llama.cpp target-only result for this host.
 
 The checkpoint also includes its complete 6,200-tensor MTP head; no separate EXL3 draft download is required. The draft adds approximately 1.25 GB on GPU0. Grouped K3 execution now supports verification windows of up to five rows. This moves MTP3 from 17.50 to 49.79 tok/s in a controlled on/off comparison. It also preserves duplicate routing slots and deterministic per-token reductions.
@@ -152,7 +154,7 @@ The MTP3 result is above the historical 45–50 tok/s llama.cpp short-context MT
 
 A controlled sweep kept the same `The capital of France is` suffix while varying the prefix from 511 to 4,095 tokens. MTP3 accepted 14–20 draft tokens and rejected 19–43, with no discontinuity at QSA's 2,051-token sparse threshold. At 12K it accepted 18 and rejected 27 while decoding at 37.60 tok/s. MTP acceptance is workload-sensitive, but it does not inherently collapse when sparse QSA activates.
 
-Sparse-QSA target decode measured 32.38 tok/s at 11,999 tokens. The original 256-token prefill chunks reached 547.5 tok/s. Matching the reference llama.cpp microbatch size with `max_chunk_size=512` raised 12K prefill to 643.1 tok/s; 1,024-token chunks regressed to 627.4 tok/s.
+Sparse-QSA target decode measured 32.38 tok/s at 11,999 tokens. The original 256-token prefill chunks reached 547.5 tok/s. Loading with `max_chunk_size=512` raised 12K prefill to 643.1 tok/s; a value of 1,024 regressed to 627.4 tok/s. `Generator` retains its independent 2,048-token default unless its `max_chunk_size` is also set.
 
 With 512-token chunks, synthetic prefill remained stable as context grew:
 
@@ -166,7 +168,7 @@ With 512-token chunks, synthetic prefill remained stable as context grew:
 
 The 180K result retained 87.6% of the 12K prefill rate instead of falling toward 300 tok/s. Retrieval quality is not yet qualified. A synthetic 12K passkey prompt failed under both sparse QSA and a forced-dense control, so it did not isolate the selector.
 
-This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP3 works beyond the sparse threshold, but its workload-dependent acceptance and sparse-QSA retrieval quality still need broader qualification. The remaining short-context bottlenecks are launch count, K5 projections, and grouped K3 expert work. Warmed 511-token prefill reached 349 tok/s with 512-token chunks, near the historical 361 tok/s llama.cpp pp512 result. Long-context retrieval quality still needs a representative control before comparison with sparse-QSA serving results.
+This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP3 works beyond the sparse threshold, but its workload-dependent acceptance and sparse-QSA retrieval quality still need broader qualification. The remaining short-context bottlenecks are the grouped K3 WMMA body, recurrent GDN, and K5 projections. Warmed 511-token prefill reached 855.11 tok/s with the throughput MoE route. Long-context retrieval quality still needs a representative control before comparison with sparse-QSA serving results.
 
 ## MCG compatibility
 

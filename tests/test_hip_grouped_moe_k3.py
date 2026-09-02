@@ -31,6 +31,8 @@ def _require_gfx12(device_index=0):
         pytest.skip(f"grouped MoE requires gfx1200/gfx1201, got {arch or 'unknown'}")
     assert hasattr(ext, "exl3_moe_gfx12_k3"), \
         "gfx12 target build is missing ext.exl3_moe_gfx12_k3"
+    assert hasattr(ext, "exl3_moe_gfx12_k3_prefill"), \
+        "gfx12 target build is missing ext.exl3_moe_gfx12_k3_prefill"
     assert ext.exl3_gemv_supported(device_index)
 
 
@@ -131,6 +133,84 @@ def _run_grouped(x, selected, weights, gate, up, down, buffers=None, pointer_arg
         buffers["gu_had"], buffers["gu_out"], buffers["down_had"], buffers["down_out"],
     )
     return buffers["output"]
+
+
+def _run_prefill(x, selected, weights, gate, up, down):
+    rows = x.shape[0]
+    assignments = rows * TOP_K
+    intermediate = down[1][0].numel()
+    order = torch.argsort(selected.reshape(-1), stable=True)
+    expert_count = torch.bincount(selected.reshape(-1), minlength=NUM_EXPERTS + 1)
+    output = torch.empty((rows, HIDDEN), dtype=torch.float32, device=x.device)
+    gu_had = torch.empty((2 * assignments, HIDDEN), dtype=torch.float16, device=x.device)
+    gu_out = torch.empty((2 * assignments, intermediate), dtype=torch.float16, device=x.device)
+    down_out = torch.empty((assignments, HIDDEN), dtype=torch.float32, device=x.device)
+    offsets = torch.empty((NUM_EXPERTS + 1,), dtype=torch.long, device=x.device)
+    inverse = torch.empty((assignments,), dtype=torch.long, device=x.device)
+    chunks = torch.empty((NUM_EXPERTS * 320,), dtype=torch.int, device=x.device)
+    chunk_count = torch.empty((1,), dtype=torch.int, device=x.device)
+    ext.exl3_moe_gfx12_k3_prefill(
+        x, output, selected, weights, order, expert_count,
+        *_grouped_args(gate, up, down),
+        gu_had, gu_out, down_out, offsets, inverse, chunks, chunk_count,
+    )
+    return output
+
+
+@torch.inference_mode()
+def test_prefill_k3_matches_reconstruction_oracle(synthetic_grouped_case):
+    _, gate, up, down = synthetic_grouped_case
+    rows = 6
+    x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda") * 1e-3
+    selected = torch.tensor(
+        [[(row * 3 + slot * 5) % NUM_EXPERTS for slot in range(TOP_K)] for row in range(rows)],
+        dtype=torch.long, device="cuda",
+    )
+    weights = torch.rand((rows, TOP_K), dtype=torch.float16, device="cuda")
+    weights /= weights.sum(dim=-1, keepdim=True)
+    expected = _oracle(x, selected, weights, gate, up, down)
+    actual = _run_prefill(x, selected, weights, gate, up, down)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0.04)
+
+
+@torch.inference_mode()
+def test_prefill_k3_preserves_concentrated_duplicate_slots(synthetic_grouped_case):
+    _, gate, up, down = synthetic_grouped_case
+    rows = 52  # 520 assignments to one expert, above the per-token row count
+    x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda") * 1e-2
+    selected = torch.zeros((rows, TOP_K), dtype=torch.long, device="cuda")
+    weights = torch.rand((rows, TOP_K), dtype=torch.float16, device="cuda")
+    weights /= weights.sum(dim=-1, keepdim=True)
+    expected_rows = []
+    for row in range(rows):
+        g = _linear_ref(x[row:row + 1], gate, 0)
+        u = _linear_ref(x[row:row + 1], up, 0)
+        activated = torch.nn.functional.silu(g.float()).half() * u
+        down_row = _linear_ref(activated, down, 0).float()
+        total = torch.zeros_like(down_row)
+        for slot in range(TOP_K):
+            total = total + down_row * weights[row, slot].float()
+        expected_rows.append(total)
+    expected = torch.cat(expected_rows)
+    actual = _run_prefill(x, selected, weights, gate, up, down)
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=0.04)
+
+
+@torch.inference_mode()
+def test_prefill_k3_is_deterministic(synthetic_grouped_case):
+    _, gate, up, down = synthetic_grouped_case
+    rows = 17
+    x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda") * 1e-3
+    selected = torch.tensor(
+        [[(row + slot * 5) % NUM_EXPERTS for slot in range(TOP_K)] for row in range(rows)],
+        dtype=torch.long, device="cuda",
+    )
+    weights = torch.rand((rows, TOP_K), dtype=torch.float16, device="cuda")
+    weights /= weights.sum(dim=-1, keepdim=True)
+    first = _run_prefill(x, selected, weights, gate, up, down).clone()
+    second = _run_prefill(x, selected, weights, gate, up, down).clone()
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -402,6 +482,39 @@ def test_flash_multirow_route_and_decline_guards(flash_model, device_index, rows
 
 @pytest.mark.parametrize("device_index", DEVICE_INDICES[:2])
 @torch.inference_mode()
+def test_flash_prefill_route_matches_layer_fallback(flash_model, device_index, monkeypatch):
+    _require_gfx12(device_index)
+    device = torch.device("cuda", device_index)
+    mlp = flash_model.find_module("model.language_model.layers.0.mlp")
+    try:
+        mlp.load(device=device)
+        assert mlp.support_hip_prefill
+        x = torch.randn((1, 64, HIDDEN), dtype=torch.float16, device=device)
+        original = ext.exl3_moe_gfx12_k3_prefill
+        calls = 0
+
+        def spy(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(ext, "exl3_moe_gfx12_k3_prefill", spy)
+        monkeypatch.setenv("EXL3_HIP_GROUPED_MOE_PREFILL", "1")
+        actual = mlp.forward(x, {}).clone()
+        assert calls == 1
+        monkeypatch.setenv("EXL3_HIP_GROUPED_MOE_PREFILL", "0")
+        expected = mlp.forward(x, {}).clone()
+        assert calls == 1
+        difference = (actual - expected).abs()
+        assert torch.isfinite(actual).all()
+        assert difference.max().item() <= 5e-4
+        assert difference.mean().item() <= 2e-5
+    finally:
+        mlp.unload()
+
+
+@pytest.mark.parametrize("device_index", DEVICE_INDICES[:2])
+@torch.inference_mode()
 def test_expert_lora_permanently_invalidates_grouped_route(flash_model, device_index, tmp_path):
     _require_gfx12(device_index)
     device = torch.device("cuda", device_index)
@@ -429,6 +542,7 @@ def test_expert_lora_permanently_invalidates_grouped_route(flash_model, device_i
         assert target.lora_a_tensors and target.lora_b_tensors
         assert mlp.hip_grouped_lora_blocked
         assert not mlp.support_hip_grouped
+        assert not mlp.support_hip_prefill
 
         x = torch.randn((1, 1, HIDDEN), dtype=torch.float16, device=device) * 1e-3
         calls, restore = _route_spies()
@@ -444,6 +558,7 @@ def test_expert_lora_permanently_invalidates_grouped_route(flash_model, device_i
         assert not target.lora_a_tensors and not target.lora_b_tensors
         assert mlp.hip_grouped_lora_blocked
         assert not mlp.support_hip_grouped
+        assert not mlp.support_hip_prefill
     finally:
         if adapter is not None:
             adapter.unload()

@@ -29,6 +29,8 @@ _HIP_ROUTER_HIDDEN = 2560
 _HIP_ROUTER_EXPERTS = 512
 _HIP_ROUTER_TOP_K = 10
 _HIP_GROUPED_MAX_ROWS = 5
+_HIP_PREFILL_MAX_ROWS = 512
+_HIP_PREFILL_MAX_EXPERT_ROWS = _HIP_PREFILL_MAX_ROWS * _HIP_ROUTER_TOP_K
 
 
 def _hip_router_device_supported(device):
@@ -120,6 +122,18 @@ class HIPGroupedBuffers:
     down_had: torch.Tensor
     down_out: torch.Tensor
     output: torch.Tensor
+
+
+@dataclass
+class HIPPrefillBuffers:
+    gu_had: torch.Tensor
+    gu_out: torch.Tensor
+    down_out: torch.Tensor
+    output: torch.Tensor
+    expert_offsets: torch.Tensor
+    inverse_order: torch.Tensor
+    expert_chunks: torch.Tensor
+    chunk_count: torch.Tensor
 
 
 def _routing_std_torch(cfg, y, params, include_bias = False):
@@ -759,6 +773,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.fused_mode_buffers = None
         self.support_hip_grouped = False
         self.hip_grouped_buffers = None
+        self.support_hip_prefill = False
+        self.hip_prefill_buffers = None
         self.hip_grouped_lora_blocked = False
         self._cpu_init_state()
 
@@ -779,6 +795,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if target in self.gates or target in self.ups or target in self.downs:
             self.hip_grouped_lora_blocked = True
             self.support_hip_grouped = False
+            self.support_hip_prefill = False
 
 
     def load_local(self, **kwargs):
@@ -834,7 +851,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.cpu_split_first is None
         )
         hip_grouped_device = False
-        if bool(torch.version.hip) and hasattr(ext, "exl3_moe_gfx12_k3"):
+        if (
+            bool(torch.version.hip) and hasattr(ext, "exl3_moe_gfx12_k3") and
+            hasattr(ext, "exl3_gemv_supported")
+        ):
             device_index = torch.device(self.device).index
             if device_index is None:
                 device_index = torch.cuda.current_device()
@@ -874,6 +894,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.support_hip_grouped = self.support_hip_grouped and all(
                 multi.K == 3 and multi.mul1 and not multi.mcg
                 for multi in (self.multi_gate, self.multi_up, self.multi_down)
+            )
+            self.support_hip_prefill = (
+                self.support_hip_grouped and hasattr(ext, "exl3_moe_gfx12_k3_prefill")
             )
 
         # Temp buffers for graph, dq and fused-bsz1 paths
@@ -951,6 +974,31 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     device, (max_assignments, H), torch.float, "moe_gfx12_down_out"),
                 output = g_tensor_cache.get(
                     device, (_HIP_GROUPED_MAX_ROWS, H), torch.float, "moe_gfx12_output"),
+            )
+
+        if self.support_hip_prefill:
+            max_assignments = _HIP_PREFILL_MAX_ROWS * numex
+            self.hip_prefill_buffers = HIPPrefillBuffers(
+                gu_had = g_tensor_cache.get(
+                    device, (2 * max_assignments, H), torch.half, "moe_gfx12_pf_gu_had"),
+                gu_out = g_tensor_cache.get(
+                    device, (2 * max_assignments, I), torch.half, "moe_gfx12_pf_gu_out"),
+                down_out = g_tensor_cache.get(
+                    device, (max_assignments, H), torch.float, "moe_gfx12_pf_down_out"),
+                output = g_tensor_cache.get(
+                    device, (_HIP_PREFILL_MAX_ROWS, H), torch.float, "moe_gfx12_pf_output"),
+                expert_offsets = g_tensor_cache.get(
+                    device, (self.num_experts + 1,), torch.long, "moe_gfx12_pf_offsets"),
+                inverse_order = g_tensor_cache.get(
+                    device, (max_assignments,), torch.long, "moe_gfx12_pf_inverse"),
+                expert_chunks = g_tensor_cache.get(
+                    device,
+                    (self.num_experts * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
+                    torch.int,
+                    "moe_gfx12_pf_chunks",
+                ),
+                chunk_count = g_tensor_cache.get(
+                    device, (1,), torch.int, "moe_gfx12_pf_chunk_count"),
             )
 
         if (self.support_quant_paths or self.support_bc_bsz1) \
@@ -1162,6 +1210,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.fused_mode_buffers = None
         self.support_hip_grouped = False
         self.hip_grouped_buffers = None
+        self.support_hip_prefill = False
+        self.hip_prefill_buffers = None
         self.hip_grouped_lora_blocked = False
         if self.multi_gate is not None:
             self.multi_gate.unload()
@@ -1332,12 +1382,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     flat_expert_local = torch.where(valid, flat_expert_local, torch.full_like(flat_expert_local, E))
 
                 # Group once by local expert id (including sentinel for expert-P mode)
-                order = flat_expert_local.argsort()
-                token_sorted = flat_token[order]
-                weight_sorted = flat_weight[order]
+                order = flat_expert_local.argsort(stable = True)
 
                 # Count how many assignments per expert
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+                token_sorted = None
+                weight_sorted = None
 
                 def run_fused(num_active):
                     # Gateless: the up module stands in for the gate pointer tables (the kernel
@@ -1376,25 +1426,68 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         num_active
                     )
 
-                # With few enough total assignments, no expert can exceed the fused kernel's
-                # row capacity: the fused path handles everything, the per-expert count
-                # readback (a CPU sync per layer, ~33% idle at MTP verify shapes) is
-                # unnecessary, and the overflow fallback loop below cannot have work.
-                # num_active -1 = unknown, kernel launches at max concurrency
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= TEMP_ROWS_FUSED:
-                    run_fused(-1)
+                hip_prefill_eligible = (
+                    self.support_hip_prefill and self.tp_mode is None and
+                    self.num_local_experts == self.num_experts and
+                    _HIP_GROUPED_MAX_ROWS < num_tokens <= _HIP_PREFILL_MAX_ROWS and
+                    y.dtype == torch.half and y.is_contiguous() and
+                    selected_experts.is_contiguous() and routing_weights.is_contiguous() and
+                    os.environ.get("EXL3_HIP_GROUPED_MOE_PREFILL", "1") != "0" and
+                    os.environ.get("EXL3_GEMV", "1") != "0" and
+                    not params.get("activate_all_experts") and
+                    not params.get("reconstruct") and not params.get("autosplit_measure")
+                )
+                if hip_prefill_eligible:
+                    buffers = self.hip_prefill_buffers
+                    assignments = num_tokens * top_k
+                    output = buffers.output[:num_tokens]
+                    ext.exl3_moe_gfx12_k3_prefill(
+                        y,
+                        output,
+                        selected_experts,
+                        routing_weights,
+                        order,
+                        expert_count,
+                        self.multi_gate.ptrs_trellis,
+                        self.multi_gate.ptrs_suh,
+                        self.multi_gate.ptrs_svh,
+                        self.multi_up.ptrs_trellis,
+                        self.multi_up.ptrs_suh,
+                        self.multi_up.ptrs_svh,
+                        self.multi_down.ptrs_trellis,
+                        self.multi_down.ptrs_suh,
+                        self.multi_down.ptrs_svh,
+                        buffers.gu_had[:2 * assignments],
+                        buffers.gu_out[:2 * assignments],
+                        buffers.down_out[:assignments],
+                        buffers.expert_offsets,
+                        buffers.inverse_order[:assignments],
+                        buffers.expert_chunks,
+                        buffers.chunk_count,
+                    )
+                    final_hidden_states = output
                     expert_count_list = None
                 else:
-                    expert_count_list = expert_count.tolist()
+                    token_sorted = flat_token[order]
+                    weight_sorted = flat_weight[order]
 
-                    # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED
-                    # tokens
-                    if self.fused_mode_buffers is not None:
-                        num_active = sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
-                        run_fused(num_active)
-                        min_rows = TEMP_ROWS_FUSED
+                    # With few enough total assignments, no expert can exceed the fused kernel's
+                    # row capacity: the fused path handles everything, the per-expert count
+                    # readback is unnecessary, and the overflow fallback cannot have work.
+                    if self.fused_mode_buffers is not None and num_tokens * top_k <= TEMP_ROWS_FUSED:
+                        run_fused(-1)
+                        expert_count_list = None
                     else:
-                        min_rows = 0
+                        expert_count_list = expert_count.tolist()
+                        if self.fused_mode_buffers is not None:
+                            num_active = sum(
+                                1 for count in expert_count_list[:num_ex]
+                                if 0 < count <= TEMP_ROWS_FUSED
+                            )
+                            run_fused(num_active)
+                            min_rows = TEMP_ROWS_FUSED
+                        else:
+                            min_rows = 0
 
                 out_state = None
                 interm = None

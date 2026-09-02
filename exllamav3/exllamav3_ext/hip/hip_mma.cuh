@@ -90,7 +90,7 @@ __device__ __forceinline__ int hip_mma_warp_id()
 // Build the gfx12 WMMA A operand (8 halves) from the kernel's a01/a23 fragments
 // (CUDA m16n8k16 A-fragment semantics, PTX ISA 9.7.15.5.8):
 //   lane l: g=l>>2, t=l&3  a01[0] = A[g][2t],A[g][2t+1]   a23[0] = A[g][2t+8],A[g][2t+9]
-//   (a01[1]/a23[1] = rows g+8, always zero in EXL3 GEMV: m <= 8).
+//   a01[1]/a23[1] carry rows g+8 for the throughput MoE m <= 16 path.
 #if defined(__gfx1200__) || defined(__gfx1201__)   // ---- gfx12 only: assembly helpers ----
 __device__ __forceinline__ HipFp16x8 assemble_a_frag_gfx12(const FragB& a01, const FragB& a23)
 {
@@ -105,14 +105,16 @@ __device__ __forceinline__ HipFp16x8 assemble_a_frag_gfx12(const FragB& a01, con
     HipFp16x8 a = {};
     uint32_t* aw = reinterpret_cast<uint32_t*>(&a);   // 8 halves = 4 dwords, little-endian
     const int row = lane & 15;                 // AMD A row this lane contributes
-    if (row < 8)                               // rows 8..15 of the m16 tile are never fed
-        for (int j = 0; j < 4; ++j)
-        {
-            // AMD reg pair (2j,2j+1) = A[row][k = 8*(lane>>4)+2j (+1)]:
-            // CUDA src lane 4*row+j, half2 a01[0] (k<8) / a23[0] (k>=8)
-            const __half2 v = stg[4 * row + j][2 * (lane >> 4)];
-            aw[j] = *reinterpret_cast<const uint32_t*>(&v);
-        }
+    const int source_row = row & 7;
+    for (int j = 0; j < 4; ++j)
+    {
+        // AMD reg pair (2j,2j+1) = A[row][k = 8*(lane>>4)+2j (+1)]:
+        // CUDA src lane 4*(row&7)+j, fragment register row>>3, with a01 for k<8
+        // and a23 for k>=8.
+        const int slot = 2 * (lane >> 4) + (row >> 3);
+        const __half2 v = stg[4 * source_row + j][slot];
+        aw[j] = *reinterpret_cast<const uint32_t*>(&v);
+    }
     return a;
 }
 

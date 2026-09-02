@@ -172,9 +172,9 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     constexpr int COLS = WNT * 16;
 
 #if defined(USE_ROCM) || defined(__HIPCC__)
-    // HIP: the WMMA fp32 C fragment holds rows 0..7 in lanes 0..15 (one column per lane,
-    // 8 rows across the 8 registers). MMODE 0 only stages its one valid output row.
-    constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
+    // HIP: the WMMA fp32 C fragment holds rows 0..7 in lanes 0..15 and rows 8..15
+    // in lanes 16..31. MMODE 0 stages one row; MMODE 2 enables all 16 for prefill.
+    constexpr int ROWS = MMODE == 0 ? 1 : MMODE == 2 ? 16 : EXL3_GEMV_MAX_M;
 #else
     constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
     constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
@@ -243,7 +243,9 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     // A fragment row indices for this lane
     const int r0 = lane >> 2;
     const size_t a_row0 = (size_t) r0 * (size_k / 2);
+    const size_t a_row1 = (size_t) (r0 + 8) * (size_k / 2);
     const bool r0_ok = MMODE == 0 ? lane < 4 : r0 < size_m;
+    const bool r1_ok = MMODE == 2 && r0 + 8 < size_m;
 
     // Per-lane extraction constants (see dq8_aligned_2bits / dq8<3, cb, 4> in exl3_dq.cuh)
     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
@@ -361,8 +363,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             FragB a01, a23;
             a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
             a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
-            a01[1] = hzero;
-            a23[1] = hzero;
+            a01[1] = r1_ok ? A2[a_row1 + a_col] : hzero;
+            a23[1] = r1_ok ? A2[a_row1 + a_col + 4] : hzero;
 
 #if defined(__gfx1200__) || defined(__gfx1201__)
             // Every adjacent N tile uses the same A rows for this K slice. Assemble the full
@@ -457,8 +459,19 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
                 #pragma unroll
-                for (int r = 0; r < ROWS; ++r)
+                for (int r = 0; r < min(ROWS, 8); ++r)
                     sh_red[warp][r][t * 16 + lane] = acc[t][r];
+        }
+        if constexpr (ROWS > 8)
+        {
+            if (lane >= 16)
+            {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int r = 0; r < 8; ++r)
+                        sh_red[warp][r + 8][t * 16 + (lane & 15)] = acc[t][r];
+            }
         }
 #else
         // Cross-warp reduction over the k splits. Lane l holds row l/4, cols

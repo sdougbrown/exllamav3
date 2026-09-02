@@ -35,6 +35,34 @@ void exl3_moe_gfx12_k3
     at::Tensor& down_had,
     at::Tensor& down_out
 );
+
+// gfx12 throughput counterpart for sorted prefill assignments. Each expert is evaluated in
+// chunks of up to eight rows so its K3 weights are reused across a WMMA tile.
+void exl3_moe_gfx12_k3_prefill
+(
+    const at::Tensor& A,
+    at::Tensor& output,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    const at::Tensor& order,
+    const at::Tensor& expert_count,
+    const at::Tensor& gate_trellis,
+    const at::Tensor& gate_suh,
+    const at::Tensor& gate_svh,
+    const at::Tensor& up_trellis,
+    const at::Tensor& up_suh,
+    const at::Tensor& up_svh,
+    const at::Tensor& down_trellis,
+    const at::Tensor& down_suh,
+    const at::Tensor& down_svh,
+    at::Tensor& gu_had,
+    at::Tensor& gu_out,
+    at::Tensor& down_out,
+    at::Tensor& expert_offsets,
+    at::Tensor& inverse_order,
+    at::Tensor& expert_chunks,
+    at::Tensor& chunk_count
+);
 #endif
 
 // Try to dispatch a GEMM call to the GEMV kernel. Returns false (launching nothing) if the
