@@ -202,6 +202,19 @@ if torch.version.hip:
         if not hasattr(exllamav3_ext, _name):
             setattr(exllamav3_ext, _name, getattr(_fb, _name))
 
+    # Keep the public API stable while using the fixed-K native QSA kernel only for its
+    # validated gfx12 wave32 shape. Everything else retains the general PyTorch fallback.
+    if hasattr(exllamav3_ext, "dsa_topk_gfx12"):
+        def _dsa_topk_rocm(scores, indices, k, t_ptr = None, t_seq = 0):
+            if (
+                hasattr(exllamav3_ext, "dsa_topk_gfx12") and
+                _fb.dsa_topk_gfx12_supported(scores, indices, k, t_ptr, t_seq)
+            ):
+                return exllamav3_ext.dsa_topk_gfx12(scores, indices)
+            return _fb.dsa_topk(scores, indices, k, t_ptr, t_seq)
+
+        setattr(exllamav3_ext, "dsa_topk", _dsa_topk_rocm)
+
     # Constants and functions guarded by fused_sampler_enable in generator/sampler/custom.py.
     # Disable the fused sampler path on ROCm by setting the flag and providing stub values.
     if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_MAX_BLOCKS'):
