@@ -829,10 +829,13 @@ class Attention(Module):
         if self.qsa_indexer is None:
             return default, kwargs
         from ..cache.fp16 import CacheLayer_fp16
-        from ..cache.qsa import CacheLayer_qsa
-        assert default is CacheLayer_fp16, \
-            "QSA attention currently supports only the fp16 cache layer"
-        return CacheLayer_qsa, kwargs
+        from ..cache.quant import CacheLayer_quant
+        from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant
+        if default is CacheLayer_fp16:
+            return CacheLayer_qsa, kwargs
+        if default is CacheLayer_quant:
+            return CacheLayer_qsa_quant, kwargs
+        raise AssertionError("QSA attention supports only fp16 or quantized cache layers")
 
 
     def autosplit_extra_measure(self, params):
@@ -921,7 +924,7 @@ class Attention(Module):
             from ..cache import CacheLayer as _CL
             qsa_layer = cache if isinstance(cache, _CL) else cache.layers[self.layer_idx, params.get("layer_instance") or 0]
             qsa_seqlens_cpu = get_for_device(params, "cache_seqlens", "cpu")
-            qsa_sparse = int(qsa_seqlens_cpu.max().item()) + seqlen > self.qsa_indexer.sparse_threshold()
+            qsa_sparse = self.qsa_indexer.uses_sparse_cache(qsa_seqlens_cpu, seqlen)
 
         # Graph-captured C++ path for the whole decode attention block (causality is baked
         # into the slot kernels, so non-causal callers like the DFlash draft graph too)
@@ -1046,6 +1049,8 @@ class Attention(Module):
 
 
     def tp_export(self, plan, producer):
+        if self.qsa_indexer is not None:
+            raise RuntimeError("Tensor parallelism is not supported for QSA attention")
         assert self.device is not None, "Cannot export module for TP before loading."
 
         def _export(child):
