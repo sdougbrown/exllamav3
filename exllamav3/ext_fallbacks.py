@@ -653,6 +653,20 @@ def dequant_cache_paged_window(
     _dequant_cache_paged(k_in, k_in_scales, k_out, v_in, v_in_scales, v_out, cache_seqlens, block_table, page_size, compand_a, -1, bonus_len, True)
 
 
+# -- Quantization utilities (quant/util.cu) ------------------------------------
+
+
+def count_inf_nan(x: torch.Tensor, counts: torch.Tensor) -> None:
+    """Accumulate infinity and NaN counts into a two-element int64 tensor."""
+    if x.dtype not in (torch.float16, torch.float32):
+        raise TypeError("count_inf_nan expects fp16 or fp32 input")
+    if counts.dtype != torch.int64 or counts.numel() != 2:
+        raise TypeError("count_inf_nan expects a two-element int64 output")
+    if counts.device != x.device:
+        raise ValueError("count_inf_nan expects input and output on the same device")
+    counts.add_(torch.stack((torch.isinf(x).sum(), torch.isnan(x).sum())))
+
+
 # -- DSA top-k (dsa_topk.cu) ---------------------------------------------------
 
 

@@ -20,9 +20,9 @@ def _rocm_device_arch(index: int) -> str:
         return "gfx1201"
     if "7900 XTX" in name or "7900 XT" in name:
         return "gfx1100"
-    if "7800 XT" in name:
+    if "7800 XT" in name or "7700 XT" in name:
         return "gfx1101"
-    if "7700 XT" in name or "7800" in name:
+    if "7600" in name:
         return "gfx1102"
     raise RuntimeError(
         f"Could not determine ROCm arch for device '{name}'. "

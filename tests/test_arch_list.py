@@ -22,6 +22,7 @@ _spec.loader.exec_module(arch_list)
         ("", "AMD Radeon RX 9070 XT", "gfx1201"),
         ("", "AMD Radeon AI PRO R9700", "gfx1201"),
         ("", "AMD Radeon RX 7900 XTX", "gfx1100"),
+        ("", "AMD Radeon RX 7700 XT", "gfx1101"),
     ],
 )
 def test_rocm_arch_fallback_prefers_gcn_arch_name_and_recognizes_gfx12(

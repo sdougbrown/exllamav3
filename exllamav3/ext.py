@@ -197,7 +197,7 @@ if torch.version.hip:
         'softcap',
         'quant_cache_cont', 'dequant_cache_cont',
         'quant_cache_paged', 'dequant_cache_paged', 'dequant_cache_paged_window',
-        'dsa_topk',
+        'count_inf_nan', 'dsa_topk',
     ]:
         if not hasattr(exllamav3_ext, _name):
             setattr(exllamav3_ext, _name, getattr(_fb, _name))
@@ -221,4 +221,4 @@ if torch.version.hip:
         setattr(exllamav3_ext, 'FUSED_SAMPLER_MAX_BLOCKS', 0)
     if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE'):
         setattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE', 0)
-    os.environ.setdefault('EXL3_FUSED_SAMPLER', '0')
+    os.environ['EXL3_FUSED_SAMPLER'] = '0'

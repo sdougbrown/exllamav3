@@ -1,6 +1,8 @@
 """ROCm smoke tests for paths whose CUDA-only extension symbols are absent."""
 from __future__ import annotations
 
+import importlib
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +16,7 @@ from exllamav3.modules import block_sparse_mlp as bsm
 from exllamav3.modules import dsv4
 from exllamav3.modules import gated_delta_net as gdn
 from exllamav3.generator import generator as generator_module
+from exllamav3.ext import exllamav3_ext as ext
 
 DEVICE = "cuda"
 
@@ -60,6 +63,33 @@ def test_ngram_drafting_fails_during_generator_construction_when_sam_is_unavaila
         assert generator.ngram_match_min == 1
     finally:
         generator.filter_pool.shutdown()
+
+
+def test_rocm_forces_fused_sampler_off(monkeypatch):
+    monkeypatch.setenv("EXL3_FUSED_SAMPLER", "1")
+
+    importlib.reload(importlib.import_module("exllamav3.ext"))
+
+    assert os.environ["EXL3_FUSED_SAMPLER"] == "0"
+
+
+def test_cpu_moe_offload_fails_early_on_rocm():
+    with pytest.raises(NotImplementedError, match = "CPU MoE offload is unavailable on ROCm"):
+        module = importlib.import_module("exllamav3.model.moe_cpu_host")
+        module.MoeCpuHost(SimpleNamespace())
+
+
+def test_count_inf_nan_fallback_accumulates_counts():
+    values = torch.tensor(
+        [0.0, float("inf"), float("-inf"), float("nan")],
+        device = DEVICE,
+        dtype = torch.float16,
+    )
+    counts = torch.tensor([4, 7], device = DEVICE, dtype = torch.long)
+
+    ext.count_inf_nan(values, counts)
+
+    assert torch.equal(counts.cpu(), torch.tensor([6, 8]))
 
 
 def test_missing_routing_bindings_use_torch_contracts(monkeypatch):

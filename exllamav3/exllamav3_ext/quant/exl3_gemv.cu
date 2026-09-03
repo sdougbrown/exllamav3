@@ -1013,6 +1013,7 @@ void exl3_gemv
 #endif
 
     TORCH_CHECK_DIM(B, 3);
+    TORCH_CHECK(A.dim() >= 1 && C.dim() >= 1, "exl3_gemv requires non-scalar A and C");
     TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
     TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
     TORCH_CHECK_DTYPE(A, kHalf);
@@ -1020,11 +1021,10 @@ void exl3_gemv
     bool c_fp32 = C.dtype() == at::kFloat;
     if (!c_fp32) TORCH_CHECK_DTYPE(C, kHalf);
     TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
-
-    const half* suh_ptr = (const half*) OPTPTR(suh);
-    half* A_had_ptr = (half*) OPTPTR(A_had);
-    const half* svh_ptr = (const half*) OPTPTR(svh);
-    TORCH_CHECK(suh_ptr && A_had_ptr && svh_ptr, "exl3_gemv requires suh, A_had and svh");
+    TORCH_CHECK(A.is_contiguous() && B.is_contiguous() && C.is_contiguous(),
+                "exl3_gemv requires contiguous A, B and C");
+    TORCH_CHECK(B.device() == A.device() && C.device() == A.device(),
+                "exl3_gemv requires A, B and C on the same device");
 
     int size_m = 1;
     int dim = A.dim();
@@ -1032,6 +1032,27 @@ void exl3_gemv
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
     int K = B.size(2) / 16;
+
+    TORCH_CHECK(suh.has_value() && A_had.has_value() && svh.has_value(),
+                "exl3_gemv requires suh, A_had and svh");
+    const at::Tensor& suh_t = suh.value();
+    const at::Tensor& A_had_t = A_had.value();
+    const at::Tensor& svh_t = svh.value();
+    TORCH_CHECK_DTYPE(suh_t, kHalf);
+    TORCH_CHECK_DTYPE(A_had_t, kHalf);
+    TORCH_CHECK_DTYPE(svh_t, kHalf);
+    TORCH_CHECK(suh_t.device() == A.device() && A_had_t.device() == A.device() &&
+                svh_t.device() == A.device(),
+                "exl3_gemv requires workspaces on the A device");
+    TORCH_CHECK(suh_t.is_contiguous() && A_had_t.is_contiguous() && svh_t.is_contiguous(),
+                "exl3_gemv requires contiguous workspaces");
+    TORCH_CHECK(suh_t.numel() == size_k, "exl3_gemv suh size mismatch");
+    TORCH_CHECK(A_had_t.sizes() == A.sizes(), "exl3_gemv A_had shape mismatch");
+    TORCH_CHECK(svh_t.numel() == size_n, "exl3_gemv svh size mismatch");
+
+    const half* suh_ptr = (const half*) suh_t.data_ptr();
+    half* A_had_ptr = (half*) A_had_t.data_ptr();
+    const half* svh_ptr = (const half*) svh_t.data_ptr();
 
     int cb = 0;
     if (mcg) cb = 1;

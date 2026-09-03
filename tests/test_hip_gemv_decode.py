@@ -221,6 +221,24 @@ def test_hip_gemv_direct_binding_accepts_rank3_inputs():
 
 
 @torch.inference_mode()
+def test_hip_gemv_rejects_invalid_workspace_dtype():
+    _require_gfx12()
+    size = 128
+    A = torch.randn((1, size), dtype = torch.float16, device = "cuda")
+    B = torch.full(
+        (size // 16, size // 16, 4 * 16), 0x1111,
+        dtype = torch.int16, device = "cuda",
+    )
+    C = torch.empty((1, size), dtype = torch.float16, device = "cuda")
+    A_had = torch.empty_like(A)
+    suh = torch.ones((size,), dtype = torch.float32, device = "cuda")
+    svh = torch.ones((size,), dtype = torch.float16, device = "cuda")
+
+    with pytest.raises(RuntimeError, match = "suh_t is incorrect datatype"):
+        ext.exl3_gemv(A, B, C, suh, A_had, svh, False, False)
+
+
+@torch.inference_mode()
 def test_hip_gemv_k5_plain_codebook_is_rejected():
     """K5 requires the MCG or mul1 codebook; cb0 remains unsupported."""
     _require_gfx12()

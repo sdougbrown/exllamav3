@@ -73,6 +73,7 @@ void pack_trellis
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    TORCH_CHECK(K >= 1 && K <= 8, "pack_trellis requires K in the range 1..8");
     TORCH_CHECK_SHAPES(packed, 0, unpacked, 0, 1);
     TORCH_CHECK_SHAPES(packed, 1, unpacked, 1, 1);
     TORCH_CHECK_SIZE(unpacked, 2, 256);
@@ -155,6 +156,7 @@ void unpack_trellis
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    TORCH_CHECK(K >= 1 && K <= 8, "unpack_trellis requires K in the range 1..8");
     TORCH_CHECK_SHAPES(packed, 0, unpacked, 0, 1);
     TORCH_CHECK_SHAPES(packed, 1, unpacked, 1, 1);
     TORCH_CHECK_SIZE(unpacked, 2, 256);

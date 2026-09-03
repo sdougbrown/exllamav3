@@ -105,7 +105,8 @@ class MoeCpuTuning:
 
 
 TUNING = MoeCpuTuning()
-ext.exl3_moe_cpu_set_memops(TUNING.memops)
+if not torch.version.hip:
+    ext.exl3_moe_cpu_set_memops(TUNING.memops)
 
 
 class _HugeArena:
@@ -359,6 +360,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
 class MoeCpuHost:
 
     def __init__(self, config):
+        if torch.version.hip:
+            raise NotImplementedError("CPU MoE offload is unavailable on ROCm")
         self.config = config
         self.model_dir = config.directory
         self.specs = []
