@@ -32,6 +32,9 @@ if not GFX12_DEVICES:
     pytest.skip("requires a gfx1200/gfx1201 wave32 device", allow_module_level = True)
 if not hasattr(ext, "dsa_topk_gfx12"):
     pytest.skip("dsa_topk_gfx12 binding is unavailable", allow_module_level = True)
+# The full-width selection route exists only while the tiled selection bindings are absent
+# (they are CUDA-only); the select-rows test below covers that route.
+assert not hasattr(ext, "dsa_topk_tile")
 
 
 @pytest.fixture(params = GFX12_DEVICES, ids = lambda index: f"cuda:{index}")
@@ -331,13 +334,14 @@ def test_gfx12_qsa_topk_native_is_byte_identical_across_repeated_launches(device
     assert torch.equal(default_outputs[0], stream_outputs[0])
 
 
+@pytest.mark.parametrize("pools", [513, 8193])
 @torch.inference_mode()
-def test_gfx12_qsa_select_rows_matches_forced_fallback_and_expands_tail(device, monkeypatch):
+def test_gfx12_qsa_select_rows_matches_forced_fallback_and_expands_tail(device, monkeypatch, pools):
     indexer = QSAIndexer(
         config = None, key = "test.qsa", hidden_size = 16, n_heads = 2, kv_heads = 1,
         head_dim = 8, token_budget = K * 4, compress_ratio = 4, rms_norm_eps = 1e-6,
     )
-    rows, pools, pos0 = 5, 513, 4 * 513 - 5
+    rows, pos0 = 5, 4 * pools - 5
     generator = torch.Generator(device = device).manual_seed(1201)
     q_rows = torch.randn((rows, 2, 8), generator = generator, device = device, dtype = torch.half)
     pool_flat = torch.randn((pools, 8), generator = generator, device = device, dtype = torch.half)
