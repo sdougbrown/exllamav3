@@ -28,6 +28,15 @@ if _prefer_fa2 and not has_fa2:
     print(" !! EXL3_PREFER_FA2 is set but flash-attn is not available; using built-in kernels")
     _prefer_fa2 = False
 
+# The pip flash-attn build (flash_attn_2, ck-tile) is not qualified on ROCm/HIP: its kernel
+# launches segfault inside libamdhip64 on this arch. The text path never reaches it -- its paged
+# cache-backed triton kernels (which are ROCm-qualified) win for every text layer. It is only ever
+# a tail fallback, and the one path that does hit it is the vision tower's non-paged attention with
+# a non-power-of-2 head_dim (e.g. 72). Exclude it outright on ROCm so vision falls through to torch
+# SDPA instead of crashing at kernel launch.
+_on_rocm = getattr(__import__("torch").version, "hip", None) is not None
+
+
 _fns_triton_fast: list[AttnFn] = [
     fn_triton_paged_attn_decode,
     fn_triton_paged_attn_prefill,
@@ -48,11 +57,15 @@ _fns_qc: list[AttnFn] = [
 # with full-size fp16 temporaries for A/B testing
 _qc_attn = _qc_staging < 2
 
-_fns_fa2: list[AttnFn] = [
-    fn_flash_attn_with_kvcache,
-    fn_flash_attn_func,
-    fn_flash_attn_varlen_func,
-]
+_fns_fa2: list[AttnFn] = (
+    []
+    if _on_rocm
+    else [
+        fn_flash_attn_with_kvcache,
+        fn_flash_attn_func,
+        fn_flash_attn_varlen_func,
+    ]
+)
 
 attn_fns: list[AttnFn] = (
     (_fns_fa2 + _fns_triton_fast) if _prefer_fa2 else (_fns_triton_fast + _fns_fa2)
