@@ -590,6 +590,12 @@ class Job:
         return next_token, next_k_tokens, next_k_probs, next_prob
 
 
+    def _invalidate_mtp_carry(self):
+        self.mtp_last_hidden = None
+        for sequence in self.sequences:
+            sequence.mtp_carry_hidden = None
+
+
     def receive_sample(
         self,
         logits: torch.Tensor | None,
@@ -927,7 +933,7 @@ class Job:
             # An MTP draft carry refers to the pre-rewind context; drop it so drafting pauses until the next
             # target forward (or replay prefill) provides a fresh one. Signal the generator that any in-flight
             # draft verification window must be abandoned.
-            self.mtp_last_hidden = None
+            self._invalidate_mtp_carry()
             self.checkpoint_rewound = True
             off_tokens = self.held_tokens.slice(len(self.checkpoint["held_tokens"]), None)
             off_text = self.held_text[len(self.checkpoint["held_text"]):]
