@@ -260,13 +260,17 @@ class QSAIndexer(Module):
         if block_table is not None:
             t_tile = max(epp, t_tile // epp * epp)   # tiles must start on a pool page
         s_backing = g_tensor_cache.get(dev, (self.SEL_SLAB * self.SEL_TILE,), torch.half, "dsa_stile")
+        tiled_topk = hasattr(ext, "dsa_topk_tile") and hasattr(ext, "dsa_topk_merge_tiles")
 
         def tile_scores(q_slab, rows, t0, t1):
             # Tile [t0, t1) of the pooled plane scored as if it started at pool 0: the row-0
             # position shifts by t0 * cr so the causal bounds shift by t0. Contiguous pools:
             # the launcher scans k_idx.shape[0] rows, so hand it exactly the visible ones
             s_stride = triton.cdiv(t1 - t0, 128) * 128
-            sc = s_backing[: rows * s_stride].view(rows, s_stride)
+            score_numel = rows * s_stride
+            backing = s_backing if score_numel <= s_backing.numel() else \
+                g_tensor_cache.get_bucketed(dev, score_numel, torch.half, "dsa_sfull")
+            sc = backing[:score_numel].view(rows, s_stride)
             if block_table is None:
                 return dsa_indexer_scores(
                     q_slab, self._sel_weights(rows, dev), pool_flat[t0 : t1], pos0 + r0 - t0 * cr,
@@ -287,7 +291,7 @@ class QSAIndexer(Module):
             q_slab = q_rows[r0 : r1]
             if T_slab <= 0:
                 pool_idx.fill_(-1)
-            elif T_slab <= t_tile:
+            elif T_slab <= t_tile or not tiled_topk:
                 sc = tile_scores(q_slab, rows, 0, T_slab)
                 ext.dsa_topk(sc, pool_idx, min(k_sel, T_slab), None, 0)
             else:
