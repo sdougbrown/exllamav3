@@ -105,6 +105,50 @@ def test_rope(qk_dim, rope_style, use_norm):
     run(0, None, torch.randint(size = (bsz, seq_len), low = 0, high = 117, dtype = torch.int, device = device))
 
 
+@pytest.mark.parametrize("norm_dtype", [torch.half, torch.bfloat16])
+@torch.inference_mode()
+def test_rope_qwen35_partial_fused_norm(norm_dtype):
+    bsz, seq_len, heads_q, heads_k, head_dim = 1, 166, 24, 4, 256
+    rope_layer = RoPE(
+        device = device,
+        rope_settings = RopeSettings(
+            rope_theta = 10_000_000.0,
+            head_dim = head_dim,
+            rope_scaling = None,
+            max_position_embeddings = 262144,
+            partial_rotary_factor = 0.25,
+            rope_style = RopeStyle.NEOX,
+        )
+    )
+
+    torch.manual_seed(35)
+    q = torch.randn((bsz, seq_len, heads_q, head_dim), dtype = torch.half, device = device)
+    k = torch.randn((bsz, seq_len, heads_k, head_dim), dtype = torch.half, device = device)
+    q_weight = (torch.randn(head_dim, dtype = torch.float, device = device) / 2).to(norm_dtype)
+    k_weight = (torch.randn(head_dim, dtype = torch.float, device = device) / 2).to(norm_dtype)
+    eps = 1e-6
+    constant_bias = 1.0
+
+    q_normed = torch.empty_like(q)
+    k_normed = torch.empty_like(k)
+    ext.rms_norm(q.view(-1, head_dim), q_weight, q_normed.view(-1, head_dim),
+                 eps, constant_bias, 1.0, False, False)
+    ext.rms_norm(k.view(-1, head_dim), k_weight, k_normed.view(-1, head_dim),
+                 eps, constant_bias, 1.0, False, False)
+    q_ref, k_ref = rope_layer.apply(q_normed, k_normed)
+
+    q_out, k_out = rope_layer.apply(
+        q, k,
+        q_norm = q_weight,
+        k_norm = k_weight,
+        norm_eps = eps,
+        norm_constant_bias = constant_bias,
+    )
+
+    torch.testing.assert_close(q_out, q_ref, rtol = 3e-3, atol = 3e-3)
+    torch.testing.assert_close(k_out, k_ref, rtol = 3e-3, atol = 3e-3)
+
+
 @pytest.mark.parametrize("rope_style", rope_styles)
 @pytest.mark.parametrize("use_norm", norm_opt)
 @pytest.mark.parametrize("in_place", [False, True])
