@@ -187,7 +187,7 @@ def _run_prefill(x, selected, weights, gate, up, down):
     return output
 
 
-@pytest.mark.parametrize("rows", [6, 17, 64], ids=["boundary-6", "boundary-17", "rows-64"])
+@pytest.mark.parametrize("rows", [2, 6, 17, 64], ids=["boundary-2", "boundary-6", "boundary-17", "rows-64"])
 @torch.inference_mode()
 def test_prefill_k3_matches_reconstruction_oracle(synthetic_grouped_case, rows):
     _, gate, up, down = synthetic_grouped_case
@@ -533,12 +533,14 @@ def test_flash_multirow_route_and_decline_guards(flash_model, device_index, rows
 
 
 @pytest.mark.parametrize("device_index", DEVICE_INDICES[:2])
+@pytest.mark.parametrize("rows", [6, 8, 12, 16])
 @torch.inference_mode()
-def test_flash_grouped_row_cap_rolls_back_to_prefill_at_6(flash_model, device_index, monkeypatch):
+def test_flash_grouped_row_cap_rolls_back_to_prefill_at_6(flash_model, device_index, rows, monkeypatch):
     _require_gfx12(device_index)
     device = torch.device("cuda", device_index)
     mlp = flash_model.find_module("model.language_model.layers.0.mlp")
     old_max_rows = os.environ.get("EXL3_HIP_GROUPED_MAX_ROWS")
+    old_prefill = os.environ.get("EXL3_HIP_GROUPED_MOE_PREFILL")
     original_module = block_sparse_mlp_module
     original_grouped = ext.exl3_moe_gfx12_k3
     original_prefill = ext.exl3_moe_gfx12_k3_prefill
@@ -557,32 +559,49 @@ def test_flash_grouped_row_cap_rolls_back_to_prefill_at_6(flash_model, device_in
 
     try:
         monkeypatch.setenv("EXL3_HIP_GROUPED_MAX_ROWS", "5")
+        monkeypatch.setenv("EXL3_HIP_GROUPED_MOE_PREFILL", "1")
         importlib.reload(block_sparse_mlp_module)
         monkeypatch.setattr(ext, "exl3_moe_gfx12_k3", grouped_spy)
         monkeypatch.setattr(ext, "exl3_moe_gfx12_k3_prefill", prefill_spy)
         mlp.load(device=device)
         assert mlp.support_hip_grouped
 
-        rows8 = torch.randn((1, 8, HIDDEN), dtype=torch.float16, device=device)
-        mlp.forward(rows8, {})
+        x_gen = torch.Generator(device=device).manual_seed(7101 + device_index * 100 + rows)
+        x = torch.randn((1, rows, HIDDEN), dtype=torch.float16, device=device, generator=x_gen)
+        result = mlp.forward(x, {}).clone()
         assert grouped_calls == 0
         assert prefill_calls == 1
+        assert torch.isfinite(result).all()
+
+        grouped_calls = 0
+        prefill_calls_before = prefill_calls
+        monkeypatch.setenv("EXL3_HIP_GROUPED_MOE_PREFILL", "0")
+        fallback = mlp.forward(x, {}).clone()
+        assert grouped_calls == 0
+        assert prefill_calls == prefill_calls_before
+        assert torch.isfinite(fallback).all()
+        torch.testing.assert_close(result, fallback, rtol=0, atol=0.04)
 
         grouped_calls = 0
         prefill_calls = 0
         monkeypatch.setenv("EXL3_HIP_GROUPED_MAX_ROWS", "16")
+        monkeypatch.setenv("EXL3_HIP_GROUPED_MOE_PREFILL", "1")
         importlib.reload(block_sparse_mlp_module)
         mlp.unload()
         mlp.load(device=device)
-        rows8 = torch.randn((1, 8, HIDDEN), dtype=torch.float16, device=device)
-        mlp.forward(rows8, {})
+        rerun = mlp.forward(x, {}).clone()
         assert grouped_calls == 1
         assert prefill_calls == 0
+        assert torch.isfinite(rerun).all()
     finally:
         if old_max_rows is None:
             os.environ.pop("EXL3_HIP_GROUPED_MAX_ROWS", None)
         else:
             os.environ["EXL3_HIP_GROUPED_MAX_ROWS"] = old_max_rows
+        if old_prefill is None:
+            os.environ.pop("EXL3_HIP_GROUPED_MOE_PREFILL", None)
+        else:
+            os.environ["EXL3_HIP_GROUPED_MOE_PREFILL"] = old_prefill
         importlib.reload(original_module)
         mlp.unload()
 

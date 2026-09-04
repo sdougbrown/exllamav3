@@ -176,11 +176,13 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
 #if defined(USE_ROCM) || defined(__HIPCC__)
     // HIP: the WMMA fp32 C fragment holds rows 0..7 in lanes 0..15 and rows 8..15
-    // in lanes 16..31. MMODE 0 stages one row; MMODE 2 enables all 16 rows.
+    // in lanes 16..31. MMODE 2 reduces those halves in separate passes.
     constexpr int ROWS = MMODE == 0 ? 1 : MMODE == 2 ? 16 : EXL3_GEMV_MAX_M;
+    constexpr int RED_ROWS = MMODE == 2 ? 8 : ROWS;
 #else
     constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
     constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
+    constexpr int RED_ROWS = ROWS;
 #endif
 
     constexpr int TWORDS = 8 * bits;                        // uint32 per 16x16 tile
@@ -270,7 +272,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         x_src_b = i2 % 24;
     }
 
-    __shared__ float sh_red[WK][ROWS][COLS];
+    __shared__ float sh_red[WK][RED_ROWS][COLS];
 #if defined(USE_ROCM) || defined(__HIPCC__)
     // HIP: staged extraction always on (gfx12 WMMA operands must not come from __shfl_sync;
     // see hip_mma.cuh). SMEM_STAGE is ignored and the staging buffer is unconditional.
@@ -455,26 +457,91 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 #if defined(USE_ROCM) || defined(__HIPCC__)
         // Cross-warp reduction over the k splits, HIP C-fragment layout (oracle-verified):
         //   C(lane, reg) = C[row = (lane>>4)*8 + reg][col = lane & 15]
-        // m <= 8 keeps all valid rows in the first half-warp: lanes 0..15 each hold one
-        // column of the tile across all 8 row registers
-        if (lane < 16)
+        if constexpr (MMODE == 2)
         {
-            #pragma unroll
-            for (int t = 0; t < WNT; ++t)
-                #pragma unroll
-                for (int r = 0; r < min(ROWS, 8); ++r)
-                    sh_red[warp][r][t * 16 + lane] = acc[t][r];
-        }
-        if constexpr (ROWS > 8)
-        {
-            if (lane >= 16)
+            // MMODE 2 reuses eight shared rows for the two C-fragment half-warps, avoiding
+            // the 16-row reduction buffer that limits gfx12 occupancy to one block per WGP.
+            if (lane < 16)
             {
                 #pragma unroll
                 for (int t = 0; t < WNT; ++t)
                     #pragma unroll
                     for (int r = 0; r < 8; ++r)
-                        sh_red[warp][r + 8][t * 16 + (lane & 15)] = acc[t][r];
+                        sh_red[warp][r][t * 16 + lane] = acc[t][r];
             }
+            __syncthreads();
+
+            const int rows_out = min(size_m, 8);
+            for (int idx = threadIdx.x; idx < COLS * rows_out; idx += THREADS)
+            {
+                const int r = idx / COLS;
+                const int c = idx % COLS;
+                float sum = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < WK; ++j)
+                    sum += sh_red[j][r][c];
+                const int col = group * COLS + c;
+                if constexpr (c_fp32) ((float*) C)[(size_t) r * size_n + col] = sum;
+                else                  ((half*)  C)[(size_t) r * size_n + col] = __float2half_rn(sum);
+            }
+            __syncthreads();
+
+            if (size_m > 8)
+            {
+                if (lane >= 16)
+                {
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                        #pragma unroll
+                        for (int r = 0; r < 8; ++r)
+                            sh_red[warp][r][t * 16 + (lane & 15)] = acc[t][r];
+                }
+                __syncthreads();
+
+                const int upper_rows_out = min(size_m - 8, 8);
+                for (int idx = threadIdx.x; idx < COLS * upper_rows_out; idx += THREADS)
+                {
+                    const int r = idx / COLS;
+                    const int c = idx % COLS;
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int j = 0; j < WK; ++j)
+                        sum += sh_red[j][r][c];
+                    const int col = group * COLS + c;
+                    if constexpr (c_fp32) ((float*) C)[(size_t) (r + 8) * size_n + col] = sum;
+                    else                  ((half*)  C)[(size_t) (r + 8) * size_n + col] = __float2half_rn(sum);
+                }
+                __syncthreads();
+            }
+        }
+        else
+        {
+            // m <= 8 keeps all valid rows in the first half-warp: lanes 0..15 each hold one
+            // column of the tile across all 8 row registers.
+            if (lane < 16)
+            {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int r = 0; r < min(ROWS, 8); ++r)
+                        sh_red[warp][r][t * 16 + lane] = acc[t][r];
+            }
+            __syncthreads();
+
+            const int rows_out = MMODE == 0 ? 1 : min(size_m, ROWS);
+            for (int idx = threadIdx.x; idx < COLS * rows_out; idx += THREADS)
+            {
+                const int r = idx / COLS;
+                const int c = idx % COLS;
+                float sum = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < WK; ++j)
+                    sum += sh_red[j][r][c];
+                const int col = group * COLS + c;
+                if constexpr (c_fp32) ((float*) C)[(size_t) r * size_n + col] = sum;
+                else                  ((half*)  C)[(size_t) r * size_n + col] = __float2half_rn(sum);
+            }
+            __syncthreads();
         }
 #else
         // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
@@ -497,6 +564,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             }
         }
 #endif
+#if !defined(USE_ROCM) && !defined(__HIPCC__)
         __syncthreads();
 
         const int rows_out = MMODE == 0 ? 1 : min(size_m, ROWS);
@@ -513,6 +581,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             else                  ((half*)  C)[(size_t) r * size_n + col] = __float2half_rn(sum);
         }
         __syncthreads();
+#endif
     }
 
 #if !defined(USE_ROCM) && !defined(__HIPCC__)

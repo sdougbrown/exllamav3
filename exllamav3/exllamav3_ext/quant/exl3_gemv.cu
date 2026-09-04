@@ -17,6 +17,7 @@ namespace cg = cooperative_groups;
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
 #include "exl3_devctx.cuh"
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -27,7 +28,7 @@ exl3_gemv_try_launch when the shape heuristic applies, or forced through the exl
 point. Kernel arguments and graph parameter offsets are identical to exl3_gemm_kernel.
 
 Env: EXL3_GEMV = 0 disables the path, 1/unset = heuristic (default), 2 = use wherever the hard
-constraints allow (testing).
+constraints allow (testing). EXL3_GEMV_DEBUG=1 prints each newly queried kernel occupancy.
 
 The CUDA heuristic envelope (measured on RTX 3090 at 4 bpw and m <= 8) favors the narrow
 config at attention-projection sizes (n <= 4096) and the wide config at large-n/small-k FFN
@@ -781,6 +782,16 @@ static int exl3_gemv_env_mode()
     return atoi(env);
 }
 
+static bool exl3_gemv_debug()
+{
+    static const bool enabled = []
+    {
+        const char* env = std::getenv("EXL3_GEMV_DEBUG");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+}
+
 bool exl3_gemv_supported(int device)
 {
 #if defined(USE_ROCM)
@@ -965,6 +976,9 @@ bool exl3_gemv_try_launch
         cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
 #endif
         cache[kernel] = blocks_per_sm;
+        if (exl3_gemv_debug())
+            std::fprintf(stderr, "EXL3_GEMV_DEBUG device=%d kernel=%p block_dim=%d blocks_per_sm=%d\n",
+                         device, kernel, block_dim, blocks_per_sm);
         return blocks_per_sm;
     };
 
