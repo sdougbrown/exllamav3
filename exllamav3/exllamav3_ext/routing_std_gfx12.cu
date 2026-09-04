@@ -21,7 +21,7 @@ constexpr int GEMV_WAVES = 8;
 constexpr int ROUTER_HIDDEN = 2560;
 constexpr int ROUTER_EXPERTS = 512;
 constexpr int ROUTER_TOP_K = 10;
-constexpr int MAX_ROUTER_ROWS = 8;
+constexpr int MAX_ROUTER_ROWS = 16;
 constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
 
 __device__ __forceinline__
