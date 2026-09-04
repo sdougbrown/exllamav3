@@ -39,6 +39,38 @@ class RecurrentCache(OrderedDict):
         }
 
 
+    def prewarm_host_pool(self, cache) -> int:
+        """
+        Fill the pinned host allocator with enough checkpoint-shaped blocks to hold max_size.
+
+        Every new pinned block is a fresh KFD system-memory allocation, and on ROCm each one evicts the process's
+        GPU queues for a few hundred milliseconds. Growing the pool one checkpoint at a time while serving therefore
+        costs a stall per request until the LRU reaches its budget. Stashing and releasing max_size worth of
+        checkpoints here moves that cost to load time; the caching host allocator keeps the released blocks for
+        reuse. Returns the number of checkpoints warmed. EXL3_PINNED_STASH_PREWARM=0 skips it.
+        """
+        import os
+        import torch
+        from ..util.memory import pinned_stash_enabled
+        if not pinned_stash_enabled() or os.environ.get("EXL3_PINNED_STASH_PREWARM", "1") == "0":
+            return 0
+        if self.model.loaded_tp or not getattr(cache, "initialized", False) or not cache.free_list:
+            return 0
+        state = cache.get_new_state()
+        try:
+            per = getattr(state, "checkpoint_size", 0)
+            if per <= 0:
+                return 0
+            n = max(1, self.max_size // per)
+            held = [state.stash() for _ in range(n)]
+        finally:
+            state.free()
+        # Blocks return to the allocator only after their copies have drained
+        torch.cuda.synchronize()
+        held.clear()
+        return n
+
+
     def get_stashed(self, key, default = None):
         """
         Fetch state from cache and move it to the end of the queue

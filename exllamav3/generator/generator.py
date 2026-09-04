@@ -241,6 +241,7 @@ class Generator:
             self.recurrent_cache.pagetable = self.pagetable
             # The new page table owns every page, so every state slot is ours too
             cache.reset_states()
+            self.recurrent_cache.prewarm_host_pool(cache)
             # Limit batch size if cache has recurrent states
             self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         else:
