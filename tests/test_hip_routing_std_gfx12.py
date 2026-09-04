@@ -98,7 +98,7 @@ def _oracle(hidden, gate):
 
 
 @pytest.mark.parametrize("device_index", GFX12_DEVICES[:2] or [0])
-@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 12, 16])
 @torch.inference_mode()
 def test_native_router_matches_independent_torch_route(device_index, rows):
     hidden, gate = _case(device_index, rows)
@@ -112,7 +112,7 @@ def test_native_router_matches_independent_torch_route(device_index, rows):
 
 
 @pytest.mark.parametrize("device_index", GFX12_DEVICES[:2] or [0])
-@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 12, 16])
 @torch.inference_mode()
 def test_native_router_matches_exact_tie_oracle_deterministically(device_index, rows):
     _require_gfx12(device_index)
@@ -142,7 +142,7 @@ def test_native_router_matches_exact_tie_oracle_deterministically(device_index, 
 
 
 @pytest.mark.parametrize("device_index", GFX12_DEVICES[:2] or [0])
-@pytest.mark.parametrize("rows", [1, 4, 8])
+@pytest.mark.parametrize("rows", [1, 4, 8, 12, 16])
 @torch.inference_mode()
 def test_native_router_selects_distinct_ids_for_all_negative_infinity_scores(device_index, rows):
     _require_gfx12(device_index)
@@ -171,7 +171,7 @@ def test_native_router_selects_distinct_ids_for_all_negative_infinity_scores(dev
 
 
 @pytest.mark.parametrize("device_index", GFX12_DEVICES[:2] or [0])
-@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 12, 16])
 @torch.inference_mode()
 def test_native_router_uses_current_custom_stream(device_index, rows):
     hidden, gate = _case(device_index, rows, seed=77)
@@ -223,7 +223,7 @@ def test_native_router_rejects_invalid_inputs(device_index, bad):
 
 
 @pytest.mark.parametrize("device_index", GFX12_DEVICES[:2] or [0])
-@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 12, 16])
 @torch.inference_mode()
 def test_python_route_executes_native_and_profiles_without_aten_mm_or_topk(device_index, rows, monkeypatch):
     hidden, gate = _case(device_index, rows)
@@ -267,7 +267,7 @@ def test_python_route_falls_back_for_unsupported_modes(device_index, mode, monke
     hidden, gate = _case(device_index)
     bsz, params = 1, {}
     if mode == "rows-over-bound":
-        bsz = 9
+        bsz = 17
         hidden = hidden.expand(bsz, -1).contiguous()
     elif mode == "activate-all": params["activate_all_experts"] = True
     elif mode == "disabled": monkeypatch.setenv("EXL3_HIP_ROUTER", "0")
@@ -357,8 +357,8 @@ def test_python_router_reuses_one_cfg_workspace_across_multirow_calls(device_ind
 @pytest.mark.parametrize("device_index", GFX12_DEVICES[:2] or [0])
 @torch.inference_mode()
 def test_unsupported_row_count_is_rejected_by_native_binding(device_index):
-    hidden, gate = _case(device_index, rows=9)
-    with pytest.raises(RuntimeError, match="supports 1 through 8 rows"):
+    hidden, gate = _case(device_index, rows=17)
+    with pytest.raises(RuntimeError, match="supports 1 through 16 rows"):
         _native(hidden, gate.T.contiguous())
 
 
