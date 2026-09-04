@@ -1,6 +1,7 @@
 """gfx12 grouped K3/mul1 decode path for the Qwen3.8 Flash routed experts."""
 from __future__ import annotations
 
+import importlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ from safetensors.torch import save_file
 from exllamav3 import Config, Model
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.model.lora import LoRA
+from exllamav3.modules import block_sparse_mlp as block_sparse_mlp_module
 
 HIDDEN = 2560
 INTERMEDIATES = (640, 768)
@@ -31,7 +33,37 @@ def _require_gfx12(device_index=0):
         pytest.skip(f"grouped MoE requires gfx1200/gfx1201, got {arch or 'unknown'}")
     assert hasattr(ext, "exl3_moe_gfx12_k3"), \
         "gfx12 target build is missing ext.exl3_moe_gfx12_k3"
+    assert hasattr(ext, "exl3_moe_gfx12_k3_prefill"), \
+        "gfx12 target build is missing ext.exl3_moe_gfx12_k3_prefill"
     assert ext.exl3_gemv_supported(device_index)
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        pytest.param(None, 16, id="default"),
+        pytest.param("8", 8, id="valid"),
+        pytest.param("invalid", 16, id="malformed"),
+        pytest.param("0", 1, id="clamped-low"),
+        pytest.param("99", 16, id="clamped-high"),
+    ],
+)
+def test_grouped_row_cap_reloads_and_preserves_the_prefill_boundary(monkeypatch, value, expected):
+    """The rollback cap is import-time configuration and never opens invalid prefill rows."""
+    try:
+        with monkeypatch.context() as env:
+            if value is None:
+                env.delenv("EXL3_HIP_GROUPED_MAX_ROWS", raising=False)
+            else:
+                env.setenv("EXL3_HIP_GROUPED_MAX_ROWS", value)
+            module = importlib.reload(block_sparse_mlp_module)
+            assert module._HIP_GROUPED_MAX_ROWS == expected
+            assert module._HIP_PREFILL_MIN_ROWS == expected + 1
+            assert not module._hip_grouped_rows_eligible(expected + 1)
+            if expected < 16:
+                assert module._hip_prefill_rows_eligible(expected + 1)
+    finally:
+        importlib.reload(block_sparse_mlp_module)
 
 
 def _ptrs(tensors):
@@ -77,30 +109,35 @@ def _linear_ref(x, projection, expert):
 
 
 def _oracle(x, selected, weights, gate, up, down):
-    rows = []
-    for slot in range(TOP_K):
-        expert = int(selected[0, slot])
-        g = _linear_ref(x, gate, expert)
-        u = _linear_ref(x, up, expert)
-        a = torch.nn.functional.silu(g.float()).half() * u
-        d = _linear_ref(a, down, expert).float()
-        rows.append((expert, slot, d * weights[0, slot].float()))
-    # Match the established bsz1 path's expert-sorted fp32 reduction. Slot order
-    # breaks duplicate-expert ties deterministically without deduplicating them.
-    rows.sort(key=lambda item: (item[0], item[1]))
-    result = torch.zeros_like(rows[0][2])
-    for _, _, row in rows:
-        result = result + row
-    return result
+    results = []
+    for token in range(x.shape[0]):
+        assignments = []
+        token_x = x[token:token + 1]
+        for slot in range(TOP_K):
+            expert = int(selected[token, slot])
+            g = _linear_ref(token_x, gate, expert)
+            u = _linear_ref(token_x, up, expert)
+            a = torch.nn.functional.silu(g.float()).half() * u
+            d = _linear_ref(a, down, expert).float()
+            assignments.append((expert, slot, d * weights[token, slot].float()))
+        # Independent per-token oracle matching the established expert-sorted fp32
+        # accumulation. Duplicate-expert ties retain their routing-slot order.
+        assignments.sort(key=lambda item: (item[0], item[1]))
+        result = torch.zeros_like(assignments[0][2])
+        for _, _, assignment in assignments:
+            result = result + assignment
+        results.append(result)
+    return torch.cat(results, dim=0)
 
 
-def _buffers(intermediate, fill=None):
+def _buffers(intermediate, rows=1, fill=None):
+    assignments = rows * TOP_K
     specs = {
-        "output": ((1, HIDDEN), torch.float32),
-        "gu_had": ((2, TOP_K, HIDDEN), torch.float16),
-        "gu_out": ((2, TOP_K, intermediate), torch.float16),
-        "down_had": ((TOP_K, intermediate), torch.float16),
-        "down_out": ((TOP_K, HIDDEN), torch.float32),
+        "output": ((rows, HIDDEN), torch.float32),
+        "gu_had": ((2 * assignments, HIDDEN), torch.float16),
+        "gu_out": ((2 * assignments, intermediate), torch.float16),
+        "down_had": ((assignments, intermediate), torch.float16),
+        "down_out": ((assignments, HIDDEN), torch.float32),
     }
     result = {}
     for name, (shape, dtype) in specs.items():
@@ -119,13 +156,93 @@ def _grouped_args(gate, up, down):
 
 def _run_grouped(x, selected, weights, gate, up, down, buffers=None, pointer_args=None):
     intermediate = down[1][0].numel()
-    buffers = buffers or _buffers(intermediate)
+    buffers = buffers or _buffers(intermediate, x.shape[0])
     args = pointer_args or _grouped_args(gate, up, down)
     ext.exl3_moe_gfx12_k3(
         x, buffers["output"], selected, weights, *args,
         buffers["gu_had"], buffers["gu_out"], buffers["down_had"], buffers["down_out"],
     )
     return buffers["output"]
+
+
+def _run_prefill(x, selected, weights, gate, up, down):
+    rows = x.shape[0]
+    assignments = rows * TOP_K
+    intermediate = down[1][0].numel()
+    order = torch.argsort(selected.reshape(-1), stable=True)
+    expert_count = torch.bincount(selected.reshape(-1), minlength=NUM_EXPERTS + 1)
+    output = torch.empty((rows, HIDDEN), dtype=torch.float32, device=x.device)
+    gu_had = torch.empty((2 * assignments, HIDDEN), dtype=torch.float16, device=x.device)
+    gu_out = torch.empty((2 * assignments, intermediate), dtype=torch.float16, device=x.device)
+    down_out = torch.empty((assignments, HIDDEN), dtype=torch.float32, device=x.device)
+    offsets = torch.empty((NUM_EXPERTS + 1,), dtype=torch.long, device=x.device)
+    inverse = torch.empty((assignments,), dtype=torch.long, device=x.device)
+    chunks = torch.empty((NUM_EXPERTS * 320,), dtype=torch.int, device=x.device)
+    chunk_count = torch.empty((1,), dtype=torch.int, device=x.device)
+    ext.exl3_moe_gfx12_k3_prefill(
+        x, output, selected, weights, order, expert_count,
+        *_grouped_args(gate, up, down),
+        gu_had, gu_out, down_out, offsets, inverse, chunks, chunk_count,
+    )
+    return output
+
+
+@pytest.mark.parametrize("rows", [6, 17, 64], ids=["boundary-6", "boundary-17", "rows-64"])
+@torch.inference_mode()
+def test_prefill_k3_matches_reconstruction_oracle(synthetic_grouped_case, rows):
+    _, gate, up, down = synthetic_grouped_case
+    x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda") * 1e-3
+    selected = torch.tensor(
+        [[(row * 3 + slot * 5) % NUM_EXPERTS for slot in range(TOP_K)] for row in range(rows)],
+        dtype=torch.long, device="cuda",
+    )
+    weights = torch.rand((rows, TOP_K), dtype=torch.float16, device="cuda")
+    weights /= weights.sum(dim=-1, keepdim=True)
+    expected = _oracle(x, selected, weights, gate, up, down)
+    actual = _run_prefill(x, selected, weights, gate, up, down)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0.04)
+
+
+@torch.inference_mode()
+def test_prefill_k3_preserves_concentrated_duplicate_slots(synthetic_grouped_case):
+    _, gate, up, down = synthetic_grouped_case
+    rows = 52  # 520 assignments to one expert, above the per-token row count
+    x_gen = torch.Generator(device="cuda").manual_seed(5201 + rows)
+    w_gen = torch.Generator(device="cuda").manual_seed(5202 + rows)
+    x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda", generator=x_gen) * 1e-2
+    selected = torch.zeros((rows, TOP_K), dtype=torch.long, device="cuda")
+    weights = torch.rand((rows, TOP_K), dtype=torch.float16, device="cuda", generator=w_gen)
+    weights /= weights.sum(dim=-1, keepdim=True)
+    expected_rows = []
+    for row in range(rows):
+        g = _linear_ref(x[row:row + 1], gate, 0)
+        u = _linear_ref(x[row:row + 1], up, 0)
+        activated = torch.nn.functional.silu(g.float()).half() * u
+        down_row = _linear_ref(activated, down, 0).float()
+        total = torch.zeros_like(down_row)
+        for slot in range(TOP_K):
+            total = total + down_row * weights[row, slot].float()
+        expected_rows.append(total)
+    expected = torch.cat(expected_rows)
+    actual = _run_prefill(x, selected, weights, gate, up, down)
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=0.04)
+
+
+@torch.inference_mode()
+def test_prefill_k3_is_deterministic(synthetic_grouped_case):
+    _, gate, up, down = synthetic_grouped_case
+    rows = 17
+    x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda") * 1e-3
+    selected = torch.tensor(
+        [[(row + slot * 5) % NUM_EXPERTS for slot in range(TOP_K)] for row in range(rows)],
+        dtype=torch.long, device="cuda",
+    )
+    weights = torch.rand((rows, TOP_K), dtype=torch.float16, device="cuda")
+    weights /= weights.sum(dim=-1, keepdim=True)
+    first = _run_prefill(x, selected, weights, gate, up, down).clone()
+    second = _run_prefill(x, selected, weights, gate, up, down).clone()
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -135,29 +252,84 @@ def _run_grouped(x, selected, weights, gate, up, down, buffers=None, pointer_arg
         pytest.param([7, 2, 7, 1, 2, 7, 4, 1, 9, 2], id="duplicates"),
     ],
 )
+@pytest.mark.parametrize("rows", [1, 3, 5, 8, 12, 16])
 @torch.inference_mode()
-def test_grouped_k3_matches_reconstruction_oracle(synthetic_grouped_case, ids):
+def test_grouped_k3_matches_reconstruction_oracle(synthetic_grouped_case, ids, rows):
     _, gate, up, down = synthetic_grouped_case
-    x = torch.randn((1, HIDDEN), dtype=torch.float16, device="cuda") * 1e-3
-    selected = torch.tensor([ids], dtype=torch.long, device="cuda")
-    weights = torch.tensor([[.03, .17, .09, .04, .21, .06, .13, .08, .11, .08]],
-                           dtype=torch.float16, device="cuda")
+    x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda") * 1e-3
+    selected = torch.stack([
+        torch.tensor(ids[row:] + ids[:row], dtype=torch.long, device="cuda")
+        for row in range(rows)
+    ])
+    weights = torch.rand((rows, TOP_K), dtype=torch.float16, device="cuda")
+    weights /= weights.sum(dim=-1, keepdim=True)
     expected = _oracle(x, selected, weights, gate, up, down)
     actual = _run_grouped(x, selected, weights, gate, up, down)
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.04)
 
 
+@pytest.mark.parametrize("rows", [1, 3, 5, 8, 12, 16])
 @torch.inference_mode()
-def test_grouped_k3_is_deterministic(synthetic_grouped_case):
+def test_grouped_k3_is_deterministic(synthetic_grouped_case, rows):
     _, gate, up, down = synthetic_grouped_case
-    x = torch.randn((1, HIDDEN), dtype=torch.float16, device="cuda") * 1e-3
-    selected = torch.tensor([[7, 2, 7, 1, 2, 7, 4, 1, 9, 2]], dtype=torch.long, device="cuda")
-    weights = torch.rand((1, TOP_K), dtype=torch.float16, device="cuda")
-    weights /= weights.sum()
-    first = _run_grouped(x, selected, weights, gate, up, down)
-    second = _run_grouped(x, selected, weights, gate, up, down)
+    x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda") * 1e-3
+    ids = [7, 2, 7, 1, 2, 7, 4, 1, 9, 2]
+    selected = torch.stack([
+        torch.tensor(ids[row:] + ids[:row], dtype=torch.long, device="cuda")
+        for row in range(rows)
+    ])
+    weights = torch.rand((rows, TOP_K), dtype=torch.float16, device="cuda")
+    weights /= weights.sum(dim=-1, keepdim=True)
+    first = _run_grouped(x, selected, weights, gate, up, down).clone()
+    second = _run_grouped(x, selected, weights, gate, up, down).clone()
     torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [1, 3, 5, 8, 12, 16])
+@torch.inference_mode()
+def test_grouped_k3_output_rows_are_isolated(synthetic_grouped_case, rows):
+    _, gate, up, down = synthetic_grouped_case
+    x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda") * 1e-3
+    selected = torch.tensor(
+        [[(row * 3 + slot * 5) % NUM_EXPERTS for slot in range(TOP_K)] for row in range(rows)],
+        dtype=torch.long, device="cuda",
+    )
+    weights = torch.rand((rows, TOP_K), dtype=torch.float16, device="cuda")
+    weights /= weights.sum(dim=-1, keepdim=True)
+    baseline = _run_grouped(x, selected, weights, gate, up, down).clone()
+
+    changed_x = x.clone()
+    changed_selected = selected.clone()
+    changed_weights = weights.clone()
+    changed_row = rows - 1
+    changed_x[changed_row].mul_(-3)
+    changed_selected[changed_row] = changed_selected[changed_row].roll(3)
+    changed_weights[changed_row] = changed_weights[changed_row].roll(1)
+    changed = _run_grouped(
+        changed_x, changed_selected, changed_weights, gate, up, down).clone()
+
+    assert not torch.equal(changed[changed_row], baseline[changed_row])
+    keep = torch.tensor([row for row in range(rows) if row != changed_row], dtype=torch.long, device="cuda")
+    torch.testing.assert_close(
+        changed.index_select(0, keep), baseline.index_select(0, keep), rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_grouped_k3_preserves_16_row_all_duplicate_slots(synthetic_grouped_case):
+    """All 160 assignments may target one expert without cross-row loss or aliasing."""
+    _, gate, up, down = synthetic_grouped_case
+    rows = 16
+    x_gen = torch.Generator(device="cuda").manual_seed(3201)
+    w_gen = torch.Generator(device="cuda").manual_seed(3202)
+    x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda", generator=x_gen) * 1e-2
+    selected = torch.zeros((rows, TOP_K), dtype=torch.long, device="cuda")
+    weights = torch.rand((rows, TOP_K), dtype=torch.float16, device="cuda", generator=w_gen)
+    weights /= weights.sum(dim=-1, keepdim=True)
+    expected = _oracle(x, selected, weights, gate, up, down)
+    actual = _run_grouped(x, selected, weights, gate, up, down)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=0.04)
 
 
 @torch.inference_mode()
@@ -238,15 +410,19 @@ def _route_spies():
     bindings = {
         "grouped": "exl3_moe_gfx12_k3",
         "gemv": "exl3_gemv",
+        "shared_gate": "add_sigmoid_gate_proj",
         "reconstruct": "reconstruct",
         "reconstruct_had_slice": "reconstruct_had_slice",
         "hgemm": "hgemm",
     }
     calls = {name: 0 for name in bindings}
+    calls["routed_k3_gemv"] = 0
     originals = {name: getattr(ext, binding) for name, binding in bindings.items()}
     for name, binding in bindings.items():
         def spy(*args, _name=name, **kwargs):
             calls[_name] += 1
+            if _name == "gemv" and args[1].shape[-1] // 16 == 3:
+                calls["routed_k3_gemv"] += 1
             return originals[_name](*args, **kwargs)
         setattr(ext, binding, spy)
 
@@ -258,8 +434,9 @@ def _route_spies():
 
 
 @pytest.mark.parametrize("device_index", DEVICE_INDICES)
+@pytest.mark.parametrize("rows", [1, 3, 5, 8, 16])
 @torch.inference_mode()
-def test_flash_bsz1_route_and_decline_guards(flash_model, device_index, monkeypatch):
+def test_flash_multirow_route_and_decline_guards(flash_model, device_index, rows, monkeypatch):
     _require_gfx12(device_index)
     device = torch.device("cuda", device_index)
     mlp = flash_model.find_module("model.language_model.layers.0.mlp")
@@ -271,27 +448,59 @@ def test_flash_bsz1_route_and_decline_guards(flash_model, device_index, monkeypa
         assert mlp.multi_gate.linears == mlp.gates
         assert mlp.multi_up.linears == mlp.ups
         assert mlp.multi_down.linears == mlp.downs
-        x = torch.randn((1, 1, HIDDEN), dtype=torch.float16, device=device)
+        x = torch.randn((1, rows, HIDDEN), dtype=torch.float16, device=device)
 
+        assert getattr(ext.add_sigmoid_gate_proj, "__module__", None) == "exllamav3_ext"
         calls, restore = _route_spies()
         try:
-            actual = mlp.forward(x, {}).clone()
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+            ) as profile:
+                actual = mlp.forward(x, {}).clone()
         finally:
             restore()
         assert calls == {
-            "grouped": 1, "gemv": 3, "reconstruct": 0,
-            "reconstruct_had_slice": 0, "hgemm": 0,
+            "grouped": 1, "gemv": 3, "routed_k3_gemv": 0, "shared_gate": 1,
+            "reconstruct": 0, "reconstruct_had_slice": 0, "hgemm": 0,
         }
+        shared_gate_matmuls = [
+            event for event in profile.events()
+            if event.name == "aten::matmul"
+            and len(event.input_shapes) >= 2
+            and event.input_shapes[1] == [HIDDEN, 1]
+        ]
+        assert not shared_gate_matmuls
         assert torch.isfinite(actual).all()
 
+        # The dedicated route uses the same K3 arithmetic and deterministic expert-sorted
+        # reduction as the per-expert fallback, including independently for verification rows.
+        monkeypatch.setenv("EXL3_HIP_GROUPED_MOE", "0")
+        fallback = mlp.forward(x, {}).clone()
+        monkeypatch.setenv("EXL3_HIP_GROUPED_MOE", "1")
+        torch.testing.assert_close(actual, fallback, rtol=0, atol=1e-6)
+
         guard_cases = [
-            ("gemv-disabled", {}, {"EXL3_GEMV": "0"}, None),
-            ("activate-all", {"activate_all_experts": True}, {}, None),
-            ("act-limit", {}, {}, 1.0),
-            ("tensor-tp", {}, {}, "channels"),
-            ("expert-tp", {}, {}, "experts"),
+            ("grouped-disabled", {}, {"EXL3_HIP_GROUPED_MOE": "0"}, None, True),
+            *(([("multirow-disabled", {}, {"EXL3_HIP_GROUPED_MOE_MULTIROW": "0"}, None, True)])
+              if rows > 1 else []),
+            ("gemv-disabled", {}, {"EXL3_GEMV": "0"}, None, True),
+            ("activate-all", {"activate_all_experts": True}, {}, None, False),
+            ("reconstruct", {"reconstruct": True}, {}, None, False),
+            ("autosplit", {"autosplit_measure": True}, {}, None, False),
+            ("act-limit", {}, {}, 1.0, False),
+            ("tensor-tp", {}, {}, "channels", False),
+            ("expert-tp", {}, {}, "experts", False),
         ]
-        for name, params, env, state in guard_cases:
+        for name, params, env, state, compare_fallback in guard_cases:
+            monkeypatch.setenv("EXL3_HIP_GROUPED_MOE", env.get("EXL3_HIP_GROUPED_MOE", "1"))
+            monkeypatch.setenv(
+                "EXL3_HIP_GROUPED_MOE_MULTIROW",
+                env.get("EXL3_HIP_GROUPED_MOE_MULTIROW", "1"),
+            )
             monkeypatch.setenv("EXL3_GEMV", env.get("EXL3_GEMV", "1"))
             old_limit, old_tp = mlp.act_limit, mlp.tp_mode
             if isinstance(state, float):
@@ -306,6 +515,110 @@ def test_flash_bsz1_route_and_decline_guards(flash_model, device_index, monkeypa
                 mlp.act_limit, mlp.tp_mode = old_limit, old_tp
             assert calls["grouped"] == 0, f"{name} entered grouped route"
             assert torch.isfinite(guarded).all()
+            if compare_fallback:
+                torch.testing.assert_close(guarded, fallback, rtol=0, atol=0.04)
+
+        if rows == 16:
+            monkeypatch.setenv("EXL3_HIP_GROUPED_MOE", "1")
+            oversized = torch.randn((1, 17, HIDDEN), dtype=torch.float16, device=device)
+            calls, restore = _route_spies()
+            try:
+                guarded = mlp.forward(oversized, {})
+            finally:
+                restore()
+            assert calls["grouped"] == 0, "m=17 must decline the grouped route"
+            assert torch.isfinite(guarded).all()
+    finally:
+        mlp.unload()
+
+
+@pytest.mark.parametrize("device_index", DEVICE_INDICES[:2])
+@torch.inference_mode()
+def test_flash_grouped_row_cap_rolls_back_to_prefill_at_6(flash_model, device_index, monkeypatch):
+    _require_gfx12(device_index)
+    device = torch.device("cuda", device_index)
+    mlp = flash_model.find_module("model.language_model.layers.0.mlp")
+    old_max_rows = os.environ.get("EXL3_HIP_GROUPED_MAX_ROWS")
+    original_module = block_sparse_mlp_module
+    original_grouped = ext.exl3_moe_gfx12_k3
+    original_prefill = ext.exl3_moe_gfx12_k3_prefill
+    grouped_calls = 0
+    prefill_calls = 0
+
+    def grouped_spy(*args, **kwargs):
+        nonlocal grouped_calls
+        grouped_calls += 1
+        return original_grouped(*args, **kwargs)
+
+    def prefill_spy(*args, **kwargs):
+        nonlocal prefill_calls
+        prefill_calls += 1
+        return original_prefill(*args, **kwargs)
+
+    try:
+        monkeypatch.setenv("EXL3_HIP_GROUPED_MAX_ROWS", "5")
+        importlib.reload(block_sparse_mlp_module)
+        monkeypatch.setattr(ext, "exl3_moe_gfx12_k3", grouped_spy)
+        monkeypatch.setattr(ext, "exl3_moe_gfx12_k3_prefill", prefill_spy)
+        mlp.load(device=device)
+        assert mlp.support_hip_grouped
+
+        rows8 = torch.randn((1, 8, HIDDEN), dtype=torch.float16, device=device)
+        mlp.forward(rows8, {})
+        assert grouped_calls == 0
+        assert prefill_calls == 1
+
+        grouped_calls = 0
+        prefill_calls = 0
+        monkeypatch.setenv("EXL3_HIP_GROUPED_MAX_ROWS", "16")
+        importlib.reload(block_sparse_mlp_module)
+        mlp.unload()
+        mlp.load(device=device)
+        rows8 = torch.randn((1, 8, HIDDEN), dtype=torch.float16, device=device)
+        mlp.forward(rows8, {})
+        assert grouped_calls == 1
+        assert prefill_calls == 0
+    finally:
+        if old_max_rows is None:
+            os.environ.pop("EXL3_HIP_GROUPED_MAX_ROWS", None)
+        else:
+            os.environ["EXL3_HIP_GROUPED_MAX_ROWS"] = old_max_rows
+        importlib.reload(original_module)
+        mlp.unload()
+
+
+@pytest.mark.parametrize("device_index", DEVICE_INDICES[:2])
+@pytest.mark.parametrize("rows", [17, 64], ids=["rows-17", "rows-64"])
+@torch.inference_mode()
+def test_flash_prefill_route_matches_layer_fallback(flash_model, device_index, rows, monkeypatch):
+    _require_gfx12(device_index)
+    device = torch.device("cuda", device_index)
+    mlp = flash_model.find_module("model.language_model.layers.0.mlp")
+    try:
+        mlp.load(device=device)
+        assert mlp.support_hip_prefill
+        x_gen = torch.Generator(device=device).manual_seed(6101 + device_index * 100 + rows)
+        x = torch.randn((1, rows, HIDDEN), dtype=torch.float16, device=device, generator=x_gen)
+        original = ext.exl3_moe_gfx12_k3_prefill
+        calls = 0
+
+        def spy(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(ext, "exl3_moe_gfx12_k3_prefill", spy)
+        monkeypatch.setenv("EXL3_HIP_GROUPED_MOE_PREFILL", "1")
+        actual = mlp.forward(x, {}).clone()
+        assert calls == 1
+        monkeypatch.setenv("EXL3_HIP_GROUPED_MOE_PREFILL", "0")
+        expected = mlp.forward(x, {}).clone()
+        assert calls == 1
+        difference = (actual - expected).abs()
+        assert torch.isfinite(actual).all()
+        # Observed deterministic device-1 max delta is ~7.35e-4; keep a narrow envelope.
+        assert difference.max().item() <= 1e-3
+        assert difference.mean().item() <= 2e-5
     finally:
         mlp.unload()
 
@@ -339,6 +652,7 @@ def test_expert_lora_permanently_invalidates_grouped_route(flash_model, device_i
         assert target.lora_a_tensors and target.lora_b_tensors
         assert mlp.hip_grouped_lora_blocked
         assert not mlp.support_hip_grouped
+        assert not mlp.support_hip_prefill
 
         x = torch.randn((1, 1, HIDDEN), dtype=torch.float16, device=device) * 1e-3
         calls, restore = _route_spies()
@@ -354,6 +668,7 @@ def test_expert_lora_permanently_invalidates_grouped_route(flash_model, device_i
         assert not target.lora_a_tensors and not target.lora_b_tensors
         assert mlp.hip_grouped_lora_blocked
         assert not mlp.support_hip_grouped
+        assert not mlp.support_hip_prefill
     finally:
         if adapter is not None:
             adapter.unload()

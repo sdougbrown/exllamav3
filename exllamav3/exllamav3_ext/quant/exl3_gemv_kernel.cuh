@@ -19,8 +19,10 @@
 // the main GEMV loop here. 2, 3 and 4 bpw.
 //
 // CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention-projection sizes;
-// CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. MMODE 0 is
-// the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
+// CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. CFG 2
+// ("prefill", 128 threads, 4 n-tiles/warp, 4 k-splits) serves the 16-row grouped-MoE body.
+// MMODE 0 is the m == 1 fast path, MMODE 1 covers 2 <= m <= 8, and HIP MMODE 2 covers
+// 9 <= m <= 16 with row-guarded fragment loads.
 
 #if !defined(USE_ROCM) && !defined(__HIPCC__)
 #include <cooperative_groups.h>
@@ -165,16 +167,17 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     static_assert(bits == 2 || bits == 3 || bits == 4,
                   "CUDA exl3_gemv_kernel supports 2, 3 and 4 bpw");
 #endif
-    constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
-    constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
-    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
+    static_assert(CFG >= 0 && CFG <= 2, "unsupported GEMV configuration");
+    constexpr int WK   = CFG == 0 ? 16 : CFG == 1 ? 8 : 4;  // k-split (warps per block)
+    constexpr int WNT  = CFG == 0 ? 2 : 4;                    // adjacent n-tiles per warp
+    constexpr int PF   = CFG == 0 ? 4 : 2;                    // prefetch ring depth
     constexpr int THREADS = WK * 32;
     constexpr int COLS = WNT * 16;
 
 #if defined(USE_ROCM) || defined(__HIPCC__)
-    // HIP: the WMMA fp32 C fragment holds rows 0..7 in lanes 0..15 (one column per lane,
-    // 8 rows across the 8 registers). MMODE 0 only stages its one valid output row.
-    constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
+    // HIP: the WMMA fp32 C fragment holds rows 0..7 in lanes 0..15 and rows 8..15
+    // in lanes 16..31. MMODE 0 stages one row; MMODE 2 enables all 16 rows.
+    constexpr int ROWS = MMODE == 0 ? 1 : MMODE == 2 ? 16 : EXL3_GEMV_MAX_M;
 #else
     constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
     constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
@@ -243,7 +246,9 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     // A fragment row indices for this lane
     const int r0 = lane >> 2;
     const size_t a_row0 = (size_t) r0 * (size_k / 2);
+    const size_t a_row1 = (size_t) (r0 + 8) * (size_k / 2);
     const bool r0_ok = MMODE == 0 ? lane < 4 : r0 < size_m;
+    const bool r1_ok = MMODE == 2 && r0 + 8 < size_m;
 
     // Per-lane extraction constants (see dq8_aligned_2bits / dq8<3, cb, 4> in exl3_dq.cuh)
     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
@@ -361,8 +366,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             FragB a01, a23;
             a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
             a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
-            a01[1] = hzero;
-            a23[1] = hzero;
+            a01[1] = r1_ok ? A2[a_row1 + a_col] : hzero;
+            a23[1] = r1_ok ? A2[a_row1 + a_col + 4] : hzero;
 
 #if defined(__gfx1200__) || defined(__gfx1201__)
             // Every adjacent N tile uses the same A rows for this K slice. Assemble the full
@@ -457,8 +462,19 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
                 #pragma unroll
-                for (int r = 0; r < ROWS; ++r)
+                for (int r = 0; r < min(ROWS, 8); ++r)
                     sh_red[warp][r][t * 16 + lane] = acc[t][r];
+        }
+        if constexpr (ROWS > 8)
+        {
+            if (lane >= 16)
+            {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int r = 0; r < 8; ++r)
+                        sh_red[warp][r + 8][t * 16 + (lane & 15)] = acc[t][r];
+            }
         }
 #else
         // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
@@ -533,7 +549,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
 #if defined(USE_ROCM) || defined(__HIPCC__)
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256)
+__global__ __launch_bounds__(CFG == 0 ? 512 : CFG == 1 ? 256 : 128)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
     exl3_gemv_kernel_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE>

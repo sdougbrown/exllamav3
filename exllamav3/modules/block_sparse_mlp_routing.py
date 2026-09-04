@@ -5,6 +5,7 @@ bucketed workspaces from the per-device static cache up to ROUTING_CACHE_ROWS ro
 buffers live in the RoutingCFG (CUDA-graph paths bake their addresses).
 """
 from __future__ import annotations
+import os
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
@@ -69,6 +70,107 @@ class RoutingCFG:
     router_bias: torch.Tensor | None = None
     tid2eid: torch.Tensor | None = None
     e_score_bias_vl: torch.Tensor | None = None   # DeepSeek-V4 vision: selection bias for image rows
+    router_logits_gfx12: torch.Tensor | None = None
+    routing_weights_gfx12: torch.Tensor | None = None
+    selected_experts_gfx12: torch.Tensor | None = None
+
+
+_HIP_ROUTER_HIDDEN = 2560
+_HIP_ROUTER_EXPERTS = 512
+_HIP_ROUTER_TOP_K = 10
+_HIP_ROUTER_MAX_ROWS = 8
+
+
+def _hip_grouped_max_rows() -> int:
+    try:
+        return max(1, min(16, int(os.environ.get("EXL3_HIP_GROUPED_MAX_ROWS", "16"))))
+    except ValueError:
+        return 16
+
+
+_HIP_GROUPED_MAX_ROWS = _hip_grouped_max_rows()
+# The native prefill binding follows the grouped cap boundary and accepts rows 2..512.
+_HIP_PREFILL_MIN_ROWS = _HIP_GROUPED_MAX_ROWS + 1
+_HIP_PREFILL_MAX_ROWS = 512
+_HIP_PREFILL_MAX_EXPERT_ROWS = _HIP_PREFILL_MAX_ROWS * _HIP_ROUTER_TOP_K
+
+
+def _hip_grouped_rows_eligible(rows: int) -> bool:
+    return 1 <= rows <= _HIP_GROUPED_MAX_ROWS
+
+
+def _hip_prefill_rows_eligible(rows: int) -> bool:
+    return _HIP_PREFILL_MIN_ROWS <= rows <= _HIP_PREFILL_MAX_ROWS
+
+
+def _hip_router_device_supported(device):
+    if not torch.version.hip or not hasattr(ext, "routing_std_gfx12_bsz1"):
+        return False
+    device = torch.device(device)
+    if device.type != "cuda":
+        return False
+    index = torch.cuda.current_device() if device.index is None else device.index
+    props = torch.cuda.get_device_properties(index)
+    arch = getattr(props, "gcnArchName", "").split(":", 1)[0]
+    return arch in ("gfx1200", "gfx1201") and getattr(props, "warp_size", 0) == 32
+
+
+def _hip_router_config_supported(cfg):
+    gate = cfg.gate_tensor
+    return (
+        cfg.num_experts == _HIP_ROUTER_EXPERTS and
+        cfg.num_experts_per_tok == _HIP_ROUTER_TOP_K and
+        cfg.per_expert_scale is None and
+        cfg.router_bias is None and
+        gate.dtype == torch.half and gate.is_contiguous() and
+        tuple(gate.shape) == (_HIP_ROUTER_HIDDEN, _HIP_ROUTER_EXPERTS) and
+        _hip_router_device_supported(gate.device)
+    )
+
+
+def _hip_router_call_supported(bsz, cfg, y, params):
+    return (
+        os.environ.get("EXL3_HIP_ROUTER", "1") != "0" and
+        1 <= bsz <= _HIP_ROUTER_MAX_ROWS and not params.get("activate_all_experts") and
+        _hip_router_config_supported(cfg) and
+        y.dtype == torch.half and y.is_contiguous() and
+        tuple(y.shape) == (bsz, _HIP_ROUTER_HIDDEN)
+    )
+
+
+def _prepare_hip_router_gate_t(cfg):
+    if (
+        os.environ.get("EXL3_HIP_ROUTER", "1") != "0" and
+        _hip_router_config_supported(cfg) and cfg.gate_tensor_t is None
+    ):
+        # One persistent E x H allocation per router (~2.5 MiB at 512 x 2560), created
+        # with the layer on its assigned device and released with routing_cfg on unload.
+        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+
+
+def _prepare_hip_router_buffers(cfg):
+    if _hip_router_config_supported(cfg) and getattr(cfg, "router_logits_gfx12", None) is None:
+        # RoutingCFG owns one persistent multirow workspace. Loaded modules already share
+        # non-reentrant workspaces, so Generator batches are stream-ordered rather than callers
+        # needing separate buffers for speculative streams.
+        device = cfg.gate_tensor.device
+        cfg.router_logits_gfx12 = torch.empty(
+            (_HIP_ROUTER_MAX_ROWS, _HIP_ROUTER_EXPERTS), device = device, dtype = torch.half)
+        cfg.selected_experts_gfx12 = torch.empty(
+            (_HIP_ROUTER_MAX_ROWS, _HIP_ROUTER_TOP_K), device = device, dtype = torch.long)
+        cfg.routing_weights_gfx12 = torch.empty(
+            (_HIP_ROUTER_MAX_ROWS, _HIP_ROUTER_TOP_K), device = device, dtype = torch.half)
+
+
+def _hip_router_buffers(cfg, rows):
+    if rows == 1:
+        return cfg.router_logits_bsz1, cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    _prepare_hip_router_buffers(cfg)
+    return (
+        cfg.router_logits_gfx12[:rows],
+        cfg.selected_experts_gfx12[:rows],
+        cfg.routing_weights_gfx12[:rows],
+    )
 
 def _routing_std_torch(cfg, y, params, include_bias = False):
     router_logits = torch.matmul(y, cfg.gate_tensor)
@@ -109,6 +211,17 @@ def _routing_nogroup_torch(cfg, y, params, scores):
 
 
 def routing_std(bsz, cfg, y, params):
+    if _hip_router_call_supported(bsz, cfg, y, params):
+        _prepare_hip_router_gate_t(cfg)
+        scores, selected_experts, routing_weights = _hip_router_buffers(cfg, bsz)
+        ext.routing_std_gfx12_bsz1(
+            y,
+            cfg.gate_tensor_t,
+            scores,
+            selected_experts,
+            routing_weights,
+        )
+        return selected_experts, routing_weights
     if not hasattr(ext, "routing_std"):
         return _routing_std_torch(cfg, y, params)
     if bsz == 1:

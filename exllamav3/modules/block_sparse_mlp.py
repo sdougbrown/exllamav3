@@ -20,6 +20,9 @@ from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
+    _HIP_ROUTER_HIDDEN, _HIP_ROUTER_EXPERTS, _HIP_ROUTER_TOP_K,
+    _HIP_GROUPED_MAX_ROWS, _HIP_PREFILL_MAX_ROWS, _HIP_PREFILL_MAX_EXPERT_ROWS,
+    _hip_grouped_rows_eligible, _hip_prefill_rows_eligible, _prepare_hip_router_gate_t,
 )
 
 # Row capacity of the fused MoE kernel's per-group temp buffers (experts with more assigned
@@ -58,6 +61,18 @@ class HIPGroupedBuffers:
     down_had: torch.Tensor
     down_out: torch.Tensor
     output: torch.Tensor
+
+
+@dataclass
+class HIPPrefillBuffers:
+    gu_had: torch.Tensor
+    gu_out: torch.Tensor
+    down_out: torch.Tensor
+    output: torch.Tensor
+    expert_offsets: torch.Tensor
+    inverse_order: torch.Tensor
+    expert_chunks: torch.Tensor
+    chunk_count: torch.Tensor
 
 
 @dataclass
@@ -189,6 +204,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 qmap = None,
                 out_dtype = torch.half,
                 pad_to = 1,
+                # The gfx12 router transpose is derived during this module's load. Its fp16
+                # source must therefore be filled before deferred loading completes.
+                no_defer_load = bool(
+                    torch.version.hip and router_type == "std" and
+                    hidden_size == _HIP_ROUTER_HIDDEN and
+                    num_experts == _HIP_ROUTER_EXPERTS and
+                    num_experts_per_tok == _HIP_ROUTER_TOP_K and
+                    key_per_expert_scale is None and interm_div == 1.0
+                ),
             )
             self.register_submodule(self.routing_gate)
         else:
@@ -435,6 +459,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.batch_recon = None
         self.support_hip_grouped = False
         self.hip_grouped_buffers = None
+        self.support_hip_prefill = False
+        self.hip_prefill_buffers = None
         self.hip_grouped_lora_blocked = False
         self._cpu_init_state()
 
@@ -458,6 +484,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if target in self.gates or target in self.ups or target in self.downs:
             self.hip_grouped_lora_blocked = True
             self.support_hip_grouped = False
+            self.support_hip_prefill = False
 
 
     def load_local(self, **kwargs):
@@ -511,7 +538,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.cpu_split_first is None
         )
         hip_grouped_device = False
-        if bool(torch.version.hip) and hasattr(ext, "exl3_moe_gfx12_k3"):
+        if (
+            bool(torch.version.hip) and hasattr(ext, "exl3_moe_gfx12_k3") and
+            hasattr(ext, "exl3_gemv_supported")
+        ):
             device_index = torch.device(self.device).index
             if device_index is None:
                 device_index = torch.cuda.current_device()
@@ -550,6 +580,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.support_hip_grouped = self.support_hip_grouped and all(
                 multi.K == 3 and multi.mul1 and not multi.mcg
                 for multi in (self.multi_gate, self.multi_up, self.multi_down)
+            )
+            self.support_hip_prefill = (
+                self.support_hip_grouped and hasattr(ext, "exl3_moe_gfx12_k3_prefill")
             )
 
         # Temp buffers for graph, dq and fused-bsz1 paths
@@ -615,17 +648,46 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.experts_cfg = cfg
 
         if self.support_hip_grouped:
+            max_assignments = _HIP_GROUPED_MAX_ROWS * numex
+            # Projection-major flat storage keeps every prefix slice contiguous up to the
+            # runtime grouped-row cap. All layers on a device share these max-sized cache
+            # entries; calls only take views.
             self.hip_grouped_buffers = HIPGroupedBuffers(
                 gu_had = g_tensor_cache.get(
-                    device, (2, numex, H), torch.half, "moe_gfx12_gu_had"),
+                    device, (2 * max_assignments, H), torch.half, "moe_gfx12_gu_had"),
                 gu_out = g_tensor_cache.get(
-                    device, (2, numex, I), torch.half, "moe_gfx12_gu_out"),
+                    device, (2 * max_assignments, I), torch.half, "moe_gfx12_gu_out"),
                 down_had = g_tensor_cache.get(
-                    device, (numex, I), torch.half, "moe_gfx12_down_had"),
+                    device, (max_assignments, I), torch.half, "moe_gfx12_down_had"),
                 down_out = g_tensor_cache.get(
-                    device, (numex, H), torch.float, "moe_gfx12_down_out"),
+                    device, (max_assignments, H), torch.float, "moe_gfx12_down_out"),
                 output = g_tensor_cache.get(
-                    device, (1, H), torch.float, "moe_gfx12_output"),
+                    device, (_HIP_GROUPED_MAX_ROWS, H), torch.float, "moe_gfx12_output"),
+            )
+
+        if self.support_hip_prefill:
+            max_assignments = _HIP_PREFILL_MAX_ROWS * numex
+            self.hip_prefill_buffers = HIPPrefillBuffers(
+                gu_had = g_tensor_cache.get(
+                    device, (2 * max_assignments, H), torch.half, "moe_gfx12_pf_gu_had"),
+                gu_out = g_tensor_cache.get(
+                    device, (2 * max_assignments, I), torch.half, "moe_gfx12_pf_gu_out"),
+                down_out = g_tensor_cache.get(
+                    device, (max_assignments, H), torch.float, "moe_gfx12_pf_down_out"),
+                output = g_tensor_cache.get(
+                    device, (_HIP_PREFILL_MAX_ROWS, H), torch.float, "moe_gfx12_pf_output"),
+                expert_offsets = g_tensor_cache.get(
+                    device, (self.num_experts + 1,), torch.long, "moe_gfx12_pf_offsets"),
+                inverse_order = g_tensor_cache.get(
+                    device, (max_assignments,), torch.long, "moe_gfx12_pf_inverse"),
+                expert_chunks = g_tensor_cache.get(
+                    device,
+                    (self.num_experts * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
+                    torch.int,
+                    "moe_gfx12_pf_chunks",
+                ),
+                chunk_count = g_tensor_cache.get(
+                    device, (1,), torch.int, "moe_gfx12_pf_chunk_count"),
             )
 
         if (self.support_quant_paths or self.support_bc_bszn) \
@@ -788,6 +850,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             topk_group = self.topk_group,
             per_expert_scale = self.per_expert_scale,
         )
+        _prepare_hip_router_gate_t(self.routing_cfg)
 
 
     @override
@@ -963,6 +1026,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.batch_recon = None
         self.support_hip_grouped = False
         self.hip_grouped_buffers = None
+        self.support_hip_prefill = False
+        self.hip_prefill_buffers = None
         self.hip_grouped_lora_blocked = False
         if self.multi_gate is not None:
             self.multi_gate.unload()
@@ -1057,19 +1122,29 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
 
-        # gfx12 grouped decode path: selected IDs and weights stay on-device, and every
-        # selected slot remains distinct so duplicates and routing order retain their semantics.
+        # gfx12 grouped decode/verification path: selected IDs and weights stay on-device,
+        # and every row-major assignment slot remains distinct.
         elif (
-            bsz == 1 and self.support_hip_grouped and self.tp_mode is None and self.act_limit == 0 and
+            _hip_grouped_rows_eligible(bsz) and self.support_hip_grouped and
+            self.tp_mode is None and self.act_limit == 0 and
+            tuple(y.shape) == (bsz, _HIP_ROUTER_HIDDEN) and y.dtype == torch.half and
+            tuple(selected_experts.shape) == (bsz, _HIP_ROUTER_TOP_K) and
+            selected_experts.dtype == torch.long and
+            tuple(routing_weights.shape) == (bsz, _HIP_ROUTER_TOP_K) and
+            routing_weights.dtype == torch.half and
+            y.is_contiguous() and selected_experts.is_contiguous() and routing_weights.is_contiguous() and
             os.environ.get("EXL3_HIP_GROUPED_MOE", "1") != "0" and
+            (bsz == 1 or os.environ.get("EXL3_HIP_GROUPED_MOE_MULTIROW", "1") != "0") and
             os.environ.get("EXL3_GEMV", "1") != "0" and
             not params.get("activate_all_experts") and
             not params.get("reconstruct") and not params.get("autosplit_measure")
         ):
             buffers = self.hip_grouped_buffers
+            assignments = bsz * _HIP_ROUTER_TOP_K
+            output = buffers.output[:bsz]
             ext.exl3_moe_gfx12_k3(
                 y,
-                buffers.output,
+                output,
                 selected_experts,
                 routing_weights,
                 self.multi_gate.ptrs_trellis,
@@ -1081,12 +1156,59 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.multi_down.ptrs_trellis,
                 self.multi_down.ptrs_suh,
                 self.multi_down.ptrs_svh,
-                buffers.gu_had,
-                buffers.gu_out,
-                buffers.down_had,
-                buffers.down_out,
+                buffers.gu_had[:2 * assignments],
+                buffers.gu_out[:2 * assignments],
+                buffers.down_had[:assignments],
+                buffers.down_out[:assignments],
             )
-            final_hidden_states = buffers.output.view(x.shape)
+            final_hidden_states = output.view(x.shape)
+
+        # gfx12 native prefill path: the kernel consumes the expert-major grouping directly,
+        # so the fused kernel's per-expert count readback and tier planning are skipped for
+        # eligible shapes.
+        elif (
+            self.support_hip_prefill and self.tp_mode is None and
+            self.num_local_experts == self.num_experts and
+            _hip_prefill_rows_eligible(bsz) and
+            y.dtype == torch.half and y.is_contiguous() and
+            selected_experts.is_contiguous() and routing_weights.is_contiguous() and
+            os.environ.get("EXL3_HIP_GROUPED_MOE_PREFILL", "1") != "0" and
+            os.environ.get("EXL3_GEMV", "1") != "0" and
+            not params.get("activate_all_experts") and
+            not params.get("reconstruct") and not params.get("autosplit_measure")
+        ):
+            num_tokens, top_k = selected_experts.shape
+            flat_expert_local = selected_experts.reshape(-1)
+            order = flat_expert_local.argsort(stable = True)
+            expert_count = torch.bincount(flat_expert_local, minlength = self.num_experts + 1)
+            buffers = self.hip_prefill_buffers
+            assignments = num_tokens * top_k
+            output = buffers.output[:num_tokens]
+            ext.exl3_moe_gfx12_k3_prefill(
+                y,
+                output,
+                selected_experts,
+                routing_weights,
+                order,
+                expert_count,
+                self.multi_gate.ptrs_trellis,
+                self.multi_gate.ptrs_suh,
+                self.multi_gate.ptrs_svh,
+                self.multi_up.ptrs_trellis,
+                self.multi_up.ptrs_suh,
+                self.multi_up.ptrs_svh,
+                self.multi_down.ptrs_trellis,
+                self.multi_down.ptrs_suh,
+                self.multi_down.ptrs_svh,
+                buffers.gu_had[:2 * assignments],
+                buffers.gu_out[:2 * assignments],
+                buffers.down_out[:assignments],
+                buffers.expert_offsets,
+                buffers.inverse_order[:assignments],
+                buffers.expert_chunks,
+                buffers.chunk_count,
+            )
+            final_hidden_states = output
 
         # Torch/C++/fused path
         elif (
@@ -1130,7 +1252,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     flat_expert_local = torch.where(valid, flat_expert_local, torch.full_like(flat_expert_local, E))
 
                 # Group once by local expert id (including sentinel for expert-P mode)
-                order = flat_expert_local.argsort()
+                order = flat_expert_local.argsort(stable = True)
                 token_sorted = flat_token[order]
                 weight_sorted = flat_weight[order]
 
