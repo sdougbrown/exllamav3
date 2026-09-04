@@ -13,7 +13,7 @@ bool exl3_gemv_supported(int device);
 
 #if defined(USE_ROCM)
 // gfx12 decode/verification grouped MoE path for the Qwen3.8 Flash K3/mul1 expert shape.
-// Supports 1..5 token rows; routing IDs and weights remain device-resident and duplicate
+// Supports 1..16 token rows; routing IDs and weights remain device-resident and duplicate
 // assignment slots are preserved independently per token.
 void exl3_moe_gfx12_k3
 (
@@ -37,7 +37,7 @@ void exl3_moe_gfx12_k3
 );
 
 // gfx12 throughput counterpart for sorted prefill assignments. Each expert is evaluated in
-// chunks of up to eight rows so its K3 weights are reused across a WMMA tile.
+// chunks of up to 16 rows so its K3 weights are reused across a WMMA tile.
 void exl3_moe_gfx12_k3_prefill
 (
     const at::Tensor& A,

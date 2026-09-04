@@ -29,9 +29,28 @@ _HIP_ROUTER_HIDDEN = 2560
 _HIP_ROUTER_EXPERTS = 512
 _HIP_ROUTER_TOP_K = 10
 _HIP_ROUTER_MAX_ROWS = 8
-_HIP_GROUPED_MAX_ROWS = 5
+
+
+def _hip_grouped_max_rows() -> int:
+    try:
+        return max(1, min(16, int(os.environ.get("EXL3_HIP_GROUPED_MAX_ROWS", "16"))))
+    except ValueError:
+        return 16
+
+
+_HIP_GROUPED_MAX_ROWS = _hip_grouped_max_rows()
+# The native prefill binding follows the grouped cap boundary and accepts rows 2..512.
+_HIP_PREFILL_MIN_ROWS = _HIP_GROUPED_MAX_ROWS + 1
 _HIP_PREFILL_MAX_ROWS = 512
 _HIP_PREFILL_MAX_EXPERT_ROWS = _HIP_PREFILL_MAX_ROWS * _HIP_ROUTER_TOP_K
+
+
+def _hip_grouped_rows_eligible(rows: int) -> bool:
+    return 1 <= rows <= _HIP_GROUPED_MAX_ROWS
+
+
+def _hip_prefill_rows_eligible(rows: int) -> bool:
+    return _HIP_PREFILL_MIN_ROWS <= rows <= _HIP_PREFILL_MAX_ROWS
 
 
 def _hip_router_device_supported(device):
@@ -991,8 +1010,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         if self.support_hip_grouped:
             max_assignments = _HIP_GROUPED_MAX_ROWS * numex
-            # Projection-major flat storage keeps every prefix slice contiguous for R=1..5.
-            # All layers on a device share these max-sized cache entries; calls only take views.
+            # Projection-major flat storage keeps every prefix slice contiguous up to the
+            # runtime grouped-row cap. All layers on a device share these max-sized cache
+            # entries; calls only take views.
             self.hip_grouped_buffers = HIPGroupedBuffers(
                 gu_had = g_tensor_cache.get(
                     device, (2 * max_assignments, H), torch.half, "moe_gfx12_gu_had"),
@@ -1331,10 +1351,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
 
         # gfx12 grouped decode/verification path: selected IDs and weights stay on-device,
-        # and every row-major assignment slot remains distinct. The router handles up to eight
-        # rows; grouped expert execution remains limited to its separately validated envelope.
+        # and every row-major assignment slot remains distinct.
         elif (
-            1 <= bsz <= _HIP_GROUPED_MAX_ROWS and self.support_hip_grouped and
+            _hip_grouped_rows_eligible(bsz) and self.support_hip_grouped and
             self.tp_mode is None and self.act_limit == 0 and
             tuple(y.shape) == (bsz, _HIP_ROUTER_HIDDEN) and y.dtype == torch.half and
             tuple(selected_experts.shape) == (bsz, _HIP_ROUTER_TOP_K) and
@@ -1459,7 +1478,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 hip_prefill_eligible = (
                     self.support_hip_prefill and self.tp_mode is None and
                     self.num_local_experts == self.num_experts and
-                    _HIP_GROUPED_MAX_ROWS < num_tokens <= _HIP_PREFILL_MAX_ROWS and
+                    _hip_prefill_rows_eligible(num_tokens) and
                     y.dtype == torch.half and y.is_contiguous() and
                     selected_experts.is_contiguous() and routing_weights.is_contiguous() and
                     os.environ.get("EXL3_HIP_GROUPED_MOE_PREFILL", "1") != "0" and

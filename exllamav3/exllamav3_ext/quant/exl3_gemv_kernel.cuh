@@ -21,7 +21,8 @@
 // CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention-projection sizes;
 // CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. CFG 2
 // ("prefill", 128 threads, 4 n-tiles/warp, 4 k-splits) serves the 16-row grouped-MoE body.
-// MMODE 0 is the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
+// MMODE 0 is the m == 1 fast path, MMODE 1 covers 2 <= m <= 8, and HIP MMODE 2 covers
+// 9 <= m <= 16 with row-guarded fragment loads.
 
 #if !defined(USE_ROCM) && !defined(__HIPCC__)
 #include <cooperative_groups.h>
@@ -175,7 +176,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
 #if defined(USE_ROCM) || defined(__HIPCC__)
     // HIP: the WMMA fp32 C fragment holds rows 0..7 in lanes 0..15 and rows 8..15
-    // in lanes 16..31. MMODE 0 stages one row; MMODE 2 enables all 16 for prefill.
+    // in lanes 16..31. MMODE 0 stages one row; MMODE 2 enables all 16 rows.
     constexpr int ROWS = MMODE == 0 ? 1 : MMODE == 2 ? 16 : EXL3_GEMV_MAX_M;
 #else
     constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)

@@ -4,6 +4,7 @@ import pytest
 import torch
 from exllamav3 import Config, Model
 from exllamav3.ext import exllamav3_ext as ext
+from exllamav3.modules.quant import exl3 as exl3_quant
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
@@ -15,7 +16,7 @@ torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 # the oracle: the `reconstruct=True` path (PyTorch reconstruct of EXL3 weights + rocBLAS
 # fp16 GEMM) is the reference, and the `reconstruct=False` path (which the HIP GEMV serves)
 # must reproduce it to fp16 tolerance. This is the same comparison pattern test_qgemm.py
-# applies to its two internal paths, applied at decode batch sizes (m <= 8, the MMODE-0/1
+# applies to its two internal paths, applied at decode batch sizes (m <= 16, the MMODE-0/1/2
 # regimes) where the GEMV path is the entire story.
 #
 # ROUTE PROOF (hard requirement): comparing reconstruct=False against reconstruct=True is
@@ -32,9 +33,9 @@ torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 # Model: set EXL3_TEST_MODEL to a compatible Qwen3.8-27B EXL3 model directory.
 # -----------------------------------------------------------------------------------
 
-# Decode regime: batch sizes that hit the GEMV path (rows <= 8) and specifically the
-# m==1 fast path plus small-m (2..8). m==1 is autoregressive decode.
-BATCH_SIZES = [1, 2, 8]
+# Decode regime: the m==1 fast path plus both small-m and 16-row HIP GEMV modes.
+# m==1 is autoregressive decode.
+BATCH_SIZES = [1, 2, 8, 9, 12, 16]
 
 # Per-arch proj keys exercising decode-relevant shapes. Keys must match the loaded
 # model's module names (Qwen3.8 hybrid: "model.language_model" prefix; full-attention
@@ -335,45 +336,54 @@ def test_hip_gemv_synthetic_oracle(K, mcg, mul1):
 
 
 @pytest.mark.parametrize(
-    "mcg, mul1",
+    "K, mcg, mul1",
     [
-        pytest.param(True, False, id="mcg"),
-        pytest.param(False, True, id="mul1"),
+        pytest.param(3, False, True, id="k3-mul1"),
+        pytest.param(4, True, False, id="k4-mcg"),
+        pytest.param(4, False, True, id="k4-mul1"),
+        pytest.param(5, False, True, id="k5-mul1"),
+        pytest.param(6, True, False, id="k6-mcg"),
+        pytest.param(6, False, True, id="k6-mul1"),
     ],
 )
-@pytest.mark.parametrize("size_n", [128, 8320], ids=["cfg0", "cfg1"])
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("rows", [9, 12, 16], ids=["rows-9", "rows-12", "rows-16"])
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32], ids=["fp16", "fp32"])
 @torch.inference_mode()
-def test_hip_gemv_k6_synthetic_oracle(mcg, mul1, size_n, batch_size, out_dtype):
-    """K6 vocabulary-head families route directly and match reconstruct+hgemm."""
+def test_hip_gemv_rows_9_to_16_synthetic_route_to_gemv(K, mcg, mul1, rows, out_dtype):
     _require_gfx12()
-    torch.manual_seed(6000 + 10 * mcg + 100 * mul1 + batch_size)
-    K = 6
-    size_k = 128
-    A = torch.randn((batch_size, size_k), dtype=torch.float16, device="cuda") * 1e-3
-    # Repeating finite cycles vary every packed word and tile, exposing omitted loads,
-    # 48-word tile-boundary mistakes, and cross-tile aliasing in both launch configs.
-    cycles = torch.tensor([0x1111, 0x2222, 0x5555, 0x2492],
-                          dtype=torch.int16, device="cuda")
-    num_words = (size_k // 16) * (size_n // 16) * K * 16
-    B = cycles.repeat((num_words + cycles.numel() - 1) // cycles.numel())[:num_words] \
-        .view(size_k // 16, size_n // 16, K * 16).clone()
-    suh = (torch.randint(0, 2, (size_k,), device="cuda") * 2 - 1).to(torch.float16)
-    svh = (torch.randint(0, 2, (size_n,), device="cuda") * 2 - 1).to(torch.float16)
+    actual, expected, calls, x, size_n = _run_rows_synthetic_oracle(K, mcg, mul1, rows, out_dtype)
+    assert calls["gemv"] == 1
+    assert calls["reconstruct"] == 0
+    assert calls["reconstruct_slice"] == 0
+    assert calls["reconstruct_had_slice"] == 0
+    assert calls["hgemm"] == 0
+    assert actual.shape == x.shape[:-1] + (size_n,)
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
 
-    actual = torch.empty((batch_size, size_n), dtype=out_dtype, device="cuda")
-    A_had = torch.empty_like(A)
-    ext.exl3_gemv(A, B, actual, suh, A_had, svh, mcg, mul1)
 
-    A_ref = torch.empty_like(A)
-    weight = torch.empty((size_k, size_n), dtype=torch.float16, device="cuda")
-    expected = torch.empty_like(actual)
-    ext.had_r_128(A, A_ref, suh, None, 1.0)
-    ext.reconstruct(weight, B, K, mcg, mul1)
-    ext.hgemm(A_ref, weight, expected)
-    ext.had_r_128(expected, expected, None, svh, 1.0)
+@torch.inference_mode()
+def test_hip_gemv_k2_rows_8_routes_to_gemv():
+    _require_gfx12()
+    actual, expected, calls, x, size_n = _run_rows_synthetic_oracle(2, True, False, 8, torch.float16)
+    assert calls["gemv"] == 1
+    assert calls["reconstruct"] == 0
+    assert calls["reconstruct_slice"] == 0
+    assert calls["reconstruct_had_slice"] == 0
+    assert calls["hgemm"] == 0
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
 
+
+@torch.inference_mode()
+def test_hip_gemv_k2_rows_9_falls_back():
+    _require_gfx12()
+    actual, expected, calls, x, size_n = _run_rows_synthetic_oracle(2, True, False, 9, torch.float16)
+    assert calls["gemv"] == 0
+    assert calls["reconstruct"] > 0
+    assert calls["hgemm"] > 0
     assert torch.isfinite(actual).all()
     assert torch.isfinite(expected).all()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
@@ -413,8 +423,6 @@ def _run_k5_synthetic_oracle(mcg, mul1, size_k, size_n, batch_size, out_dtype):
                         mcg=codebook if mcg else None, mul1=codebook if mul1 else None)
     x = torch.randn((1, batch_size, size_k), dtype=torch.float16, device="cuda") * 1e-3
 
-    # Validate that the oracle data really exercises different tile streams before using
-    # reconstruction as the direct-kernel comparison target.
     weight = torch.empty((size_k, size_n), dtype=torch.float16, device="cuda")
     ext.reconstruct(weight, trellis, K, mcg, mul1)
     assert torch.isfinite(weight).all()
@@ -436,36 +444,51 @@ def _run_k5_synthetic_oracle(mcg, mul1, size_k, size_n, batch_size, out_dtype):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
 
 
-@pytest.mark.parametrize(
-    "mcg, mul1",
-    [
-        pytest.param(True, False, id="mcg"),
-        pytest.param(False, True, id="mul1"),
-    ],
-)
+def _run_rows_synthetic_oracle(K, mcg, mul1, rows, out_dtype=torch.float16):
+    from exllamav3.modules.quant.exl3 import LinearEXL3
+
+    _require_gfx12()
+    torch.manual_seed(7000 + 10 * K + 100 * mcg + 1000 * mul1 + rows)
+    size_k = size_n = 128
+    trellis = _make_distinct_finite_trellis(K, size_k, size_n)
+    suh = (torch.randint(0, 2, (size_k,), device="cuda") * 2 - 1).to(torch.float16)
+    svh = (torch.randint(0, 2, (size_n,), device="cuda") * 2 - 1).to(torch.float16)
+    codebook = torch.ones((), dtype=torch.int32, device="cuda")
+    linear = None
+    actual = expected = calls = x = None
+    try:
+        linear = LinearEXL3(None, size_k, size_n, suh=suh, svh=svh, trellis=trellis,
+                            mcg=codebook if mcg else None, mul1=codebook if mul1 else None)
+        x = torch.randn((1, rows, size_k), dtype=torch.float16, device="cuda") * 1e-3
+
+        expected = linear.forward(x, {"reconstruct": True}, out_dtype)
+        calls, restore = _spy_ext_route()
+        try:
+            actual = linear.forward(x, {"reconstruct": False}, out_dtype)
+        finally:
+            restore()
+    finally:
+        if linear is not None:
+            linear.unload()
+    return actual, expected, calls, x, size_n
+
+
 @pytest.mark.parametrize("size_n", [128, 8320], ids=["cfg0-exact-tail", "cfg1"])
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32], ids=["fp16", "fp32"])
 @torch.inference_mode()
-def test_hip_gemv_k5_synthetic_oracle(mcg, mul1, size_n, batch_size, out_dtype):
-    """The full m1/2/8 and fp16/fp32 K5 matrix matches reconstruct+hgemm."""
+def test_hip_gemv_k5_synthetic_oracle(size_n, batch_size, out_dtype):
+    """The K5 mul1/cb2 m1..16 fp16/fp32 matrix matches reconstruct+hgemm."""
     _require_gfx12()
-    _run_k5_synthetic_oracle(mcg, mul1, 128, size_n, batch_size, out_dtype)
+    _run_k5_synthetic_oracle(False, True, 128, size_n, batch_size, out_dtype)
 
 
-@pytest.mark.parametrize(
-    "mcg, mul1",
-    [
-        pytest.param(True, False, id="mcg"),
-        pytest.param(False, True, id="mul1"),
-    ],
-)
 @pytest.mark.parametrize("size_n", [128, 8320], ids=["cfg0-exact-tail", "cfg1"])
 @torch.inference_mode()
-def test_hip_gemv_k5_prefetch_refill(mcg, mul1, size_n):
-    """K5 remains correct after both launch configurations refill their prefetch rings."""
+def test_hip_gemv_k5_prefetch_refill(size_n):
+    """K5 mul1/cb2 remains correct after both launch configurations refill prefetch."""
     _require_gfx12()
-    _run_k5_synthetic_oracle(mcg, mul1, 1152, size_n, 1, torch.float16)
+    _run_k5_synthetic_oracle(False, True, 1152, size_n, 1, torch.float16)
 
 
 @pytest.mark.parametrize("test_key", TEST_KEYS)
@@ -507,21 +530,109 @@ def test_hip_gemv_route_only(model):
         norm.unload()
 
 
+@pytest.mark.parametrize("rows", [9, 12, 16])
 @torch.inference_mode()
-def test_hip_gemv_rows_over_limit_falls_back(model):
-    """A K=4 decode batch with nine rows must not enter the m <= 8 GEMV kernel."""
+def test_hip_gemv_rows_9_to_16_route_to_gemv(model, rows):
+    """The MMODE-2 rows must use GEMV rather than reconstruct+hgemm."""
+    assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
     linear = model.find_module("model.language_model.layers.3.self_attn.q_proj")
     try:
         linear.load(device="cuda")
         assert linear.inner.K == 4
         assert linear.inner.mcg != linear.inner.mul1
-        x = torch.randn((1, 9, linear.in_features), dtype=torch.float16, device="cuda")
+        x = torch.randn((1, rows, linear.in_features), dtype=torch.float16, device="cuda")
         calls, restore = _spy_ext_route()
         try:
             y = linear.forward(x, {"reconstruct": False})
         finally:
             restore()
-        assert calls["gemv"] == 0, "m=9 must bypass the m <= 8 GEMV kernel"
+        assert calls["gemv"] == 1, f"m={rows} must make exactly one GEMV call"
+        assert calls["reconstruct"] == 0
+        assert calls["reconstruct_slice"] == 0
+        assert calls["reconstruct_had_slice"] == 0
+        assert calls["hgemm"] == 0
+        assert torch.isfinite(y.float()).all()
+    finally:
+        linear.unload()
+
+
+@torch.inference_mode()
+def test_hip_gemv_import_time_max_m_parser(monkeypatch):
+    import importlib
+
+    original = exl3_quant.EXL3_GEMV_HIP_MAX_M
+    try:
+        monkeypatch.delenv("EXL3_GEMV_HIP_MAX_M", raising=False)
+        importlib.reload(exl3_quant)
+        assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
+
+        monkeypatch.setenv("EXL3_GEMV_HIP_MAX_M", "8")
+        importlib.reload(exl3_quant)
+        assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 8
+
+        monkeypatch.setenv("EXL3_GEMV_HIP_MAX_M", "bogus")
+        importlib.reload(exl3_quant)
+        assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
+
+        monkeypatch.setenv("EXL3_GEMV_HIP_MAX_M", "0")
+        importlib.reload(exl3_quant)
+        assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 1
+
+        monkeypatch.setenv("EXL3_GEMV_HIP_MAX_M", "17")
+        importlib.reload(exl3_quant)
+        assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
+    finally:
+        monkeypatch.delenv("EXL3_GEMV_HIP_MAX_M", raising=False)
+        if original != 16:
+            monkeypatch.setenv("EXL3_GEMV_HIP_MAX_M", str(original))
+        importlib.reload(exl3_quant)
+
+
+@torch.inference_mode()
+def test_hip_gemv_rollback_cap_falls_back(model, monkeypatch):
+    """The EXL3_GEMV_HIP_MAX_M rollback cap returns m=9 to reconstruct+hgemm."""
+    import importlib
+
+    assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
+    try:
+        with monkeypatch.context() as rollback:
+            rollback.setenv("EXL3_GEMV_HIP_MAX_M", "8")
+            importlib.reload(exl3_quant)
+            assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 8
+            linear = model.find_module("model.language_model.layers.3.self_attn.q_proj")
+            try:
+                linear.load(device="cuda")
+                x = torch.randn((1, 9, linear.in_features), dtype=torch.float16, device="cuda")
+                calls, restore = _spy_ext_route()
+                try:
+                    y = linear.forward(x, {"reconstruct": False})
+                finally:
+                    restore()
+                assert calls["gemv"] == 0
+                assert calls["reconstruct"] > 0 and calls["hgemm"] > 0
+                assert torch.isfinite(y.float()).all()
+            finally:
+                linear.unload()
+    finally:
+        importlib.reload(exl3_quant)
+
+
+@torch.inference_mode()
+def test_hip_gemv_rows_over_limit_falls_back(model):
+    """A K=4 decode batch with exactly seventeen rows must bypass HIP GEMV."""
+    assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
+    linear = model.find_module("model.language_model.layers.3.self_attn.q_proj")
+    try:
+        linear.load(device="cuda")
+        assert linear.inner.K == 4
+        assert linear.inner.mcg != linear.inner.mul1
+        x = torch.randn((1, 17, linear.in_features), dtype=torch.float16, device="cuda")
+        calls, restore = _spy_ext_route()
+        try:
+            y = linear.forward(x, {"reconstruct": False})
+        finally:
+            restore()
+        assert calls["gemv"] == 0, "m=17 must bypass the m <= 16 GEMV kernel"
         assert calls["reconstruct"] > 0 and calls["hgemm"] > 0
         assert torch.isfinite(y.float()).all()
     finally:

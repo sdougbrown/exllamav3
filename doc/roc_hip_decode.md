@@ -8,7 +8,7 @@ The runtime gate in `exllamav3.modules.quant.exl3.LinearEXL3` sends a layer to H
 
 - ROCm is active and `ext.exl3_gemv_supported(device)` is true;
 - the GPU is `gfx1200` or `gfx1201`;
-- the decode batch is `rows <= 8`;
+- the decode batch is `rows <= 16` for the HIP GEMV route, subject to the existing K/codebook constraints; rows 9..16 are only for the supported native MMODE-2 variants (K3/mul1, K4/mcg or mul1, K5/mul1, K6/mcg or mul1), while K2 and all other codebook variants retain the rows<=8 limit; unsupported combinations fall back;
 - `in_features` and `out_features` are both multiples of 128;
 - `K` is from 2 through 6;
 - the existing codebook flags match the instantiated family (`mcg` / `mul1` when required); K5 and K6 require one of those two codebooks.
@@ -19,7 +19,7 @@ On those gfx12 devices, the real EXL3 decode kernel uses `v_wmma_f32_16x16x16_f1
 
 Anything outside the envelope above uses the existing reconstruct path:
 
-- rows `> 8`
+- rows `> 16`
 - unsupported bitrate / codebook combinations
 - `EXL3_GEMV=0`
 - non-gfx12 ROCm devices
@@ -146,7 +146,7 @@ The standard router is native for rows 1 through 8 on gfx1200/gfx1201 wave32 whe
 
 The grouped path's first real-model layer difference is 1.49e-8 maximum in fp32 output. Qwen4Exp recurrent state amplifies numerical noise. A 16-step fallback repeat measured a 3.63 maximum logit delta and 0.270 mean delta. The grouped pass measured 4.44 and 0.274. Both retained 15/16 top-1 agreement with the reference pass and at least 4/5 top-five overlap. The opt-in full-model oracle includes that fallback control and verifies grouped execution on both gfx1201 devices.
 
-The gfx12 throughput route extends the same direct K3 arithmetic to 6–512 prefill rows. It sorts assignments by expert, processes up to 16 rows per wide WMMA tile, and reduces through the inverse permutation in deterministic expert order. The shared workspaces add approximately 119 MiB per device. Five controlled pp511 trials improved from a 357.93 tok/s fallback median to 855.11 tok/s, a 138.9% gain. Under the profiler, HIP launches fell from 136,043 to 13,305; aggregate GPU time fell from 986 to 484 ms. A prefill-only 128-thread schedule later reduced the warm layer-harness median from 2.207 to 2.083 ms and grouped-body GPU time from 1.857 to 1.697 ms. Fixed-prompt pp511 medians improved from 902.32 to 926.67 tok/s; decode and MTP retain their existing schedules.
+The gfx12 throughput route extends the same direct K3 arithmetic to the prefill rows routed above the grouped cap. It sorts assignments by expert, processes up to 16 rows per wide WMMA tile, and reduces through the inverse permutation in deterministic expert order. The shared workspaces add approximately 119 MiB per device. Five controlled pp511 trials improved from a 357.93 tok/s fallback median to 855.11 tok/s, a 138.9% gain. Under the profiler, HIP launches fell from 136,043 to 13,305; aggregate GPU time fell from 986 to 484 ms. A prefill-only 128-thread schedule later reduced the warm layer-harness median from 2.207 to 2.083 ms and grouped-body GPU time from 1.857 to 1.697 ms. Fixed-prompt pp511 medians improved from 902.32 to 926.67 tok/s; decode and MTP retain their existing schedules.
 
 The gfx12 GDN prefill kernel uses two V partitions instead of the decode-oriented four. This retains the four-way layout for sequences up to five rows and leaves NVIDIA unchanged. A controlled pp511 sweep was noise-level, 894.48 versus 896.61 tok/s. Profiled recurrent-kernel time fell from 97.45 to 78.34 ms, while aggregate GPU time fell from 484 to 468 ms. An alternating 12K sweep improved from a 660.69 to 675.48 tok/s median, a 2.24% gain.
 
@@ -154,7 +154,7 @@ AITER can complement the runtime one operation at a time; Triton is not an all-o
 
 The 30.4 tok/s target-only short-context median is above the historical 19.43 tok/s llama.cpp target-only result for this host.
 
-The checkpoint also includes its complete 6,200-tensor MTP head; no separate EXL3 draft download is required. The draft adds approximately 1.25 GB on GPU0. Grouped K3 execution now supports verification windows of up to five rows. This moves MTP3 from 17.50 to 49.79 tok/s in a controlled on/off comparison. It also preserves duplicate routing slots and deterministic per-token reductions.
+The checkpoint also includes its complete 6,200-tensor MTP head; no separate EXL3 draft download is required. The draft adds approximately 1.25 GB on GPU0. Grouped K3 execution now supports verification windows of up to 16 rows. This moves MTP3 from 17.50 to 49.79 tok/s in a controlled on/off comparison. It also preserves duplicate routing slots and deterministic per-token reductions.
 
 Across three warmed 64-token trials, target-only measured 38.34 tok/s. MTP1/2/3/4 measured 47.91, 50.19, 53.56, and 43.30 tok/s respectively. MTP3 is the recommended short-context setting. Its three trials accepted 40–43 draft tokens and rejected 20–32 while producing coherent output. Speculative jobs now honor the same maximum output length as target-only jobs instead of reserving an unused full draft window.
 

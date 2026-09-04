@@ -156,7 +156,7 @@ pip install . --no-build-isolation
 
 The gfx1100 path remains correctness-first and uses PyTorch fallbacks for CUDA-specific kernels.
 
-On gfx1200/gfx1201, eligible EXL3 decode calls (`m <= 8`, supported K2-K6 codebooks) use the accelerated HIP WMMA kernel. Other shapes and ROCm architectures fall back to reconstruct+hgemm. Cache and DSA shims are also correctness-first PyTorch implementations, not fused performance kernels; this is not CUDA feature or performance parity.
+On gfx1200/gfx1201, eligible EXL3 decode calls use the accelerated HIP WMMA kernel, including supported native K3-K6 codebook variants through `m <= 16` (K2 remains limited to `m <= 8`). Other shapes and ROCm architectures fall back to reconstruct+hgemm. Cache and DSA shims are also correctness-first PyTorch implementations, not fused performance kernels; this is not CUDA feature or performance parity.
 
 For the gfx12 support envelope, build target, validation commands, and current benchmark scope, see [Experimental gfx12 ROCm decode backend](doc/roc_hip_decode.md).
 

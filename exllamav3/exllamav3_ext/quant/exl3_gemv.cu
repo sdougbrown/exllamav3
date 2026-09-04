@@ -29,20 +29,20 @@ point. Kernel arguments and graph parameter offsets are identical to exl3_gemm_k
 Env: EXL3_GEMV = 0 disables the path, 1/unset = heuristic (default), 2 = use wherever the hard
 constraints allow (testing).
 
-Heuristic envelope (measured, RTX 3090, 4 bpw, m <= 8, vs the tuned regular kernel): the narrow
-config wins 15-60% at attention-projection sizes (n <= 4096), the wide config wins ~8% at
-large-n/small-k FFN sizes. Big-k x big-n shapes lose slightly and fall through to the regular
-kernel, as do other architectures (Ada/Blackwell are memory-bound here and keep the regular
-kernel), bpw != 4, and m > 8.
+The CUDA heuristic envelope (measured on RTX 3090 at 4 bpw and m <= 8) favors the narrow
+config at attention-projection sizes (n <= 4096) and the wide config at large-n/small-k FFN
+sizes. HIP gfx12 additionally supports m <= 16 through its 16-row WMMA mode.
 */
 
 #if defined(USE_ROCM)
+constexpr int EXL3_GEMV_ROCM_MAX_M = 16;
+
 
 namespace {
 
 constexpr int MOE_HIDDEN = 2560;
 constexpr int MOE_TOP_K = 10;
-constexpr int MOE_MAX_ROWS = 5;
+constexpr int MOE_MAX_ROWS = 16;
 constexpr int MOE_PREFILL_MAX_ROWS = 512;
 constexpr int MOE_PREFILL_ROWS_PER_CHUNK = 16;
 constexpr int MOE_PREFILL_MAX_EXPERT_ROWS = MOE_PREFILL_MAX_ROWS * MOE_TOP_K;
@@ -494,7 +494,7 @@ void exl3_moe_gfx12_k3
     TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.dtype() == at::kHalf &&
                 A.dim() == 2 && A.size(1) == MOE_HIDDEN &&
                 A.size(0) >= 1 && A.size(0) <= MOE_MAX_ROWS,
-                "exl3_moe_gfx12_k3 requires contiguous fp16[R, 2560], R=1..5");
+                "exl3_moe_gfx12_k3 requires contiguous fp16[R, 2560], R=1..16");
     const int rows = A.size(0);
     const int assignments = rows * MOE_TOP_K;
     TORCH_CHECK(output.device() == A.device() && output.is_contiguous() && output.dtype() == at::kFloat &&
@@ -632,8 +632,8 @@ void exl3_moe_gfx12_k3_prefill
 
     TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.dtype() == at::kHalf &&
                 A.dim() == 2 && A.size(1) == MOE_HIDDEN &&
-                A.size(0) > MOE_MAX_ROWS && A.size(0) <= MOE_PREFILL_MAX_ROWS,
-                "exl3_moe_gfx12_k3_prefill requires contiguous fp16[R, 2560], R=6..512");
+                A.size(0) >= 2 && A.size(0) <= MOE_PREFILL_MAX_ROWS,
+                "exl3_moe_gfx12_k3_prefill requires contiguous fp16[R, 2560], R=2..512");
     const int rows = A.size(0);
     const int assignments = rows * MOE_TOP_K;
     TORCH_CHECK(output.device() == A.device() && output.is_contiguous() &&
@@ -824,7 +824,13 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     if (K < 2 || K > 4) return -1;
 #endif
     if (K != 4 && cb == 0) return -1;
+#if defined(USE_ROCM)
+    // K2 has no HIP MMODE-2 instantiation; its established envelope ends at eight rows.
+    if (K == 2 && size_m > EXL3_GEMV_MAX_M) return -1;
+    if (size_m > EXL3_GEMV_ROCM_MAX_M) return -1;
+#else
     if (size_m > EXL3_GEMV_MAX_M) return -1;
+#endif
     if (size_k % 128 || size_n % 128) return -1;
     //if (cc != CC_AMPERE) return -1;  // measured win on Ampere; Ada/Blackwell are memory-bound here
     if (mode == 2) return size_n <= 8192 ? 0 : 1;
@@ -861,11 +867,17 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
         SEL(bits_, cb_, false, 1, 0) SEL(bits_, cb_, false, 1, 1) \
         SEL(bits_, cb_, true,  0, 0) SEL(bits_, cb_, true,  0, 1) \
         SEL(bits_, cb_, true,  1, 0) SEL(bits_, cb_, true,  1, 1)
+    #define SEL_MMODE2_GRID(bits_, cb_) \
+        SEL(bits_, cb_, false, 2, 0) SEL(bits_, cb_, false, 2, 1) \
+        SEL(bits_, cb_, true,  2, 0) SEL(bits_, cb_, true,  2, 1)
     SEL_GRID(4, 0) SEL_GRID(4, 1) SEL_GRID(4, 2)
     SEL_GRID(2, 1) SEL_GRID(2, 2)
     SEL_GRID(3, 1) SEL_GRID(3, 2)
     SEL_GRID(5, 1) SEL_GRID(5, 2)
     SEL_GRID(6, 1) SEL_GRID(6, 2)
+    SEL_MMODE2_GRID(3, 2) SEL_MMODE2_GRID(4, 1) SEL_MMODE2_GRID(4, 2)
+    SEL_MMODE2_GRID(5, 2) SEL_MMODE2_GRID(6, 1) SEL_MMODE2_GRID(6, 2)
+    #undef SEL_MMODE2_GRID
     #undef SEL_GRID
     #undef SEL
 #else
@@ -915,7 +927,13 @@ bool exl3_gemv_try_launch
     if (K < 2 || K > 4) return false;
 #endif
     if (K != 4 && cb == 0) return false;
+#if defined(USE_ROCM)
+    // K2 has no HIP MMODE-2 instantiation; its established envelope ends at eight rows.
+    if (K == 2 && size_m > EXL3_GEMV_MAX_M) return false;
+    if (size_m > EXL3_GEMV_ROCM_MAX_M) return false;
+#else
     if (size_m > EXL3_GEMV_MAX_M) return false;
+#endif
     if (size_k % 128 || size_n % 128) return false;
 #if defined(USE_ROCM)
     if (!exl3_gemv_supported(device)) return false;
@@ -925,7 +943,11 @@ bool exl3_gemv_try_launch
     if (mode == 0) return false;
     int cc = DevCtx::instance().get_cc(device);
     // if (cc != CC_AMPERE) return false;
+#if defined(USE_ROCM)
+    int mmode = size_m == 1 ? 0 : (size_m <= EXL3_GEMV_MAX_M ? 1 : 2);
+#else
     int mmode = size_m == 1 ? 0 : 1;
+#endif
     int num_sms = DevCtx::instance().get_num_sms(device);
 
     // CUDA's cooperative grid is capped at full co-residency. HIP retains the same grid sizing

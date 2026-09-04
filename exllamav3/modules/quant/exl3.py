@@ -11,9 +11,20 @@ AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
-# Max rows served by the HIP decode GEMV kernel (EXL3_GEMV_MAX_M in
-# exllamav3_ext/quant/exl3_gemv_kernel.cuh); larger decode batches fall back to reconstruct
-EXL3_GEMV_HIP_MAX_M = 8
+def _hip_gemv_max_rows() -> int:
+    try:
+        return max(1, min(16, int(os.environ.get("EXL3_GEMV_HIP_MAX_M", "16"))))
+    except ValueError:
+        return 16
+
+
+# Runtime rollback cap for the ROCm 16-row GEMV path; larger decode batches reconstruct.
+EXL3_GEMV_HIP_MAX_M = _hip_gemv_max_rows()
+_EXL3_GEMV_HIP_MMODE1_MAX_M = 8
+_EXL3_GEMV_HIP_MMODE2_VARIANTS = frozenset({
+    (3, False, True), (4, True, False), (4, False, True),
+    (5, False, True), (6, True, False), (6, False, True),
+})
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 _hip_gemv_support_cache: dict[int, bool] = {}
@@ -158,6 +169,8 @@ class LinearEXL3:
                 if (torch.version.hip and os.environ.get("EXL3_GEMV", "1") != "0"
                         and hasattr(ext, "exl3_gemv") and _hip_gemv_supported(x.device)
                         and rows <= EXL3_GEMV_HIP_MAX_M
+                        and (rows <= _EXL3_GEMV_HIP_MMODE1_MAX_M or
+                             (self.K, self.mcg, self.mul1) in _EXL3_GEMV_HIP_MMODE2_VARIANTS)
                         and self.in_features % 128 == 0
                         and self.out_features % 128 == 0
                         and 2 <= self.K <= 6
