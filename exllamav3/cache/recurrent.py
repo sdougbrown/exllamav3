@@ -56,18 +56,20 @@ class RecurrentCache(OrderedDict):
             return 0
         if self.model.loaded_tp or not getattr(cache, "initialized", False) or not cache.free_list:
             return 0
-        state = cache.get_new_state()
-        try:
-            per = getattr(state, "checkpoint_size", 0)
-            if per <= 0:
-                return 0
-            n = max(1, self.max_size // per)
-            held = [state.stash() for _ in range(n)]
-        finally:
-            state.free()
-        # Blocks return to the allocator only after their copies have drained
-        torch.cuda.synchronize()
-        held.clear()
+        # Cache tensors are inference tensors; clearing the temporary slot writes them in place
+        with torch.inference_mode():
+            state = cache.get_new_state()
+            try:
+                per = getattr(state, "checkpoint_size", 0)
+                if per <= 0:
+                    return 0
+                n = max(1, self.max_size // per)
+                held = [state.stash() for _ in range(n)]
+            finally:
+                state.free()
+            # Blocks return to the allocator only after their copies have drained
+            torch.cuda.synchronize()
+            held.clear()
         return n
 
 
