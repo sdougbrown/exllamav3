@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import math
 import torch
+from ..util.memory import stash_to_host, unstash_copy
 import torch.nn.functional as F
 from .module import Module
 from .linear import Linear
@@ -107,11 +108,14 @@ class PLELayerState:
             self.id_state[slot, :self.ctx].copy_(temp)
 
     def stash(self, slot, position: int = 0):
-        return (self.conv_state[slot, :, :self.win].cpu(), self.id_state[slot, :self.ctx].cpu())
+        return (
+            stash_to_host(self.conv_state[slot, :, :self.win]),
+            stash_to_host(self.id_state[slot, :self.ctx]),
+        )
 
     def unstash(self, slot, stashed, position: int = 0):
-        self.conv_state[slot, :, :self.win].copy_(stashed[0])
-        self.id_state[slot, :self.ctx].copy_(stashed[1])
+        unstash_copy(self.conv_state[slot, :, :self.win], stashed[0])
+        unstash_copy(self.id_state[slot, :self.ctx], stashed[1])
 
     def tp_export(self, plan):
         return {

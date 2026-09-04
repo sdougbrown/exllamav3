@@ -104,6 +104,38 @@ def malloc_trim():
         _libc = False
 
 
+# Recurrent checkpoint stashes travel through pinned host buffers from the caching host
+# allocator instead of pageable .cpu() copies. A pageable copy of a few MB makes the runtime pin
+# the pages on the fly and, on ROCm, leaves KFD-registered ranges behind inside glibc's heap
+# (see malloc_trim above); pinned blocks are recycled by the allocator, never touch the heap,
+# and both directions are stream-ordered so the host never waits on the copy.
+# EXL3_PINNED_STASH=0 restores the pageable path.
+_pinned_stash = None
+
+def pinned_stash_enabled() -> bool:
+    global _pinned_stash
+    if _pinned_stash is None:
+        import os
+        _pinned_stash = os.environ.get("EXL3_PINNED_STASH", "1") != "0"
+    return _pinned_stash
+
+
+def stash_to_host(t: torch.Tensor) -> torch.Tensor:
+    """Device tensor (any layout) -> contiguous host copy for a checkpoint stash."""
+    if not pinned_stash_enabled() or not t.is_cuda:
+        return t.cpu()
+    src = t.contiguous()
+    dst = torch.empty(src.shape, dtype = src.dtype, pin_memory = True)
+    dst.copy_(src, non_blocking = True)
+    return dst
+
+
+def unstash_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Host stash -> device slot. Async when the stash is pinned (the allocator keeps the block
+    alive until the copy's stream has consumed it)."""
+    dst.copy_(src, non_blocking = src.is_pinned())
+
+
 def list_gpu_tensors(min_size: int = 1, cuda_only: bool = True):
     """
     Search the current process for referenced CUDA tensors and list them.

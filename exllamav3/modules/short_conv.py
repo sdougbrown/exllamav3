@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+from ..util.memory import stash_to_host, unstash_copy
 import torch.nn.functional as F
 
 from ..cache import Cache
@@ -185,12 +186,12 @@ class ShortConvLayerState:
 
     def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
-        return self.conv_state[slot, :, :cdim].cpu()
+        return stash_to_host(self.conv_state[slot, :, :cdim])
 
 
     def unstash(self, slot, stashed, position: int = 0):
         cdim = self.module.conv_kernel_size
-        self.conv_state[slot, :, :cdim].copy_(stashed)
+        unstash_copy(self.conv_state[slot, :, :cdim], stashed)
 
 
     def tp_export(self, plan):

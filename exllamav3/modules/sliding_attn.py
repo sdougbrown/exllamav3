@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+from ..util.memory import stash_to_host, unstash_copy
 from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
@@ -221,8 +222,8 @@ class SWALayerState:
         b = min(self.module.kv_state_size, position)
         a = max(0, b - self.module.sliding_window)
         return (
-            self.k_state[slot, a:b].cpu(),
-            self.v_state[slot, a:b].cpu()
+            stash_to_host(self.k_state[slot, a:b]),
+            stash_to_host(self.v_state[slot, a:b])
         )
 
 
@@ -232,8 +233,8 @@ class SWALayerState:
         k, v = stashed
         self.k_state[slot].zero_()
         self.v_state[slot].zero_()
-        self.k_state[slot, a:b].copy_(k)
-        self.v_state[slot, a:b].copy_(v)
+        unstash_copy(self.k_state[slot, a:b], k)
+        unstash_copy(self.v_state[slot, a:b], v)
 
 
 class SlidingAttention(Module):

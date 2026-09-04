@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import torch
+from ..util.memory import stash_to_host, unstash_copy
 from ..constants import PAGE_SIZE
 from .cache import Cache, CacheLayer
 from .recurrent import new_checkpoint_handle, mp_cache_recurrent_stash, mp_cache_recurrent_unstash
@@ -351,15 +352,15 @@ class DSV4LayerState:
 
 
     def stash(self, slot, position):
-        out = [self.ring[slot, :min(self.ring_rows, position)].cpu()]
+        out = [stash_to_host(self.ring[slot, :min(self.ring_rows, position)])]
         if self.comp_buf_kv is not None:
-            out.append(self.comp_buf_kv[slot].cpu())
-            out.append(self.comp_buf_gate[slot].cpu())
+            out.append(stash_to_host(self.comp_buf_kv[slot]))
+            out.append(stash_to_host(self.comp_buf_gate[slot]))
             if self.idx_buf_kv is not None:
-                out.append(self.idx_buf_kv[slot].cpu())
-                out.append(self.idx_buf_gate[slot].cpu())
-                out.append(self.comp_ovl[slot].cpu())
-                out.append(self.idx_ovl[slot].cpu())
+                out.append(stash_to_host(self.idx_buf_kv[slot]))
+                out.append(stash_to_host(self.idx_buf_gate[slot]))
+                out.append(stash_to_host(self.comp_ovl[slot]))
+                out.append(stash_to_host(self.idx_ovl[slot]))
         return out
 
 
@@ -367,15 +368,15 @@ class DSV4LayerState:
         it = iter(stashed)
         ring = next(it)
         self.ring[slot].zero_()  # never leave stale rows below the restored window
-        self.ring[slot, :ring.shape[0]].copy_(ring)
+        unstash_copy(self.ring[slot, :ring.shape[0]], ring)
         if self.comp_buf_kv is not None:
-            self.comp_buf_kv[slot].copy_(next(it))
-            self.comp_buf_gate[slot].copy_(next(it))
+            unstash_copy(self.comp_buf_kv[slot], next(it))
+            unstash_copy(self.comp_buf_gate[slot], next(it))
             if self.idx_buf_kv is not None:
-                self.idx_buf_kv[slot].copy_(next(it))
-                self.idx_buf_gate[slot].copy_(next(it))
-                self.comp_ovl[slot].copy_(next(it))
-                self.idx_ovl[slot].copy_(next(it))
+                unstash_copy(self.idx_buf_kv[slot], next(it))
+                unstash_copy(self.idx_buf_gate[slot], next(it))
+                unstash_copy(self.comp_ovl[slot], next(it))
+                unstash_copy(self.idx_ovl[slot], next(it))
 
 
     def tp_export(self, plan):

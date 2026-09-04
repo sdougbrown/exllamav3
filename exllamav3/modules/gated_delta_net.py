@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+from ..util.memory import stash_to_host, unstash_copy
 import torch.nn.functional as F
 from ..model.config import Config
 from ..util.tensor import get_for_device, to2
@@ -273,16 +274,16 @@ class GDNLayerState:
     def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
         return (
-            self.recurrent_state[slot, :1].cpu(),
-            self.conv_state[slot, :, :cdim].cpu()
+            stash_to_host(self.recurrent_state[slot, :1]),
+            stash_to_host(self.conv_state[slot, :, :cdim])
         )
 
 
     def unstash(self, slot, stashed, position: int = 0):
         cdim = self.module.conv_kernel_size
         s, c = stashed
-        self.recurrent_state[slot, :1].copy_(s)
-        self.conv_state[slot, :, :cdim].copy_(c)
+        unstash_copy(self.recurrent_state[slot, :1], s)
+        unstash_copy(self.conv_state[slot, :, :cdim], c)
 
 
     def tp_export(self, plan):
