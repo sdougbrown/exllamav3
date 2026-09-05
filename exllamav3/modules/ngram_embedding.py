@@ -87,6 +87,8 @@ class NGramEmbedding(Module):
         self.layer_multipliers = None
         self.codebook = None
         self._pin = None            # reusable pinned staging buffers for the fast path
+        self._pin_events = {}       # device index -> event recorded after the staging
+                                    # buffers' queued H2D reads (see forward())
         self._row_dtype = None      # stored row dtype of the unquantized table
 
         self.caps.update({"prefer_cpu": True})
@@ -218,6 +220,7 @@ class NGramEmbedding(Module):
         self.tables = None
         self.handles = None
         self._pin = None
+        self._pin_events = {}
         self._row_dtype = None
         self.head_bias = None
         self.head_offsets = None
@@ -398,6 +401,16 @@ class NGramEmbedding(Module):
         dev = self.device
         row_words = words_per_row(self.K) if trellis else ROW_DIM
         row_dtype = torch.int16 if trellis else self._row_dtype
+        # The staging buffers below are refilled on the CPU by the hash and the row gather;
+        # every queued H2D read of them must have completed first. An event was recorded on
+        # each consuming device's current stream right after the previous fill's copies, so
+        # waiting here fences the refill against delayed reads (a queued device wait or the
+        # pinned allocator's deferred reuse cannot stop an in-flight DMA from reading data
+        # the host has already replaced). Empty on the first fill; a no-op once the copies
+        # have retired.
+        for ev in self._pin_events.values():
+            ev.synchronize()
+        self._pin_events.clear()
         p = self._grow_pin(n, row_words, row_dtype)
 
         U = ext.ngram_hash_cpu(
@@ -416,6 +429,15 @@ class NGramEmbedding(Module):
             ext.ngram_dequant(packed_d, self.K, heads_d, self.head_bias, rows)
         else:
             rows = packed_d.float()
+        # All H2D reads from the staging buffers are now queued on dev's current stream;
+        # record there so the next fill waits for exactly these copies (and no longer).
+        di = dev.index if dev.index is not None else torch.cuda.current_device()
+        ev = self._pin_events.get(di)
+        if ev is None:
+            ev = torch.cuda.Event()
+            self._pin_events[di] = ev
+        with torch.cuda.device(dev):
+            ev.record()
         out = rows.index_select(0, inv_d).view(bsz, out_len, H * ROW_DIM)
         dt = out_dtype or self.out_dtype or torch.half
         return out.to(dt)
