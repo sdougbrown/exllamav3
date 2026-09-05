@@ -53,6 +53,37 @@ def _hip_prefill_rows_eligible(rows: int) -> bool:
     return _HIP_PREFILL_MIN_ROWS <= rows <= _HIP_PREFILL_MAX_ROWS
 
 
+def _moe_sync_free_count() -> bool:
+    # Default on: torch.bincount on a device tensor synchronizes the host once per MoE
+    # layer per chunk (48 layers), locking the host to the device. The scatter_add_
+    # histogram below is device-only. EXL3_MOE_SYNC_FREE_COUNT=0 restores bincount.
+    return os.environ.get("EXL3_MOE_SYNC_FREE_COUNT", "1") != "0"
+
+
+# Persistent all-ones source for the sync-free expert histogram, one per device. Sized
+# to the max assignments of the gfx12 prefill route (512 rows x top-k 10).
+_moe_sync_free_ones = {}
+
+
+def _scatter_expert_count(flat_expert_local: torch.Tensor, num_bins: int) -> torch.Tensor:
+    """Sync-free int64 histogram identical to torch.bincount(flat_expert_local, minlength = num_bins)."""
+    n = flat_expert_local.numel()
+    dev = flat_expert_local.device
+    if n <= _HIP_PREFILL_MAX_EXPERT_ROWS:
+        ones = _moe_sync_free_ones.get(dev)
+        if ones is None:
+            ones = torch.ones(_HIP_PREFILL_MAX_EXPERT_ROWS, dtype = torch.long, device = dev)
+            _moe_sync_free_ones[dev] = ones
+        src = ones[:n]
+    else:
+        # Rare: paths beyond the gfx12 prefill envelope (e.g. chunk > 512 rows). A fresh
+        # ones tensor here is still device-side (no host sync).
+        src = torch.ones(n, dtype = torch.long, device = dev)
+    expert_count = torch.zeros(num_bins, dtype = torch.long, device = dev)
+    expert_count.scatter_add_(0, flat_expert_local, src)
+    return expert_count
+
+
 def _hip_router_device_supported(device):
     if not torch.version.hip or not hasattr(ext, "routing_std_gfx12_bsz1"):
         return False
@@ -1434,7 +1465,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 order = flat_expert_local.argsort(stable = True)
 
                 # Count how many assignments per expert
-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+                if _moe_sync_free_count():
+                    expert_count = _scatter_expert_count(flat_expert_local, E + 1)
+                else:
+                    expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
                 token_sorted = None
                 weight_sorted = None
 
