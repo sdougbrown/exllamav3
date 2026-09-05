@@ -333,7 +333,7 @@ def main():
             "mean_target_nll": mean_nll,
             "heldout_ppl": math.exp(mean_nll),
         }
-        summary.update(compare_references(args.reference, saved_rows))
+        summary.update(compare_references(args.reference, saved_rows, actual_vocab_size))
         print(json.dumps(summary))
     finally:
         restore_qsa_guard(guarded, originals)
@@ -361,9 +361,9 @@ def main():
         print(json.dumps({"event": "saved", "path": args.out}))
 
 
-def compare_references(reference_paths, saved_rows):
+def compare_references(reference_paths, saved_rows, actual_vocab_size):
     """Verify each reference saw identical inputs/targets, then report mean KL in both
-    directions between the saved terminal logits and this run's."""
+    directions between the saved terminal logits and this run's actual vocabulary."""
     if not reference_paths:
         return {}
 
@@ -392,7 +392,11 @@ def compare_references(reference_paths, saved_rows):
             f"reference {path} logits shape {tuple(reference.shape)} != "
             f"current {tuple(current.shape)}"
         )
-        vocab_size = min(reference.shape[-1], current.shape[-1])
+        reference_vocab_size = ref_meta.get("actual_vocab_size")
+        assert reference_vocab_size == actual_vocab_size, (
+            f"reference {path} actual vocab {reference_vocab_size} != current {actual_vocab_size}"
+        )
+        vocab_size = actual_vocab_size
         # compute_kl_div(input, target) = KL(softmax(target) || softmax(input)) per row.
         kl_ref_to_cur = compute_kl_div(current, reference, vocab_size)
         kl_cur_to_ref = compute_kl_div(reference, current, vocab_size)
