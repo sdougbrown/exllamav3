@@ -7,6 +7,7 @@ from ..constants import PAGE_SIZE
 import numpy as np
 from .pagetable import Sequence, tensor_hash_checksum, random_hash
 from .filter import Filter
+import os
 import random
 import time
 from ..ext import exllamav3_ext as ext
@@ -186,6 +187,17 @@ class Job:
         self.held_probs = rq_state.get("held_probs")
         self.held_logits = rq_state.get("held_logits")
         self.full_completion = rq_state.get("full_completion", "")
+
+        # Pinned double-buffered staging for the prefill cache_seqlens upload (P3a Step 2).
+        # The forward issues non-blocking H2D copies of the staged buffer to every layer
+        # device; a slot is refilled only after the previous chunk's copies from that slot
+        # have completed (per-device events, waited before reuse). EXL3_PREFILL_ASYNC_UPLOADS=0
+        # restores the old pageable per-chunk tensor.
+        self._prefill_staging_enabled = os.environ.get("EXL3_PREFILL_ASYNC_UPLOADS", "1") != "0"
+        self._prefill_cs_staging = None          # {parity: pinned 1-elem int32 tensor}, lazy
+        self._prefill_cs_events = [{}, {}]       # {parity: {device_index: torch.cuda.Event}}
+        self._prefill_parity = 0
+        self._prefill_current_parity = 0
         self.seed = seed
 
         # Prepare sequences
@@ -1181,6 +1193,44 @@ class Job:
             new_pages += s.new_unique_pages + omitted_pages
         return new_pages
 
+    def _prefill_staged_cache_seqlens(self, prefill_start: int) -> torch.Tensor:
+        """cache_seqlens for this chunk: a pinned double-buffered staging slot (async upload)
+        or, with EXL3_PREFILL_ASYNC_UPLOADS=0, a fresh pageable tensor (old behavior)."""
+        if not self._prefill_staging_enabled:
+            return torch.tensor([prefill_start], dtype = torch.int32)
+        if self._prefill_cs_staging is None:
+            self._prefill_cs_staging = [
+                torch.zeros(1, dtype = torch.int32, pin_memory = True),
+                torch.zeros(1, dtype = torch.int32, pin_memory = True),
+            ]
+        p = self._prefill_parity
+        self._prefill_parity ^= 1
+        self._prefill_current_parity = p
+        for ev in self._prefill_cs_events[p].values():
+            ev.synchronize()   # previous chunk's copies from this slot must be DMA-complete
+        self._prefill_cs_staging[p][0] = prefill_start
+        return self._prefill_cs_staging[p]
+
+    def _prefill_record_cache_seqlens_dma(self):
+        """Record, on each device that runs prefill layers, an event after the just-issued
+        chunk's forwards: when it fires, every H2D copy of the staged cache_seqlens slot for
+        this chunk has consumed the host buffer, so the slot may be refilled."""
+        if not self._prefill_staging_enabled:
+            return
+        p = self._prefill_current_parity
+        devs = set(self.generator.model.active_devices) if self.generator is not None else set()
+        if getattr(self.generator, "draft_model", None) is not None:
+            devs |= set(self.generator.draft_model.active_devices)
+        if not devs:
+            devs = {0}
+        for d in devs:
+            ev = self._prefill_cs_events[p].get(d)
+            if ev is None:
+                ev = torch.cuda.Event()
+                self._prefill_cs_events[p][d] = ev
+            with torch.cuda.device(d):
+                ev.record()
+
 
     def prefill(self, results: list):
         """
@@ -1326,7 +1376,7 @@ class Job:
                     "attn_mode": "flash_attn",
                     "block_table": seq.block_index_tensor,
                     "cache": self.generator.cache,
-                    "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                    "cache_seqlens": self._prefill_staged_cache_seqlens(prefill_start),
                     "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
@@ -1369,10 +1419,13 @@ class Job:
                             "attn_mode": "flash_attn",
                             "block_table": seq.block_index_tensor,
                             "cache": self.generator.draft_cache,
-                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                            "cache_seqlens": params["cache_seqlens"] if self._prefill_staging_enabled else \
+                                torch.tensor([prefill_start], dtype = torch.int32),
                             "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
                         }
                     )
+
+                self._prefill_record_cache_seqlens_dma()
 
                 # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
                 # recurrent state beyond the chunk boundary. The extension is processed again by the

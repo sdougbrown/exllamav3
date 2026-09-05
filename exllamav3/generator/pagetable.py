@@ -252,6 +252,7 @@ class Sequence:
         self.block_index_tensor = torch.tensor(
             [[page.page_index for page in self.allocated_pages]],
             dtype = torch.int32,
+            pin_memory = torch.cuda.is_available(),
         )
 
     def allocate_pages(
