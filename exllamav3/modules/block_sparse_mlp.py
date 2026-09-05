@@ -46,6 +46,38 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
+
+def _moe_sync_free_count() -> bool:
+    # Default on: torch.bincount on a device tensor synchronizes the host once per MoE
+    # layer per chunk (48 layers), locking the host to the device. The scatter_add_
+    # histogram below is device-only. EXL3_MOE_SYNC_FREE_COUNT=0 restores bincount.
+    return os.environ.get("EXL3_MOE_SYNC_FREE_COUNT", "1") != "0"
+
+
+# Persistent all-ones source for the sync-free expert histogram, one per device. Sized
+# to the max assignments of the gfx12 prefill route (512 rows x top-k 10).
+_moe_sync_free_ones = {}
+
+
+def _scatter_expert_count(flat_expert_local: torch.Tensor, num_bins: int) -> torch.Tensor:
+    """Sync-free int64 histogram identical to torch.bincount(flat_expert_local, minlength = num_bins)."""
+    n = flat_expert_local.numel()
+    dev = flat_expert_local.device
+    if n <= _HIP_PREFILL_MAX_EXPERT_ROWS:
+        ones = _moe_sync_free_ones.get(dev)
+        if ones is None:
+            ones = torch.ones(_HIP_PREFILL_MAX_EXPERT_ROWS, dtype = torch.long, device = dev)
+            _moe_sync_free_ones[dev] = ones
+        src = ones[:n]
+    else:
+        # Rare: paths beyond the gfx12 prefill envelope (e.g. chunk > 512 rows). A fresh
+        # ones tensor here is still device-side (no host sync).
+        src = torch.ones(n, dtype = torch.long, device = dev)
+    expert_count = torch.zeros(num_bins, dtype = torch.long, device = dev)
+    expert_count.scatter_add_(0, flat_expert_local, src)
+    return expert_count
+
+
 @dataclass
 class FusedBuffers:
     temp_state_g: torch.Tensor
@@ -1258,14 +1290,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 token_sorted = flat_token[order]
                 weight_sorted = flat_weight[order]
 
-                # Count how many assignments per expert. With few enough total assignments no
-                # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
-                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
-                    expert_count_list = None
+                # Count how many assignments per expert
+                if _moe_sync_free_count():
+                    expert_count = _scatter_expert_count(flat_expert_local, E + 1)
                 else:
-                    expert_count_list = expert_count.tolist()
+                    expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+                token_sorted = None
+                weight_sorted = None
 
                 # Tier plan: fused kernel for experts up to self.fused_rows rows, batched
                 # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond
