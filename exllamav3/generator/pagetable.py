@@ -1,6 +1,7 @@
 from __future__ import annotations
 from functools import lru_cache
 import heapq
+import os
 import torch
 import hashlib
 from dataclasses import dataclass
@@ -17,6 +18,20 @@ import time
 from ..cache import RecurrentCache
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..util import profile_opt
+
+
+def _prefill_async_uploads_enabled() -> bool:
+    """P3a Step 2 upload staging gate. Default OFF (conservative) until ownership
+    tests qualify the async path; EXL3_PREFILL_ASYNC_UPLOADS=1 opts in. 0 or unset
+    restores the exact old pageable path."""
+    return os.environ.get("EXL3_PREFILL_ASYNC_UPLOADS", "0") != "0"
+
+
+def _block_index_pin_enabled() -> bool:
+    """Block-table pinning is part of the Step 2 async-upload path: pin only when
+    the gate is on, so EXL3_PREFILL_ASYNC_UPLOADS=0 restores the exact old pageable
+    block_index_tensor (rollback must cover pinning, not just staged lengths)."""
+    return _prefill_async_uploads_enabled() and torch.cuda.is_available()
 
 
 def _tensor_blake2b_checksum(tensor: torch.Tensor, prev_hash: bytes | None) -> bytes:
@@ -252,7 +267,7 @@ class Sequence:
         self.block_index_tensor = torch.tensor(
             [[page.page_index for page in self.allocated_pages]],
             dtype = torch.int32,
-            pin_memory = torch.cuda.is_available(),
+            pin_memory = _block_index_pin_enabled(),
         )
 
     def allocate_pages(

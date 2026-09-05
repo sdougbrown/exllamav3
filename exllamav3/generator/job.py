@@ -5,9 +5,8 @@ if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
 import numpy as np
-from .pagetable import Sequence, tensor_hash_checksum, random_hash
+from .pagetable import Sequence, tensor_hash_checksum, random_hash, _prefill_async_uploads_enabled
 from .filter import Filter
-import os
 import random
 import time
 from ..ext import exllamav3_ext as ext
@@ -191,9 +190,11 @@ class Job:
         # Pinned double-buffered staging for the prefill cache_seqlens upload (P3a Step 2).
         # The forward issues non-blocking H2D copies of the staged buffer to every layer
         # device; a slot is refilled only after the previous chunk's copies from that slot
-        # have completed (per-device events, waited before reuse). EXL3_PREFILL_ASYNC_UPLOADS=0
-        # restores the old pageable per-chunk tensor.
-        self._prefill_staging_enabled = os.environ.get("EXL3_PREFILL_ASYNC_UPLOADS", "1") != "0"
+        # have completed (per-device events, waited before reuse). Default OFF (conservative)
+        # until ownership tests qualify the async path; EXL3_PREFILL_ASYNC_UPLOADS=1 opts in,
+        # 0 or unset restores the old pageable per-chunk tensor. Read once at construction:
+        # the env var must be set before the Job is created.
+        self._prefill_staging_enabled = _prefill_async_uploads_enabled()
         self._prefill_cs_staging = None          # {parity: pinned 1-elem int32 tensor}, lazy
         self._prefill_cs_events = [{}, {}]       # {parity: {device_index: torch.cuda.Event}}
         self._prefill_parity = 0
