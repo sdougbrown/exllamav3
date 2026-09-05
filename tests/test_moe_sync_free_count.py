@@ -79,3 +79,44 @@ def test_helpers_have_expected_signature():
     ids = torch.tensor([0, 1, 2], dtype=torch.long, device=DEV)
     result = _scatter_expert_count(ids, 3)
     assert len(result.shape) == 1
+
+
+def test_scatter_512_rows_sentinel_and_empty():
+    # 512 rows x top-k 10 = 5120 assignments: the persistent ones-buffer boundary.
+    E = 512
+    ids = torch.randint(0, 8, (5120,), device=DEV)            # narrow range -> bins 8..E empty
+    ids[:64] = E                                              # sentinel present
+    ids[64:128] = torch.randint(200, 500, (64,), device=DEV)  # scattered highs
+    result = _scatter_expert_count(ids, E + 1)
+    expected = torch.bincount(ids, minlength=E + 1)
+    assert torch.equal(result, expected)
+    assert result[E].item() == 64
+    assert (result == 0).sum().item() >= 200  # bins 8..199 + 500..511 = 204 empty
+
+
+def test_scatter_1024_rows_sentinel_and_empty():
+    # 1024 rows x top-k 10 = 10240 assignments.
+    E = 512
+    ids = torch.randint(0, 8, (10240,), device=DEV)           # narrow range -> bins 8..E empty
+    ids[:128] = E                                              # sentinel present
+    ids[128:256] = torch.randint(200, 500, (128,), device=DEV)  # scattered highs
+    result = _scatter_expert_count(ids, E + 1)
+    expected = torch.bincount(ids, minlength=E + 1)
+    assert torch.equal(result, expected)
+    assert result[E].item() == 128
+    assert (result == 0).sum().item() >= 200  # bins 8..199 + 500..511 = 204 empty
+
+
+def test_scatter_2048_rows_sentinel_and_empty():
+    # 2048 rows x top-k 10 = 20480 assignments: beyond the persistent buffer, so the
+    # fresh-ones path runs (counting precedes route eligibility; P3b must reuse this
+    # helper without bincount).
+    E = 512
+    ids = torch.randint(0, 8, (20480,), device=DEV)           # narrow range -> bins 8..E empty
+    ids[:256] = E                                              # sentinel present
+    ids[256:512] = torch.randint(200, 500, (256,), device=DEV)  # scattered highs
+    result = _scatter_expert_count(ids, E + 1)
+    expected = torch.bincount(ids, minlength=E + 1)
+    assert torch.equal(result, expected)
+    assert result[E].item() == 256
+    assert (result == 0).sum().item() >= 200  # bins 8..199 + 500..511 = 204 empty
