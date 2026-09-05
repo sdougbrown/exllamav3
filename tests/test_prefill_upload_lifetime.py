@@ -19,7 +19,7 @@ from exllamav3.generator.job import Job
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU only")
 
-DEV = torch.device("cuda", torch.cuda.current_device())
+DEV = torch.device("cuda", 0)
 SLEEP_CYCLES = int(4e8)
 
 

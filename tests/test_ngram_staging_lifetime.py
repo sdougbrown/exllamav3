@@ -22,7 +22,7 @@ from exllamav3.modules.quant.exl3_lib.ngram_codec import mul1_codebook, words_pe
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU only")
 
-DEV = torch.device("cuda", torch.cuda.current_device())
+DEV = torch.device("cuda", 0)
 NGRAM_SIZE = 3
 HPN = 2
 H = (NGRAM_SIZE - 1) * HPN
