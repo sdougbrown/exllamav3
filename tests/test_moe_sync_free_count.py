@@ -1,4 +1,6 @@
 import pytest
+import time
+
 import torch
 from exllamav3.modules.block_sparse_mlp import (
     _HIP_PREFILL_MAX_EXPERT_ROWS,
@@ -79,6 +81,51 @@ def test_helpers_have_expected_signature():
     ids = torch.tensor([0, 1, 2], dtype=torch.long, device=DEV)
     result = _scatter_expert_count(ids, 3)
     assert len(result.shape) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU only")
+def test_scatter_host_sync_free_with_pending_work():
+    # Pending-work probe: hold the device with a long on-stream kernel, then time the
+    # HOST wall time of each counting call. torch.bincount on a device tensor blocks
+    # the host until the queued kernel drains; the scatter histogram must return
+    # immediately (device-only). The bincount leg validates that the probe detects a
+    # host sync — without it, a fast call would be indistinguishable from an idle
+    # device.
+    E = 512
+    ids = torch.randint(0, E + 1, (5120,), device=DEV)
+    big = torch.randint(0, E + 1, (20480,), device=DEV)  # > persistent-ones boundary
+    for _ in range(3):                                   # warm allocations/JIT
+        torch.bincount(ids, minlength=E + 1)
+        _scatter_expert_count(ids, E + 1)
+        _scatter_expert_count(big, E + 1)
+    torch.cuda.synchronize()
+
+    torch.cuda._sleep(int(4e8))                          # ~hundreds of ms on gfx12
+    t0 = time.perf_counter()
+    ref = torch.bincount(ids, minlength=E + 1)           # probe validation leg
+    bincount_host = time.perf_counter() - t0
+    torch.cuda.synchronize()
+
+    torch.cuda._sleep(int(4e8))
+    t0 = time.perf_counter()
+    got = _scatter_expert_count(ids, E + 1)
+    scatter_host = time.perf_counter() - t0
+    torch.cuda.synchronize()
+    assert torch.equal(got, ref)
+
+    torch.cuda._sleep(int(4e8))
+    t0 = time.perf_counter()
+    got_big = _scatter_expert_count(big, E + 1)          # fresh-ones path, also device-only
+    scatter_big_host = time.perf_counter() - t0
+    torch.cuda.synchronize()
+    assert torch.equal(got_big, torch.bincount(big, minlength=E + 1))
+
+    assert bincount_host > 0.02, \
+        f"probe invalid: bincount returned in {bincount_host*1e3:.3f} ms with work pending"
+    assert scatter_host < bincount_host / 10, \
+        f"scatter blocked host {scatter_host*1e3:.3f} ms vs bincount {bincount_host*1e3:.3f} ms"
+    assert scatter_big_host < bincount_host / 10, \
+        f"fresh-ones scatter blocked host {scatter_big_host*1e3:.3f} ms"
 
 
 def test_scatter_512_rows_sentinel_and_empty():
