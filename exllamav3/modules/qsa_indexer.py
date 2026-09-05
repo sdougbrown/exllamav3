@@ -662,7 +662,8 @@ class QSAIndexer(Module):
         from ..cache.quant import CacheLayer_quant
         q_rows = q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous()
         if (isinstance(layer, CacheLayer_quant) and layer.compand_a == 0.0 and
-                (layer.k_bits, layer.v_bits) == (8, 8) and attn.head_dim % 32 == 0):
+                2 <= layer.k_bits <= 8 and 2 <= layer.v_bits <= 8 and
+                attn.head_dim % 32 == 0):
             # Packed rows are H32-rotated by CacheLayer_quant. The gathered kernel uses the
             # shared paged-attention loaders, rotating Q/output once and dequantizing only the
             # selected rows. The indexer planes remain the fp16 tensors read above. H32 operates
@@ -684,9 +685,9 @@ class QSAIndexer(Module):
             )
         else:
             # Preserve existing cache behavior for unqualified widths or head geometry: use its
-            # established dequantization route, then the fp16 gathered kernel. Linear Q8/Q8
-            # with complete 32-value head groups never takes this path; companded Q8 remains on
-            # its existing safe route.
+            # established dequantization route, then the fp16 gathered kernel. Linear quantized
+            # caches (any 2..8-bit K/V widths) with complete 32-value head groups never take this
+            # path; companded caches remain on their existing safe route.
             k, v = layer.get_kv((cache_seqlens_cpu + seq).to(layer.device), block_table)
             o = qsa_sparse_attend_rows(
                 q_rows,

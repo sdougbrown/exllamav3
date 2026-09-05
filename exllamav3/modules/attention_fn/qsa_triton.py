@@ -244,7 +244,7 @@ if has_triton:
     @triton.jit(do_not_specialize = ["k_len", "num_pages_per_seq", "num_splits", "split_len"])
     def _qsa_sparse_split_quant_kernel(
         q,                   # (bsz, 1, n_q_heads, head_dim) fp16, normed + roped
-        k_cache,             # Q8 (pages, page_size, n_kv_heads, head_dim)
+        k_cache,             # quantized (pages, page_size, n_kv_heads, head_dim)
         v_cache,
         block_table,
         indices,             # (bsz, K_pad) i32 selected token positions, -1 padded
@@ -265,9 +265,11 @@ if has_triton:
         scale: tl.constexpr,
         BLOCK_H: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        K_BITS: tl.constexpr,
+        V_BITS: tl.constexpr,
         PAGED: tl.constexpr = 1,
     ):
-        """Q8 gathered GQA flash-decoding phase 1 over selected token indices."""
+        """Quantized gathered GQA flash-decoding phase 1 over selected token indices."""
         pid = tl.program_id(0)
         split = tl.program_id(1)
 
@@ -308,7 +310,7 @@ if has_triton:
                 tok = idx_c
 
             k_tile = _qc_load_kt(k_cache, k_scales, tok, kv_head, offs_d, valid_n,
-                                 8, n_kv_heads, head_dim)
+                                 K_BITS, n_kv_heads, head_dim)
             scores = tl.dot(q_tile, k_tile) * scale
 
             valid = valid_row[:, None] & valid_n[None, :]
@@ -322,7 +324,7 @@ if has_triton:
             l = l * alpha + tl.sum(p, axis = 1)
 
             v_tile = _qc_load_v(v_cache, v_scales, tok, kv_head, offs_d, valid_n,
-                                8, n_kv_heads, head_dim)
+                                V_BITS, n_kv_heads, head_dim)
             acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
             m = m_new
 
@@ -371,8 +373,9 @@ if has_triton:
         paged = block_table is not None
         if qc is not None:
             k_scales, v_scales, k_bits, v_bits = qc
-            if (k_bits, v_bits) != (8, 8):
-                raise ValueError("qsa_sparse_attend_rows online quantization requires Q8 K/V")
+            if not (2 <= k_bits <= 8 and 2 <= v_bits <= 8):
+                raise ValueError(
+                    "qsa_sparse_attend_rows online quantization requires K/V widths in 2..8 bits")
             from .triton_paged import _get_h32
             h32 = _get_h32(q.device)
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous() \
@@ -412,12 +415,13 @@ if has_triton:
                     K_pad, block_table.shape[1] if paged else 0, splits, split_len,
                     n_q_heads = H, n_kv_heads = kvh, page_size = page_size if paged else 1,
                     head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
-                    BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
+                    BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, K_BITS = k_bits, V_BITS = v_bits,
+                    PAGED = 1 if paged else 0,
                     num_warps = 4, num_stages = 2,
                 )
                 _paged_attn_decode_combine_kernel[(programs,)](
                     partial_o, partial_ml, o, h32, splits, q,
-                    QCV = 8, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
+                    QCV = v_bits, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
                     head_dim = hd, BLOCK_M = 1, BLOCK_H = BLOCK_H, BLOCK_ROWS = BLOCK_H,
                     num_warps = 4, num_stages = 1,
                 )

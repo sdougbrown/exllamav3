@@ -1,4 +1,4 @@
-"""QSA Q8 cache contracts: fp16 side planes and safe packed sparse gather routing."""
+"""QSA quantized cache contracts: fp16 side planes and packed sparse gather routing."""
 from __future__ import annotations
 
 import ast
@@ -120,10 +120,11 @@ def test_qsa_sparse_route_crosses_threshold_only_after_dense_exact_limit():
     )] == [False, False, True]
 
 
+@pytest.mark.parametrize("k_bits,v_bits", [(8, 8), (8, 4), (6, 6), (4, 4)])
 @torch.inference_mode()
-def test_qsa_q8_sparse_gather_crosses_a_scrambled_page_boundary_online(monkeypatch):
+def test_qsa_quant_sparse_gather_crosses_a_scrambled_page_boundary_online(monkeypatch, k_bits, v_bits):
     torch.manual_seed(1201)
-    layer = _layer()
+    layer = _layer(k_bits = k_bits, v_bits = v_bits)
     indexer = _indexer()
     total = PAGE_SIZE + 12
     table = torch.tensor([[1, 0]], device = DEVICE, dtype = torch.int32)
@@ -142,7 +143,7 @@ def test_qsa_q8_sparse_gather_crosses_a_scrambled_page_boundary_online(monkeypat
     monkeypatch.setattr(indexer, "select_indices_paged", lambda *_args: selected)
 
     def no_full_cache(*_args, **_kwargs):
-        pytest.fail("Q8 QSA sparse attention reconstructed a full fp16 cache")
+        pytest.fail(f"Q{v_bits} QSA sparse attention reconstructed a full fp16 cache")
 
     monkeypatch.setattr(layer, "get_kv", no_full_cache)
     online = indexer.sparse_attend(
@@ -155,7 +156,8 @@ def test_qsa_q8_sparse_gather_crosses_a_scrambled_page_boundary_online(monkeypat
     # checking the online packed loader against the exact selected logical rows.
     expected = _selected_oracle(layer, q, selected, table, seqlens + 1, 32 ** -0.5)
     assert expected.float().mean() < -0.1  # both logical pages contribute different values
-    torch.testing.assert_close(online[0, 0], expected, atol = 3e-2, rtol = 3e-2)
+    tol = 3e-2 if (k_bits, v_bits) == (8, 8) else 5e-2
+    torch.testing.assert_close(online[0, 0], expected, atol = tol, rtol = tol)
 
 
 @torch.inference_mode()
@@ -174,11 +176,13 @@ def test_qsa_fp16_sparse_gather_regression_matches_selected_rows():
     assert [arg.arg for arg in functions["_qsa_sparse_split_quant_kernel"].args.args][7:10] == [
         "k_scales", "v_scales", "h32",
     ]
+    assert "K_BITS: tl.constexpr" in Path(qsa_triton.__file__).read_text()
+    assert "V_BITS: tl.constexpr" in Path(qsa_triton.__file__).read_text()
     launcher = ast.get_source_segment(Path(qsa_triton.__file__).read_text(), functions["qsa_sparse_attend_rows"])
     assert "_qsa_sparse_split_kernel[(programs, splits)]" in launcher
     assert "_qsa_sparse_split_quant_kernel[(programs, splits)]" in launcher
     assert "partial_o, partial_ml, o, partial_ml, splits, partial_ml,\n                    QCV = 0" in launcher
-    assert "partial_o, partial_ml, o, h32, splits, q,\n                    QCV = 8" in launcher
+    assert "partial_o, partial_ml, o, h32, splits, q,\n                    QCV = v_bits" in launcher
 
     torch.manual_seed(1202)
     layer = CacheLayer_qsa(None, _attention(), 0, 2 * PAGE_SIZE)
@@ -202,9 +206,10 @@ def test_qsa_fp16_sparse_gather_regression_matches_selected_rows():
     torch.testing.assert_close(out[0, 0], _selected_oracle(layer, q, indices, table, seqlens + 1, 32 ** -0.5), atol = 3e-2, rtol = 3e-2)
 
 
-@pytest.mark.parametrize("bits,compand_a", [(4, 0.0), (8, 0.65)])
+@pytest.mark.parametrize("bits", [4, 8])
 @torch.inference_mode()
-def test_qsa_unqualified_sparse_keeps_the_existing_dequantized_gather_fallback(monkeypatch, bits, compand_a):
+def test_qsa_companded_sparse_keeps_the_existing_dequantized_gather_fallback(monkeypatch, bits):
+    compand_a = 0.65
     torch.manual_seed(1203)
     layer = _layer(bits = bits, compand_a = compand_a)
     indexer = _indexer()
