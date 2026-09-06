@@ -855,6 +855,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.hip_grouped_buffers = None
         self.support_hip_prefill = False
         self.hip_prefill_buffers = None
+        self._pf_assignments = 0
         self.hip_grouped_lora_blocked = False
         self._cpu_init_state()
 
@@ -869,6 +870,44 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return [s, [g + u, d]]
         else:
             return [[g + u, d]]
+
+
+    def _ensure_hip_prefill_buffers(self, num_tokens):
+        """Allocate the gfx12 prefill workspace sized to the actual chunk so chunk512
+        serving never reserves the full 2048-row envelope. Grows only if a larger
+        chunk routes later in the same process."""
+        top_k = self.num_experts_per_tok
+        assignments = num_tokens * top_k
+        if self.hip_prefill_buffers is not None and self._pf_assignments >= assignments:
+            return self.hip_prefill_buffers
+        device = self.device
+        H = self.hidden_size
+        I = self.intermediate_size_padded
+        rows = assignments // top_k
+        self.hip_prefill_buffers = HIPPrefillBuffers(
+            gu_had = g_tensor_cache.get(
+                device, (2 * assignments, H), torch.half, f"moe_gfx12_pf_gu_had_a{assignments}"),
+            gu_out = g_tensor_cache.get(
+                device, (2 * assignments, I), torch.half, f"moe_gfx12_pf_gu_out_a{assignments}"),
+            down_out = g_tensor_cache.get(
+                device, (assignments, H), torch.float, f"moe_gfx12_pf_down_out_a{assignments}"),
+            output = g_tensor_cache.get(
+                device, (rows, H), torch.float, f"moe_gfx12_pf_output_a{rows}"),
+            expert_offsets = g_tensor_cache.get(
+                device, (self.num_experts + 1,), torch.long, "moe_gfx12_pf_offsets"),
+            inverse_order = g_tensor_cache.get(
+                device, (assignments,), torch.long, f"moe_gfx12_pf_inverse_a{assignments}"),
+            expert_chunks = g_tensor_cache.get(
+                device,
+                (self.num_experts * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
+                torch.int,
+                "moe_gfx12_pf_chunks",
+            ),
+            chunk_count = g_tensor_cache.get(
+                device, (1,), torch.int, "moe_gfx12_pf_chunk_count"),
+        )
+        self._pf_assignments = assignments
+        return self.hip_prefill_buffers
 
 
     def invalidate_hip_grouped_for_lora(self, target: Linear):
@@ -1058,29 +1097,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
 
         if self.support_hip_prefill:
-            max_assignments = _HIP_PREFILL_MAX_ROWS * numex
-            self.hip_prefill_buffers = HIPPrefillBuffers(
-                gu_had = g_tensor_cache.get(
-                    device, (2 * max_assignments, H), torch.half, "moe_gfx12_pf_gu_had"),
-                gu_out = g_tensor_cache.get(
-                    device, (2 * max_assignments, I), torch.half, "moe_gfx12_pf_gu_out"),
-                down_out = g_tensor_cache.get(
-                    device, (max_assignments, H), torch.float, "moe_gfx12_pf_down_out"),
-                output = g_tensor_cache.get(
-                    device, (_HIP_PREFILL_MAX_ROWS, H), torch.float, "moe_gfx12_pf_output"),
-                expert_offsets = g_tensor_cache.get(
-                    device, (self.num_experts + 1,), torch.long, "moe_gfx12_pf_offsets"),
-                inverse_order = g_tensor_cache.get(
-                    device, (max_assignments,), torch.long, "moe_gfx12_pf_inverse"),
-                expert_chunks = g_tensor_cache.get(
-                    device,
-                    (self.num_experts * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
-                    torch.int,
-                    "moe_gfx12_pf_chunks",
-                ),
-                chunk_count = g_tensor_cache.get(
-                    device, (1,), torch.int, "moe_gfx12_pf_chunk_count"),
-            )
+            # Workspace is allocated lazily at dispatch sized to the actual chunk
+            # (see _ensure_hip_prefill_buffers), not reserved at the 2048-row cap, so
+            # chunk512 serving does not overallocate VRAM.
+            self.hip_prefill_buffers = None
+            self._pf_assignments = 0
 
         if (self.support_quant_paths or self.support_bc_bsz1) \
                 and not self.config.infer_params.no_reconstruct:
@@ -1293,6 +1314,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.hip_grouped_buffers = None
         self.support_hip_prefill = False
         self.hip_prefill_buffers = None
+        self._pf_assignments = 0
         self.hip_grouped_lora_blocked = False
         if self.multi_gate is not None:
             self.multi_gate.unload()
@@ -1521,7 +1543,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     not params.get("reconstruct") and not params.get("autosplit_measure")
                 )
                 if hip_prefill_eligible:
-                    buffers = self.hip_prefill_buffers
+                    buffers = self._ensure_hip_prefill_buffers(num_tokens)
                     assignments = num_tokens * top_k
                     output = buffers.output[:num_tokens]
                     ext.exl3_moe_gfx12_k3_prefill(
