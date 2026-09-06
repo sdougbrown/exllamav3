@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -262,6 +263,7 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        self.mtp_deferred_prefill = os.environ.get("EXL3_MTP_DEFERRED_PREFILL", "0") == "1"
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
@@ -316,6 +318,12 @@ class Generator:
             int: (List of) unique serial number(s) for job(s)
         """
 
+        if self.mtp_deferred_prefill:
+            from .mtp_deferred import validate_deferred_job
+            if isinstance(job, list):
+                raise ValueError("deferred MTP does not support job lists")
+            validate_deferred_job(self, job)
+
         if isinstance(job, list):
             serials = []
             for j in job:
@@ -323,6 +331,9 @@ class Generator:
             return serials
 
         job.prepare_for_queue(self, self.job_serial)
+        if self.mtp_deferred_prefill:
+            from .mtp_deferred import DeferredMTPPrefill
+            job._mtp_deferred = DeferredMTPPrefill(len(job.sequences[0].sequence_ids) - 1)
         self.job_serial += 1
         self.pending_jobs.append(job)
         return job.serial_number

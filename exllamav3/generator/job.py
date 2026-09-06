@@ -329,6 +329,7 @@ class Job:
 
         # MTP state
         self.mtp_last_hidden = None
+        self._mtp_deferred = None
 
 
     def get_pinned_logit_mask(self):
@@ -372,6 +373,8 @@ class Job:
 
 
     def is_prefill_done(self):
+        if self._mtp_deferred is not None and not self._mtp_deferred.complete:
+            return False
         return all(seq.kv_position == len(seq.sequence_ids) - 1 for seq in self.sequences)
 
 
@@ -604,6 +607,8 @@ class Job:
 
 
     def _invalidate_mtp_carry(self):
+        if self._mtp_deferred is not None:
+            self._mtp_deferred.abort()
         self.mtp_last_hidden = None
         for sequence in self.sequences:
             sequence.mtp_carry_hidden = None
@@ -1233,6 +1238,25 @@ class Job:
                 ev.record()
 
 
+    def _catch_up_mtp_prefill(self, seq):
+        def replay(start, end, hidden):
+            cache_seqlens = self._prefill_staged_cache_seqlens(start)
+            self.generator.draft_model.prefill(
+                input_ids = seq.sequence_ids.torch_slice(start, end),
+                params = {
+                    "target_hidden": hidden,
+                    "attn_mode": "flash_attn",
+                    "block_table": seq.block_index_tensor,
+                    "cache": self.generator.draft_cache,
+                    "cache_seqlens": cache_seqlens,
+                    "indexed_embeddings": None,
+                },
+            )
+            self._prefill_record_cache_seqlens_dma()
+        seq.mtp_carry_hidden = self._mtp_deferred.drain(replay)
+        self.mtp_last_hidden = seq.mtp_carry_hidden
+
+
     def prefill(self, results: list):
         """
         Run prompt prefill chunks for already allocated cache pages.
@@ -1402,6 +1426,8 @@ class Job:
                             "cache_seqlens": params["cache_seqlens"],
                         }
                     )
+                elif self._mtp_deferred is not None:
+                    self._mtp_deferred.append(prefill_start, prefill_end, params["export_states"][-1])
                 elif self.generator.draft_model:
                     if self.generator.mtp_draft:
                         target_hidden = params.get("export_states")[-1]
@@ -1454,6 +1480,8 @@ class Job:
 
                 progress += prefill_end - prefill_start
                 if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:
+                    if self._mtp_deferred is not None:
+                        self._catch_up_mtp_prefill(seq)
                     seq.prefill_complete = True
 
                 if recurrent_last_page:
@@ -1516,11 +1544,20 @@ class Job:
 
 
     def deallocate_pages(self):
+        if self._mtp_deferred is not None:
+            self._mtp_deferred.abort()
+            self._invalidate_mtp_carry()
         self.free_recurrent_state()
         for seq in self.sequences:
             if seq.allocated_pages is not None:
                 self.pagetable.deallocate_pages(seq.allocated_pages)
+                if self._mtp_deferred is not None:
+                    # Target-only pages must never advertise reusable, complete draft history.
+                    for page in seq.allocated_pages:
+                        page.clear()
                 seq.allocated_pages = []
+        if self._mtp_deferred is not None and self.generator.recurrent_cache is not None:
+            self.generator.recurrent_cache.prune_stranded()
 
 
     def prepare_sampling_past_ids(self):
