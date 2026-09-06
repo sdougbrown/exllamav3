@@ -55,7 +55,7 @@ def _moe_sync_free_count() -> bool:
 
 
 # Persistent all-ones source for the sync-free expert histogram, one per device. Sized
-# to the max assignments of the gfx12 prefill route (512 rows x top-k 10).
+# to the max assignments of the gfx12 prefill route (2048 rows x top-k 10).
 _moe_sync_free_ones = {}
 
 
