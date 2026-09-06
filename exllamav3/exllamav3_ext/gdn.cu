@@ -657,7 +657,8 @@ void cuda_recurrent_gated_delta_rule_kernel
     }
 }
 
-template <bool save_history, int V_SPLIT, bool CHANNELWISE = false>
+template <bool save_history, int V_SPLIT, bool CHANNELWISE = false, bool TRACE = false,
+          bool FIXED_ORDER = false>
 __global__ __launch_bounds__(128 * SUBK)
 void cuda_recurrent_gated_delta_rule_kernel_128
 (
@@ -708,12 +709,16 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     int v_chunk = blockIdx.z;
     int v_start = v_chunk * V_CHUNK_DIM;
 
+    // Isolated one-token diagnostics reserve slot 1 for [head, 16, 128] trace planes.
+    float* trace = TRACE ? recurrent_state + slot_size + head * 16 * HEAD_DIM : nullptr;
+
     __shared__ float sh_red[2][HEAD_DIM / 32];
     __shared__ float sh_k[HEAD_DIM];
     __shared__ float sh_q[HEAD_DIM];
     __shared__ float sh_dot1[HEAD_DIM];
     __shared__ float sh_dot2[HEAD_DIM];
     __shared__ float sh_g[CHANNELWISE ? HEAD_DIM : 1];
+    __shared__ float sh_partials[FIXED_ORDER ? SUBK : 1][HEAD_DIM];
 
     for (int s = 0; s < seqlen; ++s)
     {
@@ -771,6 +776,16 @@ void cuda_recurrent_gated_delta_rule_kernel_128
         k = k * rsqrtf(sumk + 1e-6f);
         sh_k[t] = k;
         sh_q[t] = q;
+        if constexpr (TRACE)
+        {
+            if (bt == 0 && v_chunk == 0)
+            {
+                trace[t] = q;
+                trace[HEAD_DIM + t] = k;
+                trace[7 * HEAD_DIM + t] = __expf(g[head]);
+                trace[13 * HEAD_DIM + t] = __bfloat162float(beta[head]);
+            }
+        }
         if constexpr (CHANNELWISE)
             sh_g[t] = __expf(g[head * HEAD_DIM + t]);
 
@@ -801,9 +816,31 @@ void cuda_recurrent_gated_delta_rule_kernel_128
                         sum = sum + *sh_k_rd * *rs_rd;
                 }
             }
-            atomicAdd(sh_dot1 + t, sum);
+            if constexpr (TRACE)
+                trace[(2 + bt) * HEAD_DIM + v_start + t] = sum;
+            if constexpr (FIXED_ORDER)
+                sh_partials[bt][t] = sum;
+            else
+                atomicAdd(sh_dot1 + t, sum);
         }
         __syncthreads();
+
+        if constexpr (FIXED_ORDER)
+        {
+            if (t < V_CHUNK_DIM && bt == 0)
+            {
+                float sum = 0.0f;
+                #pragma unroll
+                for (int part = 0; part < SUBK; ++part)
+                    sum = __fadd_rn(sum, sh_partials[part][t]);
+                sh_dot1[t] = sum;
+            }
+            __syncthreads();
+        }
+
+        if constexpr (TRACE)
+            if (t < V_CHUNK_DIM && bt == 0)
+                trace[6 * HEAD_DIM + v_start + t] = sh_dot1[t];
 
         if (t < V_CHUNK_DIM)
         {
@@ -830,9 +867,31 @@ void cuda_recurrent_gated_delta_rule_kernel_128
                     v_out = v_out + *sh_q_rd * state;
                 }
             }
-            atomicAdd(sh_dot2 + t, v_out);
+            if constexpr (TRACE)
+                trace[(8 + bt) * HEAD_DIM + v_start + t] = v_out;
+            if constexpr (FIXED_ORDER)
+                sh_partials[bt][t] = v_out;
+            else
+                atomicAdd(sh_dot2 + t, v_out);
         }
         __syncthreads();
+
+        if constexpr (FIXED_ORDER)
+        {
+            if (t < V_CHUNK_DIM && bt == 0)
+            {
+                float sum = 0.0f;
+                #pragma unroll
+                for (int part = 0; part < SUBK; ++part)
+                    sum = __fadd_rn(sum, sh_partials[part][t]);
+                sh_dot2[t] = sum;
+            }
+            __syncthreads();
+        }
+
+        if constexpr (TRACE)
+            if (t < V_CHUNK_DIM && bt == 0)
+                trace[12 * HEAD_DIM + v_start + t] = sh_dot2[t];
 
         if (t < V_CHUNK_DIM && bt == 0)
             out[t] = __float2bfloat16_rz(sh_dot2[t] * scale);
@@ -979,7 +1038,40 @@ void cuda_recurrent_gated_delta_rule_gr
         }                                                                                 \
     }
 
-    if (channelwise)
+    // Reference controls are opt-in; normalization, decay and FP32 partial arithmetic stay unchanged.
+    const char* fixed_env = std::getenv("EXL3_DIAGNOSTIC_GDN_FIXED_ORDER");
+    const bool fixed_order = fixed_env && !std::strcmp(fixed_env, "1");
+    if (fixed_order)
+        TORCH_CHECK(!channelwise && k_head_dim == 128 && v_head_dim == 128,
+                    "GDN fixed-order diagnostic supports only headwise 128x128 decay");
+    const char* trace_env = std::getenv("EXL3_DIAGNOSTIC_GDN_TRACE");
+    const bool diagnostic_trace = trace_env && !std::strcmp(trace_env, "1");
+    if (diagnostic_trace)
+    {
+        TORCH_CHECK(!graph && !history && !channelwise && !slots.has_value() &&
+                    bsz == 1 && seqlen == 1 && k_head_dim == 128 && v_head_dim == 128 &&
+                    v_split == 4 && recurrent_state.size(0) == 2,
+                    "GDN trace requires an isolated 128x128 one-token call, no slots/history/graph, "
+                    "and a second state slot reserved for trace planes");
+        if (fixed_order) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 4, false, true, true>)
+        else             LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 4, false, true>)
+    }
+    else if (fixed_order)
+    {
+        if (!history)
+        {
+            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 4, false, false, true>)
+            else if (v_split == 2) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 2, false, false, true>)
+            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 1, false, false, true>)
+        }
+        else
+        {
+            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 4, false, false, true>)
+            else if (v_split == 2) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 2, false, false, true>)
+            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 1, false, false, true>)
+        }
+    }
+    else if (channelwise)
     {
         if (!history)
         {

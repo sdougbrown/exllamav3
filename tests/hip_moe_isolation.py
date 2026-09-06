@@ -219,7 +219,7 @@ def replay(out, repeats, rows=None, sentinel=False):
     (out/'exposed-stage-reference.json').write_text(json.dumps(reference,indent=2))
 
 
-def module_replay(out, repeats, force_routing=False):
+def module_replay(out, repeats, force_routing=False, stable_ties=False):
     load_harness()
     import torch
     from exllamav3 import Config, Model
@@ -231,6 +231,10 @@ def module_replay(out, repeats, force_routing=False):
     mlp.load(device=torch.device('cuda:0'))
     assert not mlp.router_pre_norm and not mlp.routed_pre_norm and not mlp.alt_residual_channel
     x = frozen['x'].cuda().view(1, 512, 2560)
+    restore_router = None
+    if stable_ties:
+        from hip_stable_router_control import install
+        restore_router = install()
     if force_routing:
         selected = frozen['selected'].cuda()
         weights = frozen['weights'].cuda()
@@ -271,16 +275,19 @@ def module_replay(out, repeats, force_routing=False):
             print(json.dumps(results[-1]),flush=True)
             (out/f'{label}.json').write_text(json.dumps(results,indent=2))
         torch.save(base,out/f'{label}-base.pt')
-        if force_routing:
+        if force_routing or stable_ties:
             assert all(s['different'] == 0 and s['finite'] for r in results for s in r['stats'].values())
+            assert all(len({r['stats'][name]['digest'] for r in results}) == 1 for name in base)
     finally:
+        if restore_router is not None:
+            restore_router()
         ext.exl3_moe_gfx12_k3_prefill = original
         for m,f in wrappers:
             m.forward = f
         mlp.unload()
 
 
-def router_replay(out, repeats):
+def router_replay(out, repeats, stable_ties=False):
     load_harness()
     import torch
     from exllamav3 import Config, Model
@@ -303,12 +310,27 @@ def router_replay(out, repeats):
     for rep in range(repeats):
         repeated_scores = torch.matmul(x, gate).float()
         assert torch.equal(scores, repeated_scores)
-        values, indices = torch.topk(scores, 10, dim=-1)
+        old_values, old_indices = torch.topk(scores, 10, dim=-1)
+        if stable_ties:
+            from hip_stable_router_control import stable_topk
+            values, indices = stable_topk(scores, 10)
+            assert values.is_contiguous()
+            assert torch.equal(values, old_values)
+            assert torch.equal(torch.softmax(values, -1).half(), torch.softmax(old_values, -1).half())
+            unique = (scores.unsqueeze(1) == values.unsqueeze(-1)).sum(-1) == 1
+            assert torch.equal(indices[unique], old_indices[unique])
+            oracle = torch.tensor([sorted(range(row.numel()), key=lambda e: (-float(row[e]), e))[:10]
+                                   for row in scores_cpu])
+            assert torch.equal(indices.cpu(), oracle)
+        else:
+            values, indices = old_values, old_indices
         cpu_ids = indices.cpu().clone()
         cpu_values = values.cpu().clone()
         gathered = scores_cpu.gather(1, cpu_ids)
         if base is None:
             base = cpu_ids
+        if stable_ties:
+            assert torch.equal(cpu_ids, base)
         assert torch.equal(cpu_values, expected_values)
         assert torch.equal(gathered, expected_values)
         assert all(len(set(row)) == 10 for row in cpu_ids.tolist())
@@ -340,7 +362,10 @@ if __name__ == '__main__':
     parser.add_argument('mode', choices=['capture', 'replay', 'module', 'router'])
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--repeats', type=int, default=12)
-    parser.add_argument('--force-routing', action='store_true')
+    controls = parser.add_mutually_exclusive_group()
+    controls.add_argument('--force-routing', action='store_true')
+    controls.add_argument('--stable-router-ties', action='store_true',
+                          help='diagnostic only: stable exact ties in the torch router fallback')
     parser.add_argument('--rows', type=int, choices=[2,16,17,32,512])
     parser.add_argument('--sentinel', action='store_true')
     args = parser.parse_args()
@@ -354,8 +379,8 @@ if __name__ == '__main__':
     if args.mode == 'capture':
         capture(args.out)
     elif args.mode == 'module':
-        module_replay(args.out, args.repeats, args.force_routing)
+        module_replay(args.out, args.repeats, args.force_routing, args.stable_router_ties)
     elif args.mode == 'router':
-        router_replay(args.out, args.repeats)
+        router_replay(args.out, args.repeats, args.stable_router_ties)
     else:
         replay(args.out, args.repeats, args.rows, args.sentinel)
