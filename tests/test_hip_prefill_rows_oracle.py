@@ -111,8 +111,9 @@ def test_gfx12_prefill_rows_1024_2048_oracle(monkeypatch):
         # Fast route at 2048-row prefill chunks.
         mode["name"] = "fast"
         monkeypatch.setenv("EXL3_HIP_GROUPED_MOE_PREFILL", "1")
-        ftokens.set_()  # ensure reference tokens drive nothing here (no forcing)
-        ttokens, tlogits = _generate(model, oracle_cache, tokenizer, ids, forced=ftokens)
+        # Force the same continuation so the prefill logits are comparable at the same tokens.
+        forced = ftokens.reshape(1, -1).contiguous()
+        ttokens, tlogits = _generate(model, oracle_cache, tokenizer, ids, forced=forced)
 
         # The fast route must have handled a full 2048-row prefill chunk.
         assert prefill_rows["fast"], "fast route never invoked"
