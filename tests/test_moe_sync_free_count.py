@@ -41,7 +41,7 @@ def test_scatter_matches_bincount_empty_experts():
 
 def test_scatter_long_index():
     E = 512
-    ids = torch.randint(0, E + 1, (10240,), device=DEV)
+    ids = torch.randint(0, E + 1, (_HIP_PREFILL_MAX_EXPERT_ROWS + 1,), device=DEV)
     assert ids.shape[0] > _HIP_PREFILL_MAX_EXPERT_ROWS
     result = _scatter_expert_count(ids, E + 1)
     expected = torch.bincount(ids, minlength=E + 1)

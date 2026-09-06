@@ -100,7 +100,10 @@ def check_exposed_stages(inputs, projections, buffers):
     expected_offsets = torch.cat((torch.zeros(1,dtype=torch.long), counts[:experts].cumsum(0)))
     assert torch.equal(buffers['offsets'], expected_offsets)
     assert torch.equal(buffers['inverse'], order.argsort())
-    chunks = [expert * 320 + chunk for expert in range(experts)
+    # 320 == 512*10/16, the MOE_PREFILL_CHUNKS_PER_EXPERT stride at the old 512 cap;
+    # 1280 is the same stride at the 2048 cap (MOE_PREFILL_MAX_EXPERT_ROWS//16).
+    STRIDE = 1280
+    chunks = [expert * STRIDE + chunk for expert in range(experts)
               for chunk in range((int(counts[expert]) + 15) // 16)]
     assert torch.equal(buffers['chunks'], torch.tensor(chunks, dtype=torch.int))
     assert int(buffers['chunk_count']) == len(chunks)
@@ -182,7 +185,7 @@ def replay(out, repeats, rows=None, sentinel=False):
              'gu_out': ((2 * assignments, intermediate), torch.float16),
              'down_out': ((assignments, hidden), torch.float32),
              'offsets': ((experts + 1,), torch.long), 'inverse': ((assignments,), torch.long),
-             'chunks': ((experts * 320,), torch.int), 'chunk_count': ((1,), torch.int)}
+             'chunks': ((experts * 1280,), torch.int), 'chunk_count': ((1,), torch.int)}
     buffers = {k: torch.empty(shape, dtype=dtype, device='cuda') for k, (shape, dtype) in specs.items()}
     base = None
     results = []

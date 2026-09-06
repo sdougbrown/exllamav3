@@ -44,7 +44,7 @@ namespace {
 constexpr int MOE_HIDDEN = 2560;
 constexpr int MOE_TOP_K = 10;
 constexpr int MOE_MAX_ROWS = 16;
-constexpr int MOE_PREFILL_MAX_ROWS = 512;
+constexpr int MOE_PREFILL_MAX_ROWS = 2048;
 constexpr int MOE_PREFILL_ROWS_PER_CHUNK = 16;
 constexpr int MOE_PREFILL_MAX_EXPERT_ROWS = MOE_PREFILL_MAX_ROWS * MOE_TOP_K;
 constexpr int MOE_PREFILL_CHUNKS_PER_EXPERT =
@@ -634,7 +634,7 @@ void exl3_moe_gfx12_k3_prefill
     TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.dtype() == at::kHalf &&
                 A.dim() == 2 && A.size(1) == MOE_HIDDEN &&
                 A.size(0) >= 2 && A.size(0) <= MOE_PREFILL_MAX_ROWS,
-                "exl3_moe_gfx12_k3_prefill requires contiguous fp16[R, 2560], R=2..512");
+                "exl3_moe_gfx12_k3_prefill requires contiguous fp16[R, 2560], R=2..2048");
     const int rows = A.size(0);
     const int assignments = rows * MOE_TOP_K;
     TORCH_CHECK(output.device() == A.device() && output.is_contiguous() &&

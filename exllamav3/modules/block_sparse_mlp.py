@@ -39,9 +39,9 @@ def _hip_grouped_max_rows() -> int:
 
 
 _HIP_GROUPED_MAX_ROWS = _hip_grouped_max_rows()
-# The native prefill binding follows the grouped cap boundary and accepts rows 2..512.
+# The native prefill binding follows the grouped cap boundary and accepts rows 2..2048.
 _HIP_PREFILL_MIN_ROWS = _HIP_GROUPED_MAX_ROWS + 1
-_HIP_PREFILL_MAX_ROWS = 512
+_HIP_PREFILL_MAX_ROWS = 2048
 _HIP_PREFILL_MAX_EXPERT_ROWS = _HIP_PREFILL_MAX_ROWS * _HIP_ROUTER_TOP_K
 
 
@@ -61,7 +61,7 @@ def _moe_sync_free_count() -> bool:
 
 
 # Persistent all-ones source for the sync-free expert histogram, one per device. Sized
-# to the max assignments of the gfx12 prefill route (512 rows x top-k 10).
+# to the max assignments of the gfx12 prefill route (2048 rows x top-k 10).
 _moe_sync_free_ones = {}
 
 
