@@ -89,7 +89,10 @@ class Model_TPMixin:
         self.mp_child_conn: list = [None] * (num_devices + 1)
         self.tp_producer = SMProducer(buffer_size = 64 * 1024**2)
 
-        for rank, device in enumerate(self.active_devices + [-1]):
+        # The -1 CPU helper slot exists to run native CPU-assisted reductions; the distributed
+        # backend has no CPU work, so the slot is only spawned for the native backend
+        cpu_slot = [-1] if self.tp_backend == "native" else []
+        for rank, device in enumerate(self.active_devices + cpu_slot):
             log_tp(None, f"Spawning child process: {device}")
             if self.tp_output_device == device:
                 self.mp_parent_conn[device] = PseudoParentConn(
@@ -618,7 +621,8 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
-        self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
+        if self.tp_backend == "native":
+            self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
         x, reserve = self.prepare_inputs_for_tp(x, params)
         # active_devices order sends work to spawned CUDA workers first and the main-process output device last.
@@ -638,7 +642,8 @@ class Model_TPMixin:
         r = self.tp_worker_result(self.tp_output_device)
         assert r is None, "TP logic error"
         self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
-        self.tp_pending_acks.append(-1)
+        if self.tp_backend == "native":
+            self.tp_pending_acks.append(-1)
         # See forward_tp: the exported recurrent-state handles must outlive the deferred acks
         self.tp_pending_refs = (args, params.get("recurrent_states"))
         self.restore_tp_params(params, reserve)
@@ -652,7 +657,8 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
-        self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
+        if self.tp_backend == "native":
+            self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
         x, reserve = self.prepare_inputs_for_tp(x, params)
         # Keep the output-device pseudo-worker last for the same reason as prefill_tp(): its send() path executes
@@ -672,7 +678,8 @@ class Model_TPMixin:
         out = self.tp_worker_result(self.tp_output_device)
         assert out is not None, "TP logic error"
         self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
-        self.tp_pending_acks.append(-1)
+        if self.tp_backend == "native":
+            self.tp_pending_acks.append(-1)
         # Pin the exported recurrent-state handles too: restore_tp_params swaps them out of the
         # params dict in place, so holding args alone would not keep their shared storages alive
         self.tp_pending_refs = (args, params.get("recurrent_states"))
