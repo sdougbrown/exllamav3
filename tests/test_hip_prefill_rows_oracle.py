@@ -39,9 +39,9 @@ def _gfx12_devices():
 
 def _pad_ids(tokenizer, length):
     base = tokenizer.encode(BASE_PROMPT, add_bos=True)
-    base = base.reshape(-1).long()  # encode() already returns a tensor; ensure 1-D
+    base = base.reshape(-1).long()  # flatten to 1-D
     reps = -(-length // len(base))
-    return base.repeat(reps)[:length]
+    return base.repeat(reps)[:length].unsqueeze(0)  # Job wants [1, seq_len]
 
 
 def _generate(model, cache, tokenizer, ids, forced=None):
