@@ -61,8 +61,10 @@ class CacheLayer_qsa(CacheLayer_fp16):
 
     @override
     def storage_size(self):
-        return super().storage_size() + \
-            (np.prod(self.raw_k_shape) + np.prod(self.pooled_shape)) * torch.half.itemsize
+        return super().storage_size() + self.plane_storage_size()
+
+    def plane_storage_size(self):
+        return (np.prod(self.raw_k_shape) + np.prod(self.pooled_shape)) * torch.half.itemsize
 
     @override
     def tp_export(self, plan):
@@ -131,8 +133,10 @@ class CacheLayer_qsa_quant(CacheLayer_quant):
 
     @override
     def storage_size(self):
-        return super().storage_size() + \
-            (np.prod(self.raw_k_shape) + np.prod(self.pooled_shape)) * torch.half.itemsize
+        return super().storage_size() + self.plane_storage_size()
+
+    def plane_storage_size(self):
+        return (np.prod(self.raw_k_shape) + np.prod(self.pooled_shape)) * torch.half.itemsize
 
     @override
     def tp_export(self, plan):

@@ -54,18 +54,23 @@ class QSAIndexer(Module):
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         qbits_key: str = "bits",
+        index_qk_proj: Module | None = None,
+        q_layernorm: RMSNorm | None = None,
+        k_layernorm: RMSNorm | None = None,
     ):
         super().__init__(config = config, key = key, qmap = None)
         assert kv_heads == 1, "QSAIndexer assumes a single raw key head"
         self.hidden_size = hidden_size
         self.n_heads = n_heads
+        self.kv_heads = kv_heads
         self.head_dim = head_dim
         self.token_budget = token_budget
         self.compress_ratio = compress_ratio
+        self.rms_norm_eps = rms_norm_eps
         self.block_topk = token_budget // compress_ratio
         self.scale = 1.0 / math.sqrt(head_dim)
 
-        self.index_qk_proj = Linear(
+        self.index_qk_proj = index_qk_proj if index_qk_proj is not None else Linear(
             config = config,
             key = f"{key}.index_qk_proj",
             in_features = hidden_size,
@@ -74,8 +79,10 @@ class QSAIndexer(Module):
             out_dtype = torch.half,
             qbits_key = qbits_key,
         )
-        self.q_layernorm = RMSNorm(config, f"{key}.q_layernorm", rms_norm_eps, constant_bias = 1.0)
-        self.k_layernorm = RMSNorm(config, f"{key}.k_layernorm", rms_norm_eps, constant_bias = 1.0)
+        self.q_layernorm = q_layernorm if q_layernorm is not None else \
+            RMSNorm(config, f"{key}.q_layernorm", rms_norm_eps, constant_bias = 1.0)
+        self.k_layernorm = k_layernorm if k_layernorm is not None else \
+            RMSNorm(config, f"{key}.k_layernorm", rms_norm_eps, constant_bias = 1.0)
         self.register_submodule(self.index_qk_proj)
         self.register_submodule(self.q_layernorm)
         self.register_submodule(self.k_layernorm)
@@ -83,6 +90,48 @@ class QSAIndexer(Module):
     @override
     def optimizer_targets(self):
         return self.index_qk_proj.optimizer_targets()
+
+    def storage_size(self):
+        """Replicated fp16 storage of the indexer and its norms (shape-derived, no stc)."""
+        return self.weights_numel() * 2
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        return {
+            "cls": QSAIndexer,
+            "kwargs": {
+                "key": self.key,
+                "hidden_size": self.hidden_size,
+                "n_heads": self.n_heads,
+                "kv_heads": self.kv_heads,
+                "head_dim": self.head_dim,
+                "token_budget": self.token_budget,
+                "compress_ratio": self.compress_ratio,
+                "rms_norm_eps": self.rms_norm_eps,
+            },
+            "index_qk_proj": self.index_qk_proj.tp_export(plan, producer),
+            "q_layernorm": self.q_layernorm.tp_export(plan, producer),
+            "k_layernorm": self.k_layernorm.tp_export(plan, producer),
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        module = QSAIndexer(
+            config = None,
+            **exported["kwargs"],
+            index_qk_proj = exported["index_qk_proj"]["cls"].tp_import(
+                local_context, exported["index_qk_proj"], plan),
+            q_layernorm = exported["q_layernorm"]["cls"].tp_import(
+                local_context, exported["q_layernorm"], plan),
+            k_layernorm = exported["k_layernorm"]["cls"].tp_import(
+                local_context, exported["k_layernorm"], plan),
+        )
+        module.device = device
+        torch.cuda.synchronize()
+        return module
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
