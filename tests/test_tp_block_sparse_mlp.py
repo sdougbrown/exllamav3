@@ -58,13 +58,23 @@ class _Backend:
 def _mlp(shared, local=1, reduce=True):
     m = bsm.BlockSparseMLP.__new__(bsm.BlockSparseMLP)
     m.alt_residual_channel = False; m.hidden_size = 1; m.router_pre_norm = None; m.routed_pre_norm = None
-    m.routing_gate = object(); m.routing_cfg = None; m.routing_fn = lambda *a: (torch.tensor([[0]]), torch.ones(1, 1))
+    m.routing_gate = object(); m.routing_cfg = None
+    m.routing_fn_calls = 0
+    def routing_fn(*args):
+        m.routing_fn_calls += 1
+        return torch.tensor([[0]]), torch.ones(1, 1)
+    m.routing_fn = routing_fn
     m.routing_device = None; m.cpu_split_first = None; m.cpu_offload = True
     m.intermediate_size = 1; m.num_local_experts = local; m.num_experts_per_tok = 1
     m.shared_experts = shared; m.shared_gate = None; m.tp_reduce = reduce
+    m.tp_mode = "experts" if reduce else None
     m.routed_post_norm = None; m.shared_experts_post_norm = None; m.bc = None
     m.cpu_split_combine = lambda y, *_: y
-    m.cpu_offload_forward = lambda *args: torch.full_like(args[1], 2.0)
+    m.cpu_offload_forward_calls = 0
+    def cpu_offload_forward(*args):
+        m.cpu_offload_forward_calls += 1
+        return torch.full_like(args[1], 2.0)
+    m.cpu_offload_forward = cpu_offload_forward
     return m
 
 
@@ -75,9 +85,12 @@ def test_forward_routes_then_adds_replicated_shared(local, reduce, expected, cal
     class Shared:
         def forward(self, x, params): return torch.full_like(x, 3.0)
     backend = _Backend()
-    out = _mlp(Shared(), local, reduce).forward(torch.ones(1, 1), {"backend": backend})
+    mlp = _mlp(Shared(), local, reduce)
+    out = mlp.forward(torch.ones(1, 1), {"backend": backend})
     assert out.item() == expected
     assert backend.calls == calls
+    assert mlp.routing_fn_calls == 1
+    assert mlp.cpu_offload_forward_calls == 1
 
 
 def test_multilinear_pointer_table_is_local_list():
@@ -91,8 +104,13 @@ def test_multilinear_pointer_table_is_local_list():
         def __init__(self): self.inner = Inner()
     ls = [L(), L()]
     table = MultiLinear(torch.device("cpu"), ls)
-    assert table.ptrs_trellis.numel() == len(ls)
-    assert table.ptrs_trellis.tolist() == [x.inner.trellis.data_ptr() for x in ls]
+    for ptrs, values in (
+        (table.ptrs_trellis, [x.inner.trellis.data_ptr() for x in ls]),
+        (table.ptrs_suh, [x.inner.suh.data_ptr() for x in ls]),
+        (table.ptrs_svh, [x.inner.svh.data_ptr() for x in ls]),
+    ):
+        assert ptrs.numel() == len(ls)
+        assert ptrs.tolist() == values
     ids = bsm._map_expert_ids_to_local(torch.tensor([4, 5, 6]), 4, 6)
     assert ids.tolist() == [0, 1, 2]
     assert bsm._scatter_expert_count(ids, 3).tolist() == [1, 1, 1]
