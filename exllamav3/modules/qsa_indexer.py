@@ -92,8 +92,15 @@ class QSAIndexer(Module):
         return self.index_qk_proj.optimizer_targets()
 
     def storage_size(self):
-        """Replicated fp16 storage of the indexer and its norms (shape-derived, no stc)."""
-        return self.weights_numel() * 2
+        """Replicated fp16 storage of the indexer and its norms (shape-derived, no stc).
+        Uses the project's pre-load int; norms' weights may not be materialized yet, so
+        coalesce None to 0."""
+        s = self.index_qk_proj.storage_size()
+        for m in (self.q_layernorm, self.k_layernorm):
+            n = m.weights_numel()
+            if n:
+                s += n * 2
+        return s
 
     def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
