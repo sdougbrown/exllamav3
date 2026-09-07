@@ -83,13 +83,14 @@ def _pool_for(device_index: int):
 
 
 class _BlockGraphSlot:
-    __slots__ = ("graph", "x_in", "slots_dev", "last_used")
+    __slots__ = ("graph", "x_in", "slots_dev", "last_used", "slots_src_id")
 
     def __init__(self, graph, x_in, slots_dev, stamp):
         self.graph = graph
         self.x_in = x_in
         self.slots_dev = slots_dev
         self.last_used = stamp
+        self.slots_src_id = None
 
 
 class BlockGraphRunner:
@@ -281,7 +282,17 @@ class BlockGraphRunner:
         slot.last_used = self.stamp
         try:
             slot.x_in.copy_(x)
-            slot.slots_dev.copy_(params["recurrent_slots"])
+            # Slot ids are immutable per slot-tuple: the live CPU tensor is _static_dev_cache
+            # with a persistent per-device copy. Refresh the graph's fixed-address slots buffer
+            # with a stream-ordered D2D copy only when the source object changes (job slot
+            # reassignment); same-tuple continuations upload nothing (a blocking pageable H2D
+            # here would drain the queue once per captured block).
+            live = params["recurrent_slots"]
+            if live.data_ptr() != slot.slots_src_id:
+                from ..util.tensor import get_for_device
+                live_dev = get_for_device(params, "recurrent_slots", x.device)
+                slot.slots_dev.copy_(live_dev)
+                slot.slots_src_id = live.data_ptr()
             with torch.cuda.device(x.device):
                 slot.graph.replay()
         except Exception as e:
