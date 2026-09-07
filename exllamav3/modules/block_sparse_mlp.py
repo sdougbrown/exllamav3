@@ -46,8 +46,9 @@ _HIP_PREFILL_MAX_EXPERT_ROWS = _HIP_PREFILL_MAX_ROWS * _HIP_ROUTER_TOP_K
 
 
 def _map_expert_ids_to_local(selected, routing_first, routing_last):
-    if routing_first is None or routing_last is None:
-        return selected.clone()
+    assert (routing_first is None) == (routing_last is None)
+    if routing_first is None:
+        return selected
     local = selected - routing_first
     expert_count = routing_last - routing_first
     valid = (local >= 0) & (local < expert_count)
@@ -982,9 +983,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # semantics have their own oracle coverage; in particular, expert-parallel and
         # intermediate-split modules must continue through the established fallback.
         routing_range_ok = (
-            (self.routing_first is None or self.routing_last is None) or
+            (self.routing_first is None and self.routing_last is None) or
             (self.routing_first is not None and self.routing_last is not None and
-             self.routing_first <= self.routing_last and
+             0 <= self.routing_first <= self.routing_last <= self.num_experts and
              self.routing_last - self.routing_first == self.num_local_experts)
         )
         full_expert_layer = len(self.ups) == self.num_local_experts and routing_range_ok
