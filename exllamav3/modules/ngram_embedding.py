@@ -40,6 +40,10 @@ def _find_nth_prime_after(start: int, count: int) -> int:
     return p
 
 
+def _dtype_from_name(name: str) -> torch.dtype:
+    return getattr(torch, name.rsplit(".", 1)[-1])
+
+
 class NGramEmbedding(Module):
 
     def __init__(
@@ -114,6 +118,81 @@ class NGramEmbedding(Module):
         bias = get(names["bias"], optional = True) if "bias" in names else None
         self.head_bias = bias.half().contiguous().to(self.device) if bias is not None else None
         assert self.head_offsets.shape[0] == self.num_heads
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        assert self.mode is not None and self.mode.endswith("_disk"), \
+            "NGramEmbedding TP export requires a disk-streaming mode: RAM modes would " \
+            "duplicate the table per rank"
+        stream_from_disk = self.stream_from_disk
+        if stream_from_disk is None:
+            stream_from_disk = True
+        return {
+            "cls": NGramEmbedding,
+            "kwargs": {
+                "key": self.key,
+                "ngram_size": self.ngram_size,
+                "heads_per_ngram": self.heads_per_ngram,
+                "ple_embed_dim": self.ple_embed_dim,
+                "eos_token_id": self.eos_token_id,
+                "stream_from_disk": stream_from_disk,
+                "out_dtype": self.out_dtype,
+                "qmap": self.qmap,
+            },
+            "mode": self.mode,
+            "K": self.K,
+            "rows_per_shard": self.rows_per_shard,
+            "num_rows": self.num_rows,
+            "_row_dtype": str(self._row_dtype) if self._row_dtype is not None else None,
+            "handles": [{
+                "key": h.key,
+                "filename": h.filename,
+                "abs_offset": h.abs_offset,
+                "shape": list(h.shape),
+                "dtype": str(h.dtype),
+            } for h in self.handles],
+            "head_offsets": producer.send(self.head_offsets),
+            "head_vocab_sizes": producer.send(self.head_vocab_sizes),
+            "layer_multipliers": producer.send(self.layer_multipliers),
+            "head_bias": producer.send(self.head_bias),
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        module = NGramEmbedding(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+        module.mode = exported["mode"]
+        module.K = exported["K"]
+        module.rows_per_shard = exported["rows_per_shard"]
+        module.num_rows = exported["num_rows"]
+        module._row_dtype = _dtype_from_name(exported["_row_dtype"]) \
+            if exported["_row_dtype"] is not None else None
+        module.handles = [
+            DiskTensorHandle(
+                key = d["key"],
+                filename = d["filename"],
+                abs_offset = d["abs_offset"],
+                shape = d["shape"],
+                dtype = _dtype_from_name(d["dtype"]),
+            )
+            for d in exported["handles"]
+        ]
+        # The hash parameters stay host-side (matching load()); only the dequant bias goes
+        # to the device
+        module.head_offsets = consumer.recv(exported["head_offsets"])
+        module.head_vocab_sizes = consumer.recv(exported["head_vocab_sizes"])
+        module.layer_multipliers = consumer.recv(exported["layer_multipliers"])
+        module.head_bias = consumer.recv(exported["head_bias"], cuda = True)
+        if module.mode.startswith("trellis"):
+            module.codebook = mul1_codebook(device)
+        # _pin / _pin_events stay lazy: the first forward grows the staging buffers
+        return module
 
     @override
     def load(self, device: torch.device, **kwargs):
