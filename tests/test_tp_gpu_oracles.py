@@ -389,3 +389,25 @@ def test_qsa_g2_mtp_verify_shapes():
     o = m.sparse_attend(layer, attn, q, q, bt, seqlens)
     assert o.shape == (1, 1, 2, 32)
     assert o.dtype == torch.half
+
+
+# Stage 4 GPU oracles. These intentionally remain skipped on host-only runs.
+def test_stage4_route_proof_both_ranks_fast_path_no_fallback():
+    _gpu_gate()
+    pytest.fail("Stage 4 GPU oracle is not run without an exclusive GPU window")
+
+
+def test_stage4_empty_and_skewed_route_correctness():
+    _gpu_gate()
+    pytest.fail("Stage 4 GPU oracle is not run without an exclusive GPU window")
+
+
+def test_stage4_frozen_moe_shard_sum():
+    _gpu_gate()
+    pytest.fail("Stage 4 GPU oracle is not run without an exclusive GPU window")
+
+
+@pytest.mark.parametrize("rows", list(range(1, 17)) + [17, 2047, 2048])
+def test_stage4_decode_and_prefill_boundaries(rows):
+    _gpu_gate()
+    pytest.fail(f"Stage 4 GPU oracle ({rows}) is not run without an exclusive GPU window")
