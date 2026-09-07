@@ -242,7 +242,8 @@ def test_t6_make_tp_allocation_indexer_accounting():
     hd = attn.head_dim
     cr = attn.qsa_indexer.compress_ratio
     num_pages = 4 * PAGE_SIZE // PAGE_SIZE
-    indexer_storage = (128 * 3 * hd + hd + hd) * 2
+    # Indexer storage:= index_qk_proj.storage_size (mocked 1000) + norm weights_numel (0 pre-load)
+    indexer_storage = 1_000 + 0
     # planes: 2 layers x (raw num_pages*PAGE_SIZE*hd + pooled num_pages*(PAGE_SIZE//cr)*hd) fp16
     plane = (num_pages * PAGE_SIZE * hd + num_pages * (PAGE_SIZE // cr) * hd) * 2
     assert c.storage_per_device == indexer_storage + 2 * plane
