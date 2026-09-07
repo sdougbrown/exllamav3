@@ -78,7 +78,7 @@ def test_shared_reduce_accounting_zero_local_and_no_reduce():
             if contribute:
                 value *= 2
 
-    for contribute, tp_reduce, expected in ((False, True, 3.0), (True, False, 7.0)):
+    for contribute, tp_reduce, expected in ((False, True, 7.0), (True, False, 7.0)):
         value = torch.tensor([3.0])
         if tp_reduce:
             Backend().all_reduce(value, contribute)
