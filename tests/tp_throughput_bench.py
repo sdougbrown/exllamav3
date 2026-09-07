@@ -107,36 +107,40 @@ def main() -> None:
         while ids.shape[1] < args.context:
             ids = torch.cat((ids, ids[:, : args.context - ids.shape[1]]), dim=1)
 
-        params = {
-        "attn_mode": "flash_attn",
-        "cache": cache,
-        "past_len": 0,
-        "batch_shape": (1, cache_tokens),
-    }
+        params = {"attn_mode": "flash_attn", "cache": cache, "past_len": 0,
+                    "batch_shape": (1, args.cache_tokens)}
         t_pre = time.time()
         with torch.inference_mode():
             model.prefill(input_ids=ids, params=params)
         prefill_s = time.time() - t_pre
         prefill_tps = ids.shape[1] / prefill_s
+        rs = params.get("recurrent_states")
         past_len = ids.shape[1]
+
+        def step_params() -> dict:
+            p = {"attn_mode": "flash_attn", "cache": cache, "past_len": past_len,
+                 "batch_shape": (1, args.cache_tokens)}
+            if rs:
+                p["recurrent_states"] = rs
+            return p
 
         # warmup decode tokens
         in_ids = ids[:, -1:].contiguous()
         for _ in range(args.warmup_steps):
             with torch.inference_mode():
-                model.forward(input_ids=in_ids, params=params)
+                model.forward(input_ids=in_ids, params=step_params())
             in_ids = in_ids.new_zeros((1, 1), dtype=torch.int32)
-            params["past_len"] += 1
+            past_len += 1
 
         # timed decode tokens
         lat = []
         for _ in range(args.decode_steps):
             t0 = time.time()
             with torch.inference_mode():
-                model.forward(input_ids=in_ids, params=params)
+                model.forward(input_ids=in_ids, params=step_params())
             lat.append(time.time() - t0)
             in_ids = in_ids.new_zeros((1, 1), dtype=torch.int32)
-            params["past_len"] += 1
+            past_len += 1
 
         lat_ms = [x * 1000.0 for x in lat]
         tps = [1000.0 / x for x in lat_ms]
