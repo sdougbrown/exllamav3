@@ -70,6 +70,7 @@ def main() -> None:
     ap.add_argument("--warmup-steps", type=int, default=8)
     ap.add_argument("--prefill-chunk", type=int, default=512)
     ap.add_argument("--use-dev", type=parse_dev, default=parse_dev("30,30"))
+    ap.add_argument("--no-unload", action="store_true", help="print report then os._exit (skip the TP teardown barrier, batches >=8 deadlock)")
     args = ap.parse_args()
 
     batch = args.batch
@@ -190,6 +191,19 @@ def main() -> None:
             "per_req_tok_s_mean": round(statistics.mean(req_tps), 2),
         }
         print(json.dumps(report, sort_keys=True))
+        sys.stdout.flush()
+        if getattr(args, "no_unload", False):
+            # Batch >=8 TP leaves the teardown close() barrier deadlocked; skip unload
+            # for benchmarking (OS reclaims GPU mem on exit).
+            os._exit(0)
+    except Exception:
+        # A batch >=8 forward error otherwise unwinds into finally -> unload -> the close()
+        # barrier, which deadlocks because the peer rank is still mid-collective. Print the
+        # real cause and exit without unload.
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        os._exit(2)
     finally:
         # Return the recurrent state slots to the cache pool before the cache loses its
         # layer tensors with the model (state.free() is bookkeeping-only)
