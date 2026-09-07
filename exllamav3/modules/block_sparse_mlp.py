@@ -1386,7 +1386,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # by the mgemm kernel's position-preserving mask at num_tokens > 1 (out-of-range picks
         # inactive in place, so the grouped reduction's slot runs stay intact). Shared experts
         # are supported at any bsz via BC_GatedMLP's own multi-row graph (see mlp.py)
-        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN and not (self.tp_reduce and self.bc_sh_exp)
 
         # Routing
         if self.router_pre_norm:
@@ -1901,16 +1901,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     ext.add_sigmoid_gate(y, z, shared_contribution)
                 else:
                     ext.add_sigmoid_gate_proj(y, x, shared_contribution, self.shared_gate.inner.weight)
-                if pre_norm_reduce:
+                if not self.tp_reduce or pre_norm_reduce:
                     final_hidden_states += shared_contribution
             else:
-                if pre_norm_reduce:
+                if not self.tp_reduce or pre_norm_reduce:
                     final_hidden_states += y
 
         # Output reduction
         if self.tp_reduce and not pre_norm_reduce:
-            if self.shared_experts and not bc_sh_exp:
-                final_hidden_states -= shared_contribution if shared_contribution is not None else y
             params["backend"].all_reduce(
                 final_hidden_states,
                 self.intermediate_size > 0 and self.num_local_experts > 0
