@@ -510,7 +510,8 @@ class NGramEmbedding(Module):
             rows = packed_d.float()
         # All H2D reads from the staging buffers are now queued on dev's current stream;
         # record there so the next fill waits for exactly these copies (and no longer).
-        di = dev.index if dev.index is not None else torch.cuda.current_device()
+        # dev may be an int (TP worker device) or a torch.device; normalize for dedup key.
+        di = torch.device(dev).index if torch.device(dev).index is not None else torch.cuda.current_device()
         ev = self._pin_events.get(di)
         if ev is None:
             ev = torch.cuda.Event()
