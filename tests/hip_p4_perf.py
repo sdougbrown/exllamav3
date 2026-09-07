@@ -29,6 +29,9 @@ from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Token
 from exllamav3.cache import CacheLayer_quant  # noqa: E402
 from exllamav3.modules import block_graph  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).parent))
+from p4_perf_metrics import arms_by_flag, decode_wall_s  # noqa: E402
+
 MODEL = os.path.expanduser("~/Models/Qwen3.8-Flash-Next-exl3-bpw3")
 OUT_ROOT = Path(os.path.expanduser(
     "~/Serve/hosts/rocky/serving/qwen38-flash-exl3/benchmarks"))
@@ -66,7 +69,9 @@ def build(flag_value, mtp, batch):
     os.environ["EXL3_QC_STAGING"] = "1"
     os.environ["EXL3_PREFILL_ASYNC_UPLOADS"] = "0"
     os.environ["EXL3_BLOCK_GRAPH"] = flag_value
-    importlib.reload(block_graph)
+    # No module reload: no runners exist before the model loads, and the initial
+    # enabled state is set directly (a reload would reset _registry semantics).
+    block_graph.BLOCK_GRAPH_ENABLED = flag_value == "1"
     config = Config.from_directory(MODEL)
     config.infer_params.ngram_stream_from_disk = True
     target = Model.from_config(config, component="text")
@@ -130,39 +135,50 @@ def main():
                 r = run_trial(gen, tokenizer, PROMPTS[:conc])
                 t_end = time.time()
                 wall = time.perf_counter() - t0
-                # time_first_token is absolute wall-clock (time.time); decode wall uses the
-                # same clock sampled after the trial completes
-                r["decode_wall_s"] = max(0.0, t_end - r["ttft_s"])
+                # time_first_token is absolute wall-clock (time.time); decode wall uses
+                # the same clock sampled after the trial completes
+                r["decode_wall_s"] = decode_wall_s(r["ttft_s"], t_end)
                 kfd1 = _b.kfd_evicted_ms(os.getpid())
                 kfd_delta = {k: v1 - kfd0[k] for k, v1 in kfd1.items()
                              if k.startswith("stats_") and isinstance(v1, int)
                              and isinstance(kfd0.get(k), int)}
-                warns = journal_warnings_since(cursor) if False else []
+                warns = journal_warnings_since(cursor)
                 stats = block_graph.global_stats()
                 trials.append({
                     "flag": flag, "rep": rep, "wall_s": wall,
+                    "decode_wall_s": r["decode_wall_s"],
                     "per_req_tok_s": STEPS * conc / wall,
+                    "decode_tok_s": STEPS * conc / max(r["decode_wall_s"], 1e-9),
                     "ttft_s": r["ttft_s"],
                     "accepted": r["accepted"], "rejected": r["rejected"],
                     "kfd_delta": kfd_delta,
+                    "journal_warnings": warns,
                     "graph_captures": stats["captures"],
                     "graph_replays": stats["replays"],
                 })
                 print(f"[c{conc} {flag} rep{rep}] wall={wall:.2f}s decode={r['decode_wall_s']:.2f}s "
                       f"agg={STEPS * conc / wall:.1f} dec={STEPS * conc / max(r['decode_wall_s'], 1e-9):.1f} tok/s "
                       f"kfd={kfd_delta} acc={r['accepted']}", flush=True)
+        arms = arms_by_flag(trials)
         summary = {
             "concurrency": conc,
-            "eager_wall_s": [t["wall_s"] for t in trials if t["graph_replays"] == 0],
-            "graph_wall_s": [t["wall_s"] for t in trials if t["graph_replays"] > 0],
+            "eager_wall_s": [t["wall_s"] for t in arms.get("0", [])],
+            "graph_wall_s": [t["wall_s"] for t in arms.get("1", [])],
+            "eager_decode_wall_s": [t["decode_wall_s"] for t in arms.get("0", [])],
+            "graph_decode_wall_s": [t["decode_wall_s"] for t in arms.get("1", [])],
+            "journal_warning_count": sum(len(t["journal_warnings"]) for t in trials),
             "trials": trials,
         }
-        # NOTE: eager/graph classification by graph_replays is unreliable once runners exist;
-        # the flag env is the source of truth (trials alternate 0/1/0/1).
+        # Arm classification uses the per-trial flag recorded at run time; cumulative
+        # counters and index parity are unreliable under counterbalanced ordering.
         (out_dir / f"perf-c{conc}.json").write_text(json.dumps(summary, indent=2))
-        e_w = [t["wall_s"] for i, t in enumerate(trials) if i % 2 == 0]
-        g_w = [t["wall_s"] for i, t in trials and enumerate(trials) if i % 2 == 1]
-        print(f"[c{conc}] eager={e_w} graph={g_w}", flush=True)
+        e_w = [t["wall_s"] for t in arms.get("0", [])]
+        g_w = [t["wall_s"] for t in arms.get("1", [])]
+        e_dec = [t["decode_wall_s"] for t in arms.get("0", [])]
+        g_dec = [t["decode_wall_s"] for t in arms.get("1", [])]
+        print(f"[c{conc}] eager_wall={e_w} graph_wall={g_w} "
+              f"eager_decode={e_dec} graph_decode={g_dec} "
+              f"warns={summary['journal_warning_count']}", flush=True)
         block_graph.purge()
         target.unload()
         draft.unload()
