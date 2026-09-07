@@ -2072,7 +2072,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             gates = gates,
             ups = ups,
             downs = downs,
-            shared_experts = _import_no_reduce("shared_experts"),
+            shared_experts = _import("shared_experts"),
             shared_gate = _import("shared_gate"),
             routing_gate = _import("routing_gate") if device == output_device else None,
             routing_first = routing_first,
