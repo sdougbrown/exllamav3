@@ -1887,8 +1887,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.routed_post_norm:
             final_hidden_states = self.routed_post_norm.forward(final_hidden_states, params)
 
+        # Routed-only reduction before shared experts
+        if self.tp_reduce and not pre_norm_reduce:
+            params["backend"].all_reduce(
+                final_hidden_states,
+                self.intermediate_size > 0 and self.num_local_experts > 0
+            )
+
         # Shared experts
-        shared_contribution = None
         if self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, params)
             if pre_norm_reduce:
@@ -1896,26 +1902,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if self.shared_experts_post_norm:
                 y = self.shared_experts_post_norm.forward(y, params)
             if self.shared_gate:
-                shared_contribution = torch.empty_like(final_hidden_states)
                 if bsz > 32:
                     z = self.shared_gate.forward(x, params)
-                    ext.add_sigmoid_gate(y, z, shared_contribution)
+                    ext.add_sigmoid_gate(y, z, final_hidden_states)
                 else:
-                    ext.add_sigmoid_gate_proj(y, x, shared_contribution, self.shared_gate.inner.weight)
-                if not self.tp_reduce or pre_norm_reduce:
-                    final_hidden_states += shared_contribution
+                    ext.add_sigmoid_gate_proj(y, x, final_hidden_states, self.shared_gate.inner.weight)
             else:
-                if not self.tp_reduce or pre_norm_reduce:
-                    final_hidden_states += y
-
-        # Output reduction
-        if self.tp_reduce and not pre_norm_reduce:
-            params["backend"].all_reduce(
-                final_hidden_states,
-                self.intermediate_size > 0 and self.num_local_experts > 0
-            )
-            if self.shared_experts and not bc_sh_exp:
-                final_hidden_states += shared_contribution if shared_contribution is not None else y
+                final_hidden_states += y
 
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)

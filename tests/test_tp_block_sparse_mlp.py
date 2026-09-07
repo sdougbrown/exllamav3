@@ -93,6 +93,29 @@ def test_forward_routes_then_adds_replicated_shared(local, reduce, expected, cal
     assert mlp.cpu_offload_forward_calls == 1
 
 
+@pytest.mark.parametrize("bsz", [1, 32, 33])
+@pytest.mark.parametrize("reduce,expected,calls", [(False, 6.0, []), (True, 8.0, [True])])
+def test_forward_gated_shared_accumulates_directly(monkeypatch, bsz, reduce, expected, calls):
+    class Shared:
+        def forward(self, x, params): return torch.full_like(x, 3.0)
+
+    class Gate:
+        inner = type("Inner", (), {"weight": torch.ones(1, 1)})()
+        def forward(self, x, params): return torch.ones_like(x)
+
+    def add_gate(y, z, out): out.add_(y + z)
+    def add_gate_proj(y, x, out, weight): out.add_(y + x @ weight)
+    monkeypatch.setattr(bsm.ext, "add_sigmoid_gate", add_gate)
+    monkeypatch.setattr(bsm.ext, "add_sigmoid_gate_proj", add_gate_proj)
+
+    backend = _Backend()
+    mlp = _mlp(Shared(), reduce=reduce)
+    mlp.shared_gate = Gate()
+    out = mlp.forward(torch.ones(bsz, 1), {"backend": backend})
+    assert torch.all(out == expected)
+    assert backend.calls == calls
+
+
 def test_multilinear_pointer_table_is_local_list():
     class Inner:
         K = 3; mcg = 1; mul1 = 2; bias = None; softcap = False
