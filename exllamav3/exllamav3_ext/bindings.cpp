@@ -10,6 +10,11 @@
 #include "hc_mix.cuh"
 #include "activation.cuh"
 
+// CPU expert offload (P5): unconditional — the flag/worker/mul1 symbols are bound in both
+// the CUDA and ROCm branches below.
+#include "cpu/moe_mul1.h"
+#include "cpu/moe_handoff.h"
+
 #if !defined(USE_ROCM)
 
 #include "norm.cuh"
@@ -303,6 +308,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
     m.def("pack_signs", &pack_signs, "pack_signs");
+    // CPU expert offload (P5): registered-SHM handoff with kernel-wait flags. The moe_split_*/
+    // fused-exl3_moe tiers are NOT ported; their Python call sites are gated off on HIP.
+    m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
+    m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
+    m.def("exl3_moe_cpu_forward", &exl3_moe_cpu_forward, "exl3_moe_cpu_forward",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("exl3_moe_cpu_has_avx2", &exl3_moe_cpu_has_avx2, "exl3_moe_cpu_has_avx2");
+    m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
+    m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
+    m.def("exl3_moe_cpu_set_memops", &exl3_moe_cpu_set_memops, "exl3_moe_cpu_set_memops");
+    m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
+    m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
+    m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
 
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");

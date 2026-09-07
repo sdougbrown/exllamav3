@@ -20,7 +20,7 @@ ROCM_EXCLUDE_FILES = {
     'libtorch/linear.cpp', 'libtorch/dsv4_attn.cpp', 'libtorch/dsv4_compressor.cpp',
     'libtorch/mla_attention.cpp',
     'dsv4_compress.cu', 'dsa_topk.cu', 'ple.cu',
-    'cpu/moe_handoff.cu', 'cpu/moe_mul1.cpp',
+    'cpu/moe_handoff.cu',
 }
 
 

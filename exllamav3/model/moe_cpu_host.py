@@ -360,8 +360,14 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
 class MoeCpuHost:
 
     def __init__(self, config):
-        if torch.version.hip:
-            raise NotImplementedError("CPU MoE offload is unavailable on ROCm")
+        # HIP (ROCm) support (P5): kernel-wait flags over registered SHM only. The unported
+        # tiers (streamed prefill, fused split issue/collect, native memops) are gated off
+        # below and in block_sparse_mlp_cpu.py; the copy path + reconstruction fallback is
+        # the HIP surface.
+        if torch.version.hip and not (
+            hasattr(ext, "exl3_moe_cpu_worker_run") and hasattr(ext, "exl3_moe_flag_write")
+        ):
+            raise NotImplementedError("CPU MoE offload is unavailable on ROCm (bindings missing)")
         self.config = config
         self.model_dir = config.directory
         self.specs = []
@@ -717,6 +723,10 @@ class MoeCpuHost:
         (dynamic map or static tail offset) happens inside the kernel.
         """
         rows = y.shape[0]
+        # HIP: the fused fast path needs moe_split_issue (not ported); the caller falls back
+        # to the copy path when this returns None.
+        if torch.version.hip:
+            return None
         spec = self.specs[layer_idx]
         if rows > self.cap_rows or not (y.is_contiguous() and routing_weights.is_contiguous()):
             return None
@@ -970,6 +980,11 @@ class MoeCpuHost:
         after them, so the CPU works the tail while the GPU streams. Falls back to the plain CPU
         path when nothing qualifies.
         """
+        # HIP: the streamed prefill tier depends on the fused exl3_moe binding (absent in the
+        # HIP build) and the CUDA stream-state machinery; route everything through the plain
+        # CPU handoff instead (verified reconstruction-equivalent path).
+        if torch.version.hip:
+            return self.submit(layer_idx, y, selected_experts, routing_weights)
         spec = self.specs[layer_idx]
         rows = y.shape[0]
         if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
