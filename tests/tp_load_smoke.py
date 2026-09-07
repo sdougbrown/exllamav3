@@ -27,10 +27,11 @@ def main():
     ap.add_argument("--cache-tokens", type=int, default=16384)
     ap.add_argument("--use-dev", default="30,30")
     ap.add_argument("--chunk", type=int, default=512)
-    ap.add_argument("--prompt", default="The capital of France is")
+    ap.add_argument("--prompt", default="Once upon a time, a small robot named Sparky discovered a mysterious glowing door in the middle of the forest. When Sparky opened it,")
     ap.add_argument("--new-tokens", type=int, default=16)
     ap.add_argument("--max-seq", type=int, default=32768)
     ap.add_argument("--tp-backend", default="nccl")
+    ap.add_argument("--no-tp", action="store_true", help="load layer-split (control) instead of TP")
     args = ap.parse_args()
 
     use_per_device = [float(x) for x in args.use_dev.split(",")]
@@ -39,7 +40,7 @@ def main():
 
     from exllamav3 import Config, Model, Cache, Tokenizer
     from exllamav3.generator import Generator
-    from exllamav3.generator.sampler.presets import ArgmaxSampler
+    from exllamav3.generator.sampler.presets import DefaultSampler
 
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
@@ -54,7 +55,7 @@ def main():
 
     t0 = time.time()
     model.load(
-        tensor_p=True,
+        tensor_p=not args.no_tp,
         tp_backend=args.tp_backend,
         use_per_device=use_per_device,
         max_chunk_size=args.chunk,
@@ -72,12 +73,13 @@ def main():
         # recurrent cache small for host; fine at default
     )
 
-    settings = ArgmaxSampler()
+    settings = DefaultSampler()
     tgen = time.time()
     out = ""
     try:
-        for result in gen.generate(prompt=args.prompt, max_new_tokens=args.new_tokens, sampler=settings, streaming=False):
-            out = result.get("text") if isinstance(result, dict) else str(result)
+        result = gen.generate(prompt=args.prompt, max_new_tokens=args.new_tokens,
+                              sampler=settings, streaming=False)
+        out = result.get("text") if isinstance(result, dict) else result
     except Exception as e:
         print("GEN ERROR:", type(e).__name__, e)
         torch.cuda.synchronize()
