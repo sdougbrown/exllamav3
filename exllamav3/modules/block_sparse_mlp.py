@@ -914,12 +914,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             output = g_tensor_cache.get(
                 device, (rows, H), torch.float, f"moe_gfx12_pf_output_a{rows}"),
             expert_offsets = g_tensor_cache.get(
-                device, (self.num_experts + 1,), torch.long, "moe_gfx12_pf_offsets"),
+                device, (self.num_local_experts + 1,), torch.long, "moe_gfx12_pf_offsets"),
             inverse_order = g_tensor_cache.get(
                 device, (assignments,), torch.long, f"moe_gfx12_pf_inverse_a{assignments}"),
             expert_chunks = g_tensor_cache.get(
                 device,
-                (self.num_experts * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
+                (self.num_local_experts * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
                 torch.int,
                 "moe_gfx12_pf_chunks",
             ),
@@ -981,7 +981,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Dedicated ROCm decode route. Keep this exact until additional shapes and split
         # semantics have their own oracle coverage; in particular, expert-parallel and
         # intermediate-split modules must continue through the established fallback.
-        full_expert_layer = len(self.ups) == self.num_local_experts
+        routing_range_ok = (
+            (self.routing_first is None or self.routing_last is None) or
+            (self.routing_first is not None and self.routing_last is not None and
+             self.routing_first <= self.routing_last and
+             self.routing_last - self.routing_first == self.num_local_experts)
+        )
+        full_expert_layer = len(self.ups) == self.num_local_experts and routing_range_ok
         hip_shape_ok = (
             self.is_quantized and self.gated and self.hidden_size == 2560 and
             self.intermediate_size_padded in (640, 768) and
@@ -1912,7 +1918,6 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if self.shared_experts and not bc_sh_exp:
                 final_hidden_states += shared_contribution if shared_contribution is not None else y
 
-        # Legacy source-contract marker: (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
