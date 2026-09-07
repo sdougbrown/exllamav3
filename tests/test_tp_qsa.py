@@ -225,9 +225,13 @@ def test_t6_make_tp_allocation_indexer_accounting():
     assert len(attn.cache_layers) == 2
 
     # Linear.storage_size/recons_size need stc (config is None here); pin them so the
-    # accounting is fully deterministic
+    # accounting is fully deterministic. Also capture the indexer's mocked qk-proj
+    # storage + the norms' real (pre-load) weights_numel inside the mock context.
     with mock.patch.object(Linear, "storage_size", return_value = 1000), \
          mock.patch.object(Linear, "recons_size", return_value = 500):
+        indexer_storage = attn.qsa_indexer.index_qk_proj.storage_size() + \
+            2 * attn.qsa_indexer.q_layernorm.weights_numel() + \
+            2 * attn.qsa_indexer.k_layernorm.weights_numel()
         comps = attn.make_tp_allocation({})
 
     assert len(comps) == 1
@@ -238,15 +242,10 @@ def test_t6_make_tp_allocation_indexer_accounting():
     assert c.channel_width == 1
     assert c.channels_to_split == 2
 
-    # indexer storage: qk proj (padded in 128 x (n_heads+kv_heads)*hd) + q norm (hd) + k norm (hd), fp16
+    # planes: 2 layers x (raw num_pages*PAGE_SIZE*hd + pooled num_pages*(PAGE_SIZE//cr)*hd) fp16
     hd = attn.head_dim
     cr = attn.qsa_indexer.compress_ratio
     num_pages = 4 * PAGE_SIZE // PAGE_SIZE
-    # Indexer storage:= index_qk_proj.storage_size (mocked 1,000) + norm weights_numel*2
-    indexer_storage = attn.qsa_indexer.index_qk_proj.storage_size() \
-        + 2 * attn.qsa_indexer.q_layernorm.weights_numel() \
-        + 2 * attn.qsa_indexer.k_layernorm.weights_numel()
-    # planes: 2 layers x (raw num_pages*PAGE_SIZE*hd + pooled num_pages*(PAGE_SIZE//cr)*hd) fp16
     plane = (num_pages * PAGE_SIZE * hd + num_pages * (PAGE_SIZE // cr) * hd) * 2
     assert c.storage_per_device == indexer_storage + 2 * plane
     # split storage: q/k/v/o (mocked 1000 each) + main K/V of both layers
