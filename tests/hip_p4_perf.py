@@ -127,11 +127,11 @@ def main():
                 cursor = get_journal_cursor()
                 kfd0 = _b.kfd_evicted_ms(os.getpid())
                 t0 = time.perf_counter()
-                t_end = time.time()
                 r = run_trial(gen, tokenizer, PROMPTS[:conc])
+                t_end = time.time()
                 wall = time.perf_counter() - t0
                 # time_first_token is absolute wall-clock (time.time); decode wall uses the
-                # same clock at the end of the run
+                # same clock sampled after the trial completes
                 r["decode_wall_s"] = max(0.0, t_end - r["ttft_s"])
                 kfd1 = _b.kfd_evicted_ms(os.getpid())
                 kfd_delta = {k: v1 - kfd0[k] for k, v1 in kfd1.items()
