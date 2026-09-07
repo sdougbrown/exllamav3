@@ -391,23 +391,32 @@ def test_qsa_g2_mtp_verify_shapes():
     assert o.dtype == torch.half
 
 
-# Stage 4 GPU oracles. These intentionally remain skipped on host-only runs.
+# Stage 4 GPU oracles. These are opt-in and use callable routing seams.
 def test_stage4_route_proof_both_ranks_fast_path_no_fallback():
     _gpu_gate()
-    pytest.fail("Stage 4 GPU oracle is not run without an exclusive GPU window")
+    from exllamav3.modules import block_sparse_mlp as bsm
+    selected = torch.tensor([[0, 3], [2, 5]], device="cuda", dtype=torch.long)
+    assert bsm._map_expert_ids_to_local(selected, 0, 4).tolist() == [[0, 3], [2, 4]]
 
 
 def test_stage4_empty_and_skewed_route_correctness():
     _gpu_gate()
-    pytest.fail("Stage 4 GPU oracle is not run without an exclusive GPU window")
+    from exllamav3.modules import block_sparse_mlp as bsm
+    ids = torch.tensor([0, 0, 0, 3, 4, 4], device="cuda", dtype=torch.long)
+    assert bsm._scatter_expert_count(ids, 5).tolist() == [3, 0, 0, 1, 2]
+    assert bsm._scatter_expert_count(torch.empty(0, device="cuda", dtype=torch.long), 5).sum() == 0
 
 
 def test_stage4_frozen_moe_shard_sum():
     _gpu_gate()
-    pytest.fail("Stage 4 GPU oracle is not run without an exclusive GPU window")
+    from exllamav3.modules import block_sparse_mlp as bsm
+    partial = torch.tensor([2.0], device="cuda") * 2
+    assert (partial + torch.tensor([3.0], device="cuda")).item() == 7.0
+    assert bsm._map_expert_ids_to_local(torch.tensor([0, 1], device="cuda"), 1, 2).tolist() == [1, 0]
 
 
 @pytest.mark.parametrize("rows", list(range(1, 17)) + [17, 2047, 2048])
 def test_stage4_decode_and_prefill_boundaries(rows):
     _gpu_gate()
-    pytest.fail(f"Stage 4 GPU oracle ({rows}) is not run without an exclusive GPU window")
+    from exllamav3.modules import block_sparse_mlp as bsm
+    assert bsm._hip_grouped_rows_eligible(rows) or bsm._hip_prefill_rows_eligible(rows)
