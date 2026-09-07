@@ -107,7 +107,12 @@ def main() -> None:
         while ids.shape[1] < args.context:
             ids = torch.cat((ids, ids[:, : args.context - ids.shape[1]]), dim=1)
 
-        params = {"attn_mode": "flash_attn", "cache": cache, "past_len": 0, "batch_shape": (1, 1)}
+        params = {
+        "attn_mode": "flash_attn",
+        "cache": cache,
+        "past_len": 0,
+        "batch_shape": (1, cache_tokens),
+    }
         t_pre = time.time()
         with torch.inference_mode():
             model.prefill(input_ids=ids, params=params)
