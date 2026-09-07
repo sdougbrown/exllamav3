@@ -57,7 +57,7 @@ class _Backend:
 
 def _mlp(shared, local=1, reduce=True):
     m = bsm.BlockSparseMLP.__new__(bsm.BlockSparseMLP)
-    m.alt_residual_channel = False; m.hidden_size = 1; m.router_pre_norm = None
+    m.alt_residual_channel = False; m.hidden_size = 1; m.router_pre_norm = None; m.routed_pre_norm = None
     m.routing_gate = object(); m.routing_cfg = None; m.routing_fn = lambda *a: (torch.tensor([[0]]), torch.ones(1, 1))
     m.routing_device = None; m.cpu_split_first = None; m.cpu_offload = True
     m.intermediate_size = 1; m.num_local_experts = local; m.num_experts_per_tok = 1
