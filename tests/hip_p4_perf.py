@@ -119,17 +119,20 @@ def main():
         trials = []
         pre_kfd = _b.kfd_evicted_ms(os.getpid())
         pre_cursor = None
-        for rep in range(3):  # 3 paired eager/graph trials per concurrency
-            for flag in ("0", "1"):
+        for rep in range(3):  # 3 paired trials per concurrency, order counterbalanced
+            order = ("0", "1") if rep % 2 == 0 else ("1", "0")
+            for flag in order:
                 os.environ["EXL3_BLOCK_GRAPH"] = flag
-                importlib.reload(block_graph)
+                block_graph.BLOCK_GRAPH_ENABLED = flag == "1"  # dynamic toggle, no reload
                 cursor = get_journal_cursor()
                 kfd0 = _b.kfd_evicted_ms(os.getpid())
                 t0 = time.perf_counter()
+                t_end = time.time()
                 r = run_trial(gen, tokenizer, PROMPTS[:conc])
                 wall = time.perf_counter() - t0
-                # time_first_token is absolute wall-clock; decode wall = end - first token
-                r["decode_wall_s"] = (t0 + wall) - r["ttft_s"]
+                # time_first_token is absolute wall-clock (time.time); decode wall uses the
+                # same clock at the end of the run
+                r["decode_wall_s"] = max(0.0, t_end - r["ttft_s"])
                 kfd1 = _b.kfd_evicted_ms(os.getpid())
                 kfd_delta = {k: v1 - kfd0[k] for k, v1 in kfd1.items()
                              if k.startswith("stats_") and isinstance(v1, int)

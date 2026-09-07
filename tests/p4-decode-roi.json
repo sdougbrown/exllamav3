@@ -1,0 +1,23 @@
+{
+  "eager": {
+    "wall_s": 2.0467371490085497,
+    "measured_iters": 24,
+    "captures_delta": 0,
+    "replays_delta": 0,
+    "open_at": 40,
+    "close_at": 64
+  },
+  "graph": {
+    "wall_s": 1.536186289973557,
+    "measured_iters": 24,
+    "captures_delta": 0,
+    "replays_delta": 864,
+    "open_at": 72,
+    "close_at": 96
+  },
+  "job": {
+    "accepted": 184,
+    "rejected": 125,
+    "max_tokens": 288
+  }
+}
