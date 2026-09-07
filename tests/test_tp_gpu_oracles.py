@@ -39,7 +39,7 @@ def test_gated_rmsnorm_sigmoid_gpu_import_and_forward():
     _gpu_gate()
     module = GatedRMSNorm(config=None, key="test.gnorm", rms_norm_eps=1e-5, gate_activation="sigmoid")
     module.device = torch.device("cuda:0")
-    module.weight = nn.Parameter(torch.randn(8, 8, dtype=torch.bfloat16, device="cuda:0"))
+    module.weight = nn.Parameter(torch.randn(8, dtype=torch.bfloat16, device="cuda:0"))
 
     producer = SMProducer(buffer_size=1 << 20)
     consumer = SMConsumer(producer_imp=producer, device=0, pin_memory=False)
@@ -310,13 +310,13 @@ def test_qsa_g2_dense_sparse_selection_and_partial_blocks():
     indices = m.select_indices_ref(q, pooled, past_len = 0, batch_stride = total)
 
     for s in range(20):
-        sel = {int(i) for i in indices[0, s][indices[0, s] >= 0].tolist()}
+        sel = {int(i) for i in indices[s][indices[s] >= 0].tolist()}
         dense = set(torch.nonzero(mask[0, s]).flatten().tolist())
         assert sel == dense, f"row {s}: sparse {sorted(sel)} != dense {sorted(dense)}"
 
     # partial block: absolute position 5 sits in block 1 (tokens 4..7); the incomplete tail
     # tokens 4,5 must always be selected
-    row = indices[0, 5]
+    row = indices[5]
     sel = {int(i) for i in row[row >= 0].tolist()}
     assert {4, 5} <= sel
 
@@ -366,7 +366,8 @@ def test_qsa_g2_mixed_seqlens_selection():
             nz = row[row >= 0]
             assert (nz <= pos0 + s).all(), f"row b={b} s={s} violates causality"
             tail0 = ((pos0 + s + 1) // 4) * 4
-            assert tail0 in {int(i) for i in nz.tolist()}, f"row b={b} s={s} lost its tail block"
+            if tail0 <= pos0 + s:  # no incomplete tail when the query ends a full block
+                assert tail0 in {int(i) for i in nz.tolist()}, f"row b={b} s={s} lost its tail block"
 
 
 def test_qsa_g2_mtp_verify_shapes():
