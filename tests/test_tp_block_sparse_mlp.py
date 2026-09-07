@@ -58,7 +58,7 @@ class _Backend:
 def _mlp(shared, local=1, reduce=True):
     m = bsm.BlockSparseMLP.__new__(bsm.BlockSparseMLP)
     m.alt_residual_channel = False; m.hidden_size = 1; m.router_pre_norm = None
-    m.routing_gate = object(); m.routing_fn = lambda *a: (torch.tensor([[0]]), torch.ones(1, 1))
+    m.routing_gate = object(); m.routing_cfg = None; m.routing_fn = lambda *a: (torch.tensor([[0]]), torch.ones(1, 1))
     m.routing_device = None; m.cpu_split_first = None; m.cpu_offload = True
     m.intermediate_size = 1; m.num_local_experts = local; m.num_experts_per_tok = 1
     m.shared_experts = shared; m.shared_gate = None; m.tp_reduce = reduce
@@ -68,8 +68,8 @@ def _mlp(shared, local=1, reduce=True):
     return m
 
 
-@pytest.mark.parametrize("local,reduce,expected,calls", [(1, True, 7.0, [True, True]),
-                                                           (0, True, 5.0, [False, True]),
+@pytest.mark.parametrize("local,reduce,expected,calls", [(1, True, 7.0, [True]),
+                                                           (0, True, 5.0, [False]),
                                                            (1, False, 5.0, [])])
 def test_forward_routes_then_adds_replicated_shared(local, reduce, expected, calls):
     class Shared:
