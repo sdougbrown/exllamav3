@@ -262,34 +262,34 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _tier_b_collectives(backend, rank, world_size):
+def _tier_b_collectives(backend, rank, world_size, device="cpu"):
     out_device = world_size - 1
 
     backend.fwd_barrier()
 
     # broadcast small (<= 2KB) and large (> 2KB)
     for n in (64, 1024):
-        expected = torch.arange(n, dtype=torch.float32) + 1.0
-        t = expected.clone() if rank == 0 else torch.empty(n, dtype=torch.float32)
+        expected = torch.arange(n, dtype=torch.float32, device=device) + 1.0
+        t = expected.clone() if rank == 0 else torch.empty(n, dtype=torch.float32, device=device)
         backend.broadcast(t, src_device=0)
         assert torch.equal(t, expected), f"broadcast {n} mismatch"
 
     # all_reduce exact in fp32 / fp16 / bf16
     for dtype in (torch.float32, torch.float16, torch.bfloat16):
-        t = torch.full((16,), float(rank + 1), dtype=dtype)
+        t = torch.full((16,), float(rank + 1), dtype=dtype, device=device)
         backend.all_reduce(t)
         expected = float(world_size * (world_size + 1) // 2)
         assert torch.all(t == expected), f"all_reduce {dtype} mismatch: {t.tolist()}"
 
     # contribution=False: only rank 0 contributes, both ranks receive the full sum
-    t = torch.full((16,), float(rank + 1), dtype=torch.float32)
+    t = torch.full((16,), float(rank + 1), dtype=torch.float32, device=device)
     backend.all_reduce(t, contribution=(rank == 0))
     assert torch.all(t == 1.0), f"contribution=False mismatch: {t.tolist()}"
 
     # gather: uneven widths, sorted concat order
     gd, ldims = [0, 1], [3, 5]
-    out = torch.empty((8,)) if rank == out_device else None
-    t = torch.full((ldims[rank],), float(rank + 1))
+    out = torch.empty((8,), device=device) if rank == out_device else None
+    t = torch.full((ldims[rank],), float(rank + 1), device=device)
     backend.gather(t, out, gd, out_device, ldims)
     if rank == out_device:
         assert out[:3].tolist() == [1.0] * 3, f"uneven gather head: {out.tolist()}"
@@ -297,32 +297,32 @@ def _tier_b_collectives(backend, rank, world_size):
 
     # gather: zero-width participant (rank 0 contributes nothing)
     gd, ldims = [0, 1], [0, 5]
-    out = torch.empty((5,)) if rank == out_device else None
-    t = torch.full((ldims[rank],), float(rank + 1))
+    out = torch.empty((5,), device=device) if rank == out_device else None
+    t = torch.full((ldims[rank],), float(rank + 1), device=device)
     backend.gather(t, out, gd, out_device, ldims)
     if rank == out_device:
         assert out.tolist() == [2.0] * 5, f"zero-width gather: {out.tolist()}"
 
     # gather: subset (only the output device participates)
     gd, ldims = [1], [7]
-    out = torch.empty((7,)) if rank == out_device else None
-    t = torch.full((7,), 9.0)
+    out = torch.empty((7,), device=device) if rank == out_device else None
+    t = torch.full((7,), 9.0, device=device)
     backend.gather(t, out, gd, out_device, ldims)
     if rank == out_device:
         assert out.tolist() == [9.0] * 7, f"subset gather: {out.tolist()}"
 
     # gather: zero-width output device (only rank 0 contributes)
     gd, ldims = [0, 1], [5, 0]
-    out = torch.empty((5,)) if rank == out_device else None
-    t = torch.full((ldims[rank],), float(rank + 1))
+    out = torch.empty((5,), device=device) if rank == out_device else None
+    t = torch.full((ldims[rank],), float(rank + 1), device=device)
     backend.gather(t, out, gd, out_device, ldims)
     if rank == out_device:
         assert out.tolist() == [1.0] * 5, f"zero-width dst gather: {out.tolist()}"
 
     # gather_small: same send/recv path
     gd, ldims = [0, 1], [2, 4]
-    out = torch.empty((6,)) if rank == out_device else None
-    t = torch.full((ldims[rank],), float(rank + 1))
+    out = torch.empty((6,), device=device) if rank == out_device else None
+    t = torch.full((ldims[rank],), float(rank + 1), device=device)
     backend.gather_small(t, out, gd, out_device, ldims)
     if rank == out_device:
         assert out[:2].tolist() == [1.0] * 2, f"gather_small head: {out.tolist()}"
@@ -330,8 +330,8 @@ def _tier_b_collectives(backend, rank, world_size):
 
     # 50 rounds of broadcast + all_reduce
     for i in range(50):
-        t = (torch.full((8,), float(i), dtype=torch.float32) if rank == 0
-             else torch.empty((8,), dtype=torch.float32))
+        t = (torch.full((8,), float(i), dtype=torch.float32, device=device) if rank == 0
+             else torch.empty((8,), dtype=torch.float32, device=device))
         backend.broadcast(t, src_device=0)
         assert torch.all(t == float(i)), f"round {i} broadcast mismatch"
         backend.all_reduce(t)
@@ -436,7 +436,7 @@ def _tier_c_worker(rank, world_size, port, results):
             timeout_s=60.0,
         )
         try:
-            _tier_b_collectives(backend, rank, world_size)
+            _tier_b_collectives(backend, rank, world_size, device=f"cuda:{rank}")
         finally:
             backend.close()
         assert not dist.is_initialized(), "process group must be destroyed after close"
