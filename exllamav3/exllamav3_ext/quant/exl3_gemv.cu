@@ -21,6 +21,7 @@ namespace cg = cooperative_groups;
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <algorithm>
 
 /*
 QTIP-style small-m GEMV path, kernel in exl3_gemv_kernel.cuh. Dispatched from exl3_gemm via
@@ -732,7 +733,14 @@ void exl3_moe_gfx12_k3_prefill
     (A.data_ptr(), gu_had.data_ptr(), selected_ptr, order_ptr, counts_ptr, gsuh, usuh,
      assignments, MOE_HIDDEN, experts, true);
 
-    const int chunk_slots = CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + experts;
+    // num_chunks is computed on device (no host readback). Two host-side upper
+    // bounds are always valid: sum_e ceil(count_e/16) <= ceil(A/16) + experts and
+    // sum_e ceil(count_e/16) <= (A + 15*A_active)/16 <= A. At small assignment
+    // counts (decode rows 2-5) the second is far tighter — at rows=2 it is 20
+    // slots vs 514 — so take the smaller of the two; large-A prefill keeps the
+    // old bound.
+    const int chunk_slots = std::min(
+        CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + experts, assignments);
     dim3 gu_grid(intermediate / 64, chunk_slots, 2);
     moe_prefill_grouped_gemv_k3_kernel<false, true, 2><<<gu_grid, 128, 0, stream>>>
     (reinterpret_cast<const half*>(gu_had.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr,
