@@ -13,6 +13,7 @@ from safetensors.torch import save_file
 from exllamav3 import Config, Model
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.model.lora import LoRA
+from exllamav3.modules.block_sparse_mlp import _HIP_PREFILL_MAX_EXPERT_ROWS
 from exllamav3.modules import block_sparse_mlp as block_sparse_mlp_module
 
 HIDDEN = 2560
@@ -177,7 +178,11 @@ def _run_prefill(x, selected, weights, gate, up, down):
     down_out = torch.empty((assignments, HIDDEN), dtype=torch.float32, device=x.device)
     offsets = torch.empty((NUM_EXPERTS + 1,), dtype=torch.long, device=x.device)
     inverse = torch.empty((assignments,), dtype=torch.long, device=x.device)
-    chunks = torch.empty((NUM_EXPERTS * 320,), dtype=torch.int, device=x.device)
+    # workspace must cover experts * CHUNKS_PER_EXPERT; CHUNKS_PER_EXPERT tracks
+    # the binding's MOE_PREFILL_MAX_ROWS (2048 since c2f73d1), not the old 512-era 320
+    chunks = torch.empty(
+        (NUM_EXPERTS * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
+        dtype=torch.int, device=x.device)
     chunk_count = torch.empty((1,), dtype=torch.int, device=x.device)
     ext.exl3_moe_gfx12_k3_prefill(
         x, output, selected, weights, order, expert_count,
