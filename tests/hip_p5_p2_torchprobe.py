@@ -78,7 +78,8 @@ def main():
         it = 0
         wall0 = wall1 = 0.0
         prof = torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA],
+            activities=[torch.profiler.ProfilerActivity.CUDA,
+                        torch.profiler.ProfilerActivity.CPU],
             schedule=torch.profiler.schedule(wait=WARM_ITER, warmup=0, active=MEASURE_ITER))
         prof.start()
         while gen.num_remaining_jobs():
@@ -94,7 +95,12 @@ def main():
         wall_ms = (wall1 - wall0) * 1000.0
         moe = {"gu": 0.0, "down": 0.0}
         busy = {}
+        cpu_self = {}
         for ev in prof.events():
+            if ev.device_type == torch.autograd.DeviceType.CPU:
+                nm = ev.name[:60]
+                cpu_self[nm] = cpu_self.get(nm, 0.0) + ev.self_cpu_time_total
+                continue
             if ev.device_type != torch.autograd.DeviceType.CUDA or ev.time_range is None:
                 continue
             dev = getattr(ev, "device_index", None)
@@ -106,14 +112,21 @@ def main():
             key = f"cuda{dev}"
             busy.setdefault(key, []).append((s, e))
         per_iter = {k: busy_union_ms(v) / MEASURE_ITER for k, v in busy.items()}
+        top_cpu = sorted(cpu_self.items(), key=lambda kv: -kv[1])[:20]
         results[arm] = {
             "wall_per_iter_ms": wall_ms / MEASURE_ITER,
             "moe_gu_sum_per_iter_ms": moe["gu"] / MEASURE_ITER,
             "moe_down_sum_per_iter_ms": moe["down"] / MEASURE_ITER,
             "busy_union_per_iter_ms": per_iter,
+            "host_cpu_self_total_per_iter_ms": sum(cpu_self.values()) / MEASURE_ITER,
+            "top_host_ops_self_ms_per_iter": [(n, round(v / MEASURE_ITER, 3))
+                                              for n, v in top_cpu],
             "kernels_counted": sum(len(v) for v in busy.values()),
         }
-        print(f"[torchprobe {arm}] {json.dumps(results[arm], indent=1)}", flush=True)
+        print(f"[torchprobe {arm}] wall/iter={results[arm]['wall_per_iter_ms']:.2f} ms "
+              f"host_self/iter={results[arm]['host_cpu_self_total_per_iter_ms']:.2f} ms", flush=True)
+        for n, v in top_cpu:
+            print(f"   {v:8.3f} ms/it  {n}", flush=True)
         for k in saved:
             if saved[k] is None:
                 os.environ.pop(k, None)
