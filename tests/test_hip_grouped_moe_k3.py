@@ -483,10 +483,17 @@ def test_flash_multirow_route_and_decline_guards(flash_model, device_index, rows
 
         # The dedicated route uses the same K3 arithmetic and deterministic expert-sorted
         # reduction as the per-expert fallback, including independently for verification rows.
+        # The 1e-6 bit-equality invariant holds for the default CFG schedule; the CFG
+        # schedule variants (EXL3_HIP_GROUPED_MOE_CFG_*) change the K-split/fold order, so
+        # their grouped-vs-fallback diff is accumulation-order noise — measured max-abs
+        # 1.4e-5..8.7e-5 at rows 1..16 — asserted 40x tighter than the framework's 0.04
+        # reconstruction envelope. The reconstruction oracle above stays the tight gate.
         monkeypatch.setenv("EXL3_HIP_GROUPED_MOE", "0")
         fallback = mlp.forward(x, {}).clone()
         monkeypatch.setenv("EXL3_HIP_GROUPED_MOE", "1")
-        torch.testing.assert_close(actual, fallback, rtol=0, atol=1e-6)
+        cfg_variant = (os.environ.get("EXL3_HIP_GROUPED_MOE_CFG_GU", "0") != "0"
+                       or os.environ.get("EXL3_HIP_GROUPED_MOE_CFG_DOWN", "0") != "0")
+        torch.testing.assert_close(actual, fallback, rtol=0, atol=1e-3 if cfg_variant else 1e-6)
 
         guard_cases = [
             ("grouped-disabled", {}, {"EXL3_HIP_GROUPED_MOE": "0"}, None, True),

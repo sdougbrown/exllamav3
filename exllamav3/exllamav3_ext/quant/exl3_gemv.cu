@@ -124,8 +124,8 @@ __global__ void moe_silu_mul_kernel(const half* gate, const half* up, half* outp
     }
 }
 
-template <bool FP32, bool TWO_PROJECTIONS>
-__global__ __launch_bounds__(MOE_THREADS)
+template <bool FP32, bool TWO_PROJECTIONS, int CFG>
+__global__ __launch_bounds__(CFG == 0 ? 512 : CFG == 1 ? 256 : 128)
 void moe_grouped_gemv_k3_kernel
 (
     const half* A,
@@ -139,6 +139,7 @@ void moe_grouped_gemv_k3_kernel
     int assignments
 )
 {
+    constexpr int COLS = CFG == 0 ? 32 : 64;
     const int slot = blockIdx.y;
     const int projection = TWO_PROJECTIONS ? blockIdx.z : 0;
     const int64_t expert = selected[slot];
@@ -151,18 +152,21 @@ void moe_grouped_gemv_k3_kernel
     const int64_t B_ptr = valid_expert ? B_table[expert] : 0;
     if (!B_ptr)
     {
-        const int col = blockIdx.x * 32 + threadIdx.x;
-        if (threadIdx.x < 32 && col < size_n)
+        if (threadIdx.x < COLS)
         {
-            if constexpr (FP32) reinterpret_cast<float*>(C_row)[col] = 0.0f;
-            else reinterpret_cast<half*>(C_row)[col] = __float2half_rn(0.0f);
+            const int col = blockIdx.x * COLS + threadIdx.x;
+            if (col < size_n)
+            {
+                if constexpr (FP32) reinterpret_cast<float*>(C_row)[col] = 0.0f;
+                else reinterpret_cast<half*>(C_row)[col] = __float2half_rn(0.0f);
+            }
         }
         return;
     }
 
     const uint16_t* B = reinterpret_cast<const uint16_t*>(B_ptr);
     const half* A_row = A + matrix * size_k;
-    exl3_gemv_kernel_body<3, FP32, 2, 0, 0, true>
+    exl3_gemv_kernel_body<3, FP32, 2, 0, CFG, true>
     (A_row, B, C_row, 1, size_k, size_n, nullptr, nullptr, nullptr, nullptr);
 }
 
@@ -464,6 +468,18 @@ void check_moe_alignment(const at::Tensor& tensor, const char* name)
                 "exl3_moe_gfx12_k3: ", name, " must be 16-byte aligned");
 }
 
+// MoE CFG schedule selector: 0 = 512 threads / 32 cols / 16 K-splits,
+// 1 = 256 / 64 / 8, 2 = 128 / 64 / 4 (the prefill schedule). Read per call
+// like exl3_gemv_env_mode; unset env returns the caller's default, invalid
+// values fall back to it so a typo cannot silently change the schedule.
+static int moe_env_cfg(const char* name, int invalid_fallback)
+{
+    const char* env = std::getenv(name);
+    if (!env) return invalid_fallback;
+    const int v = std::atoi(env);
+    return (v >= 0 && v <= 2) ? v : invalid_fallback;
+}
+
 } // namespace
 
 void exl3_moe_gfx12_k3
@@ -566,10 +582,26 @@ void exl3_moe_gfx12_k3
     (A.data_ptr(), gu_had.data_ptr(), selected_ptr, gsuh, usuh,
      assignments, MOE_HIDDEN, experts, true);
 
-    dim3 gu_grid(intermediate / 32, assignments, 2);
-    moe_grouped_gemv_k3_kernel<false, true><<<gu_grid, MOE_THREADS, 0, stream>>>
+    // CFG schedule selector: 0 = 512 threads / 32 cols / 16 K-splits,
+    // 1 = 256 / 64 / 8, 2 = 128 / 64 / 4 (the prefill schedule). Per
+    // specialization (gate/up vs down) so each can be tuned independently.
+    const int cfg_gu = moe_env_cfg("EXL3_HIP_GROUPED_MOE_CFG_GU", 0);
+    const int cfg_down = moe_env_cfg("EXL3_HIP_GROUPED_MOE_CFG_DOWN", 0);
+    if (cfg_gu == 1)
+        moe_grouped_gemv_k3_kernel<false, true, 1><<<dim3(intermediate / 64, assignments, 2), 256, 0, stream>>>
     (reinterpret_cast<const half*>(gu_had.data_ptr()), selected_ptr, gt, ut,
      gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
+    else if (cfg_gu == 2)
+        moe_grouped_gemv_k3_kernel<false, true, 2><<<dim3(intermediate / 64, assignments, 2), 128, 0, stream>>>
+    (reinterpret_cast<const half*>(gu_had.data_ptr()), selected_ptr, gt, ut,
+     gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
+    else
+    {
+        dim3 gu_grid(intermediate / 32, assignments, 2);
+        moe_grouped_gemv_k3_kernel<false, true, 0><<<gu_grid, MOE_THREADS, 0, stream>>>
+        (reinterpret_cast<const half*>(gu_had.data_ptr()), selected_ptr, gt, ut,
+         gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
+    }
 
     moe_had_rows_kernel<false, false><<<dim3(2 * assignments, intermediate / 128), 32, 0, stream>>>
     (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, gsvh, usvh,
@@ -584,10 +616,21 @@ void exl3_moe_gfx12_k3
     (down_had.data_ptr(), down_had.data_ptr(), selected_ptr, dsuh, dsuh,
      assignments, intermediate, experts, false);
 
-    dim3 down_grid(MOE_HIDDEN / 32, assignments, 1);
-    moe_grouped_gemv_k3_kernel<true, false><<<down_grid, MOE_THREADS, 0, stream>>>
+    if (cfg_down == 1)
+        moe_grouped_gemv_k3_kernel<true, false, 1><<<dim3(MOE_HIDDEN / 64, assignments, 1), 256, 0, stream>>>
     (reinterpret_cast<const half*>(down_had.data_ptr()), selected_ptr, dt, dt,
      down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
+    else if (cfg_down == 2)
+        moe_grouped_gemv_k3_kernel<true, false, 2><<<dim3(MOE_HIDDEN / 64, assignments, 1), 128, 0, stream>>>
+    (reinterpret_cast<const half*>(down_had.data_ptr()), selected_ptr, dt, dt,
+     down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
+    else
+    {
+        dim3 down_grid(MOE_HIDDEN / 32, assignments, 1);
+        moe_grouped_gemv_k3_kernel<true, false, 0><<<down_grid, MOE_THREADS, 0, stream>>>
+        (reinterpret_cast<const half*>(down_had.data_ptr()), selected_ptr, dt, dt,
+         down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
+    }
 
     moe_had_rows_kernel<false, true><<<dim3(assignments, MOE_HIDDEN / 128), 32, 0, stream>>>
     (down_out.data_ptr(), down_out.data_ptr(), selected_ptr, dsvh, dsvh,
@@ -739,13 +782,31 @@ void exl3_moe_gfx12_k3_prefill
     // counts (decode rows 2-5) the second is far tighter — at rows=2 it is 20
     // slots vs 514 — so take the smaller of the two; large-A prefill keeps the
     // old bound.
+    // Inverse schedule variants: the prefill route defaults to CFG 2
+    // (128 threads / 64 cols / 4 K-splits); CFG 0/1 are selectable per
+    // specialization for the rows 2-5 crossover and prefill-shape tuning.
     const int chunk_slots = std::min(
         CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + experts, assignments);
-    dim3 gu_grid(intermediate / 64, chunk_slots, 2);
-    moe_prefill_grouped_gemv_k3_kernel<false, true, 2><<<gu_grid, 128, 0, stream>>>
+    const int cfg_pf_gu = moe_env_cfg("EXL3_HIP_PREFILL_MOE_CFG_GU", 2);
+    const int cfg_pf_down = moe_env_cfg("EXL3_HIP_PREFILL_MOE_CFG_DOWN", 2);
+    if (cfg_pf_gu == 1)
+        moe_prefill_grouped_gemv_k3_kernel<false, true, 1><<<dim3(intermediate / 64, chunk_slots, 2), 256, 0, stream>>>
     (reinterpret_cast<const half*>(gu_had.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr,
      gt, ut,
      gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
+    else if (cfg_pf_gu == 0)
+        moe_prefill_grouped_gemv_k3_kernel<false, true, 0><<<dim3(intermediate / 32, chunk_slots, 2), 512, 0, stream>>>
+    (reinterpret_cast<const half*>(gu_had.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr,
+     gt, ut,
+     gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
+    else
+    {
+        dim3 gu_grid(intermediate / 64, chunk_slots, 2);
+        moe_prefill_grouped_gemv_k3_kernel<false, true, 2><<<gu_grid, 128, 0, stream>>>
+        (reinterpret_cast<const half*>(gu_had.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr,
+         gt, ut,
+         gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
+    }
 
     moe_prefill_had_rows_kernel<false, false>
         <<<dim3(2 * assignments, intermediate / 128), 32, 0, stream>>>
@@ -762,11 +823,25 @@ void exl3_moe_gfx12_k3_prefill
     (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsuh, dsuh,
      assignments, intermediate, experts, false);
 
-    dim3 down_grid(MOE_HIDDEN / 64, chunk_slots, 1);
-    moe_prefill_grouped_gemv_k3_kernel<true, false, 2><<<down_grid, 128, 0, stream>>>
+    // Inverse schedule variants, down specialization (see cfg_pf_gu above).
+    if (cfg_pf_down == 1)
+        moe_prefill_grouped_gemv_k3_kernel<true, false, 1><<<dim3(MOE_HIDDEN / 64, chunk_slots, 1), 256, 0, stream>>>
     (reinterpret_cast<const half*>(gu_out.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr,
      dt, dt,
      down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
+    else if (cfg_pf_down == 0)
+        moe_prefill_grouped_gemv_k3_kernel<true, false, 0><<<dim3(MOE_HIDDEN / 32, chunk_slots, 1), 512, 0, stream>>>
+    (reinterpret_cast<const half*>(gu_out.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr,
+     dt, dt,
+     down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
+    else
+    {
+        dim3 down_grid(MOE_HIDDEN / 64, chunk_slots, 1);
+        moe_prefill_grouped_gemv_k3_kernel<true, false, 2><<<down_grid, 128, 0, stream>>>
+        (reinterpret_cast<const half*>(gu_out.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr,
+         dt, dt,
+         down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
+    }
 
     moe_prefill_had_rows_kernel<false, true>
         <<<dim3(assignments, MOE_HIDDEN / 128), 32, 0, stream>>>
