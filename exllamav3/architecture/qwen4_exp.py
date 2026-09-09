@@ -305,7 +305,7 @@ class Qwen4ExpModel(Model):
 
         self.calibration_all_experts = True
         self.caps.update({
-            "supports_tp": False,
+            "supports_tp": True,
             "recurrent_states": True,
             "default_recurrent_checkpoint_interval": 2048,
             "linear_attn": True,

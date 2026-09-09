@@ -1008,8 +1008,16 @@ class Attention(Module):
         storage += self.k_proj.storage_size()
         storage += self.v_proj.storage_size() if self.v_proj else 0
         storage += self.o_proj.storage_size()
+        storage_per_device = 0
         for cl in self.cache_layers:
-            storage += cl.storage_size()
+            if self.qsa_indexer is not None:
+                # QSA: the indexer's side planes are replicated per rank; only the main K/V
+                # storage is split
+                plane = cl.plane_storage_size()
+                storage += cl.storage_size() - plane
+                storage_per_device += plane
+            else:
+                storage += cl.storage_size()
         overhead_d = 0
         overhead_d += self.hidden_size * (self.out_dtype or torch.half).itemsize
         overhead_s = 0
@@ -1023,6 +1031,9 @@ class Attention(Module):
             self.v_proj.recons_size() if self.v_proj else 0,
             self.o_proj.recons_size(),
         )
+        if self.qsa_indexer is not None:
+            storage_per_device += self.qsa_indexer.storage_size()
+            overhead_d += self.qsa_indexer.index_qk_proj.recons_size()
         channel_width = 1
         channels_to_split = self.num_kv_heads
         while channel_width * self.head_dim < 128:
@@ -1037,7 +1048,7 @@ class Attention(Module):
             key = self.key,
             channel_width = channel_width,
             channel_unit = "heads",
-            storage_per_device = 0,
+            storage_per_device = storage_per_device,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
@@ -1049,8 +1060,6 @@ class Attention(Module):
 
 
     def tp_export(self, plan, producer):
-        if self.qsa_indexer is not None:
-            raise RuntimeError("Tensor parallelism is not supported for QSA attention")
         assert self.device is not None, "Cannot export module for TP before loading."
 
         def _export(child):
@@ -1092,6 +1101,7 @@ class Attention(Module):
                 "o_proj",
                 "g_proj",
             )},
+            "qsa_indexer": _export(self.qsa_indexer),
             # Learned attention sinks (gpt-oss): one logit per query head, sliced to the local heads on import
             "sinks": producer.send(self.sinks) if self.sinks is not None else None,
             "device": self.device,
@@ -1155,6 +1165,8 @@ class Attention(Module):
             return exported[name]["cls"].tp_import_split(local_context, exported[name], plan, split) \
                 if split and exported.get(name) else None
 
+        qsa_indexer = _import("qsa_indexer") if num_kv_heads else None
+
         module = Attention(
             config = None,
             **exported["kwargs"],
@@ -1170,6 +1182,7 @@ class Attention(Module):
             kv_proj = _import_split("kv_proj", kv_split),
             o_proj = _import_split("o_proj", o_split),
             g_proj = _import_split("g_proj", qh_split),
+            qsa_indexer = qsa_indexer,
         )
 
         # Attention sinks are one logit per query head; each rank keeps its local head range

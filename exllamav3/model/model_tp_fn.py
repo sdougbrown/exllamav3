@@ -50,6 +50,11 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
                 uuid = backend_args["uuid"],
             )
         case "native":
+            if not hasattr(ext, "pg_init_context"):
+                raise NotImplementedError(
+                    "Native TP backend requires the pg_* extension functions, which are not "
+                    "available in this build. Use the 'nccl' backend."
+                )
             backend = TPBackendNative(
                 device = device,
                 active_devices = active_devices,

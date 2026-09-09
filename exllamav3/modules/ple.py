@@ -11,6 +11,7 @@ from .ngram_embedding import NGramEmbedding
 from ..ext import exllamav3_ext as ext
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..model.config import Config
+from ..model.model_tp_alloc import TPAllocation
 from ..util.tensor import get_for_device
 
 """
@@ -245,6 +246,85 @@ class PLELayer(Module):
     def optimizer_targets(self):
         return self.key_proj.optimizer_targets() + self.value_proj.optimizer_targets()
 
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
+        # PLE state and small projection weights are replicated across ranks (no child
+        # recursion): the n-gram table stays rank-local and file-backed, and the recurrent
+        # state is per-rank. Shape-derived, since conversion reads the count after unload()
+        storage = self.weights_numel() * 2
+        tpa = TPAllocation(
+            key = self.key,
+            storage_per_device = storage,
+            storage_to_split = 0,
+            channels_to_split = 1,
+        )
+        return [tpa]
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        emb = self.ple_embedding
+        stream_from_disk = emb.stream_from_disk
+        if stream_from_disk is None:
+            stream_from_disk = emb.mode is not None and emb.mode.endswith("_disk")
+        return {
+            "cls": PLELayer,
+            "kwargs": {
+                "key": self.key,
+                "layer_idx": self.layer_idx,
+                "hidden_size": self.hidden_size,
+                "hc_mult": self.hc_mult,
+                "ple_embed_dim": emb.ple_embed_dim,
+                "ngram_size": emb.ngram_size,
+                "heads_per_ngram": emb.heads_per_ngram,
+                "eos_token_id": emb.eos_token_id,
+                "conv_kernel_size": self.conv_kernel_size,
+                "rms_norm_eps": self.norm_key.rms_norm_eps,
+                "qmap": self.key_proj.qmap,
+                "stream_from_disk": stream_from_disk,
+                "out_dtype": self.out_dtype,
+                "mm_token_id": self.mm_token_id,
+            },
+            **{name: getattr(self, name).tp_export(plan, producer) for name in (
+                "ple_embedding", "key_proj", "value_proj", "norm_key", "norm_query", "norm_conv")},
+            "conv_w": producer.send(self.conv_w),
+            "recurrent_layers": [rl.tp_export(plan) for rl in self.recurrent_layers],
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+
+        def _import(name):
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan)
+
+        module = PLELayer(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.ple_embedding = _import("ple_embedding")
+        module.key_proj = _import("key_proj")
+        module.value_proj = _import("value_proj")
+        module.norm_key = _import("norm_key")
+        module.norm_query = _import("norm_query")
+        module.norm_conv = _import("norm_conv")
+        module.modules = [module.ple_embedding, module.key_proj, module.value_proj,
+                          module.norm_key, module.norm_query, module.norm_conv]
+        module.conv_w = consumer.recv(exported["conv_w"], cuda = True).contiguous()
+        for exp_state in exported["recurrent_layers"]:
+            module.recurrent_layers.append(exp_state["cls"](module, **exp_state["args"]))
+        module.load_local(device)
+        module.device = device
+        return module
+
+    def load_local(self, device: torch.device):
+        """TP import: allocate the recurrent state on the worker device and register it in
+        the exported look-up. No stc access (the tensor collection is not available to TP
+        workers)."""
+        for rl in self.recurrent_layers:
+            rl.alloc(device)
+            self.tp_recurrent_lookup[rl.cache_id] = rl
+
     def _short_conv(self, x: torch.Tensor, conv_state: torch.Tensor | None):
         """
         x: (bsz, seq, hc_hidden) normed gated values. conv_state: (bsz, hc_hidden,
@@ -349,8 +429,11 @@ class PLELayer(Module):
 
         rsg = params.get("recurrent_states")
         if rsg:
-            layer_instance = (self.layer_idx, params.get("layer_instance", 0))
-            rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+            if rsg[0].exported:
+                rsl = self.tp_recurrent_lookup[rsg[0].cache]
+            else:
+                layer_instance = (self.layer_idx, params.get("layer_instance", 0))
+                rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
             conv_state, id_state = rsl.get_state_tensors()
             slots = get_for_device(params, "recurrent_slots", "cpu").tolist()
             assert len(slots) == bsz
