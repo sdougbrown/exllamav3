@@ -1,6 +1,7 @@
 import torch
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import get_for_device, buffered_arange
+from . import gdn_aiter_adapter as _aiter_adapter
 
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
@@ -204,7 +205,25 @@ def gated_delta_rule_fn(
         return core_attn_out
 
     # Chunked rule
-    if seqlen >= num_v_heads and chunk_gated_delta_rule is not None and not history:
+    chunked_eligible = seqlen >= num_v_heads and not history
+    use_aiter = (
+        chunked_eligible
+        and not channelwise_g
+        and _aiter_adapter.optin_enabled()
+        and _aiter_adapter.aiter_eligible(
+            seqlen, history, channelwise_g, k_head_dim, v_head_dim, num_v_heads, num_k_heads
+        )
+    )
+    if use_aiter:
+        # Opt-in AITER chunked backend; lazy import fails clearly before any
+        # state mutation. Unselected slots and the native K,V pool layout are
+        # preserved (transpose happens inside the adapter, costs included).
+        return _aiter_adapter.aiter_chunked_gdn_prefill(
+            mixed_qkv, beta, g, recurrent_state, recurrent_slots, save_state,
+            num_k_heads, num_v_heads, k_head_dim, v_head_dim,
+        )
+
+    if chunked_eligible and chunk_gated_delta_rule is not None:
 
         q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
         q = q.view(bsz, seqlen, -1, k_head_dim)
