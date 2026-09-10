@@ -105,11 +105,40 @@ def test_qsa_cache_mapping_rejects_unknown_cache_types():
         Attention.cache_layer_type(SimpleNamespace(qsa_indexer = object()), object, {})
 
 
-def test_qsa_tensor_parallelism_fails_before_exporting_an_incomplete_indexer():
+def test_qsa_tp_export_proceeds_with_indexer():
+    # QSA TP is supported (Stage 3): tp_export no longer raises; the indexer is exported
+    # as a replicated child
     attention = object.__new__(Attention)
-    attention.qsa_indexer = object()
-    with pytest.raises(RuntimeError, match = "Tensor parallelism.*QSA"):
-        attention.tp_export(None, None)
+    attention.qsa_indexer = SimpleNamespace(
+        tp_export = lambda plan, producer: {"cls": QSAIndexer, "stub": True})
+    attention.device = torch.device("cpu")
+    attention.key = "test"
+    attention.layer_idx = 0
+    attention.hidden_size = 16
+    attention.head_dim = 32
+    attention.rope_settings = None
+    attention.sm_scale = 32 ** -0.5
+    attention.out_dtype = None
+    attention.sliding_window = -1
+    attention.logit_softcapping = 0.0
+    attention.tp_split_norm = True
+    attention.use_k_as_v = False
+    attention.interleaved_gate = False
+    attention.num_kv_heads = 1
+    attention.num_q_heads = 2
+    attention.q_norm = None
+    attention.k_norm = None
+    attention.v_norm = None
+    attention.q_proj = None
+    attention.k_proj = None
+    attention.v_proj = None
+    attention.kv_proj = None
+    attention.o_proj = None
+    attention.g_proj = None
+    attention.sinks = None
+    attention.cache_layers = []
+    exported = attention.tp_export({}, None)
+    assert exported["qsa_indexer"]["stub"] is True
 
 
 def test_qsa_sparse_route_crosses_threshold_only_after_dense_exact_limit():

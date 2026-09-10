@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 import time
 import numpy as np
+from datetime import timedelta
 from .model_tp_cuda import (
     cuda_host_register,
     cuda_host_unregister,
@@ -45,17 +46,20 @@ class TPBackendNCCL:
         init_method: str,
         master: bool,
         uuid: str,
-        shbuf_size: int = SHBUF_SIZE,
+        backend: str = "nccl",
+        timeout_s: float = 1800.0,
     ):
         """
-        NCCL-backed tensor-parallel communication backend.
+        torch.distributed-backed tensor-parallel communication backend.
 
-        CUDA worker processes join a torch.distributed NCCL process group for barriers and all-reduce operations.
-        The CPU helper process skips NCCL initialization. Operations not currently implemented directly with NCCL,
-        such as broadcast and gather variants, delegate to a native shared-memory fallback backend so the rest of
-        the TP code can use one backend interface.
+        CUDA worker processes join a torch.distributed process group (NCCL on CUDA/ROCm, or any other
+        backend for host-only testing) for barriers, broadcasts, all-reduces and gathers. The CPU helper
+        process (device < 0) skips process-group initialization entirely. master and uuid are retained
+        for interface compatibility with the native backend construction path and are unused here.
         """
         self.device = device
+        self.backend = backend
+        self._pg_initialized = False
         if device < 0:
             log_tp(device, f"NCCL init: skip CPU process")
             return
@@ -67,21 +71,15 @@ class TPBackendNCCL:
         log_tp(device, f"NCCL init: world_size {self.world_size}, rank {self.rank}, device {device}, init_method {init_method}")
         print(f" -- NCCL init: world_size {self.world_size}, rank {self.rank}, device {device}, init_method {init_method}")
         dist.init_process_group(
-            "nccl",
+            backend,
             rank = self.rank,
             world_size = self.world_size,
             init_method = init_method,
+            timeout = timedelta(seconds = timeout_s),
+            device_id = torch.device(device) if backend == "nccl" else None,
         )
+        self._pg_initialized = True
         self.mp_warmup_nccl(device)
-        self.fallback = TPBackendNative(
-            device,
-            active_devices,
-            output_device,
-            init_method,
-            master,
-            uuid,
-            shbuf_size
-        )
 
 
     def mp_warmup_nccl(self, device):
@@ -91,7 +89,8 @@ class TPBackendNCCL:
         by TP loader as soon as processes are spawned and process group is initialized.
         """
         print(f" -- NCCL warmup, device {device}, please wait...")
-        x = torch.ones((6,), device = device)
+        dev = "cpu" if self.backend != "nccl" else device
+        x = torch.ones((6,), device = dev)
         dist.all_reduce(x)
         print(f" -- Finished NCCL warmup, device {device}")
 
@@ -101,9 +100,10 @@ class TPBackendNCCL:
             log_tp(self.device, f"NCCL close: skip CPU process")
             return
 
-        dist.barrier()
-        self.fallback.close()
-        dist.destroy_process_group()
+        if self._pg_initialized:
+            dist.barrier()
+            dist.destroy_process_group()
+            self._pg_initialized = False
 
 
     def fwd_barrier(self):
@@ -111,19 +111,50 @@ class TPBackendNCCL:
 
 
     def broadcast(self, tensor: torch.Tensor, src_device: int):
-        self.fallback.broadcast(tensor, src_device)
-        # src_rank = self.active_devices.index(src_device)
-        # dist.broadcast(tensor, src = src_rank)
+        src_rank = self.active_devices.index(src_device)
+        dist.broadcast(tensor, src = src_rank)
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
-        if tensor.dtype == torch.float32:
-            temp = tensor.to(torch.bfloat16)
-            dist.all_reduce(temp, async_op = False)
-            temp = temp.to(torch.float32)
-            tensor.copy_(temp)
+        if not contribution:
+            tensor.zero_()
+        dist.all_reduce(tensor, async_op = False)
+
+
+    def _gather_impl(
+        self,
+        tensor: torch.Tensor,
+        out_tensor: torch.Tensor | None,
+        gather_devices: torch.Tensor | None,
+        out_device: int,
+        ldims: list[int]
+    ):
+        gather_devices = [int(d) for d in gather_devices]
+        assert gather_devices == sorted(gather_devices), \
+            f"Gather: gather_devices must be sorted, got {gather_devices}"
+        dst_rank = self.active_devices.index(out_device)
+        if self.rank == dst_rank:
+            assert out_tensor is not None, \
+                f"Gather: Output device must supply output tensor"
+            assert out_tensor.shape[-1] == sum(ldims), \
+                f"Gather: Output tensor must match size of concatenated slices: {sum(ldims)}"
+            od = 0
+            for d, ldim in zip(gather_devices, ldims):
+                if ldim == 0:
+                    continue
+                out_slice = out_tensor[..., od : od + ldim]
+                od += ldim
+                if d == self.device:
+                    out_slice.copy_(tensor)
+                else:
+                    rbuf = torch.empty_like(out_slice)
+                    dist.recv(rbuf, src = self.active_devices.index(d))
+                    out_slice.copy_(rbuf)
         else:
-            dist.all_reduce(tensor, async_op = False)
+            if self.device in gather_devices:
+                ldim = ldims[gather_devices.index(self.device)]
+                if ldim > 0:
+                    dist.send(tensor, dst = dst_rank)
 
 
     def gather(
@@ -134,31 +165,7 @@ class TPBackendNCCL:
         out_device: int,
         ldims: list[int]
     ):
-        self.fallback.gather(tensor, out_tensor, gather_devices, out_device, ldims)
-
-        # dst_rank = self.active_devices.index(out_device)
-        # d_ldims = [0] * (max(self.active_devices) + 1)
-        # for d, m in zip(gather_devices, ldims):
-        #     d_ldims[d] = m
-        # ldims = [d_ldims[d] for d in self.active_devices]
-        #
-        # if self.rank == dst_rank:
-        #     od = 0
-        #     for src, ldim in enumerate(ldims):
-        #         if ldim == 0:
-        #             continue
-        #         out_slice = out_tensor[..., od : od + ldim]
-        #         od += ldim
-        #         if src == self.rank:
-        #             out_slice.copy(tensor)
-        #         else:
-        #             # print(f"rank {self.rank} recv {out_slice.shape[-1]} from {src}")
-        #             rbuf = torch.empty_like(out_slice)
-        #             dist.recv(rbuf, src = src)
-        #             out_slice.copy_(rbuf)
-        # elif tensor.shape[-1] > 0:
-        #     # print(f"rank {self.rank} send {tensor.shape[-1]} to {dst_rank}")
-        #     dist.send(tensor, dst = dst_rank)
+        self._gather_impl(tensor, out_tensor, gather_devices, out_device, ldims)
 
 
     def gather_small(
@@ -169,7 +176,7 @@ class TPBackendNCCL:
         out_device: int,
         ldims: list[int]
     ):
-        self.fallback.gather_small(tensor, out_tensor, gather_devices, out_device, ldims)
+        self._gather_impl(tensor, out_tensor, gather_devices, out_device, ldims)
 
 
     def run_cpu_reduce_jobs(self):

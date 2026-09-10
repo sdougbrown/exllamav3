@@ -45,6 +45,27 @@ _HIP_PREFILL_MAX_ROWS = 2048
 _HIP_PREFILL_MAX_EXPERT_ROWS = _HIP_PREFILL_MAX_ROWS * _HIP_ROUTER_TOP_K
 
 
+def _map_expert_ids_to_local(selected, routing_first, routing_last):
+    assert (routing_first is None) == (routing_last is None)
+    if routing_first is None:
+        return selected
+    local = selected - routing_first
+    expert_count = routing_last - routing_first
+    valid = (local >= 0) & (local < expert_count)
+    return torch.where(valid, local, torch.full_like(local, expert_count))
+
+
+def _hip_expert_shard_eligible(*, tp_mode, cpu_split_first, num_local_experts, lora,
+                               activate_all_experts, autosplit_measure, reconstruct,
+                               no_reconstruct, bias, padded_down, shape_ok, activation_ok):
+    return (
+        tp_mode in (None, "experts") and cpu_split_first is None and
+        num_local_experts > 0 and not lora and not activate_all_experts and
+        not autosplit_measure and not reconstruct and not no_reconstruct and
+        not bias and not padded_down and shape_ok and activation_ok
+    )
+
+
 def _hip_grouped_rows_eligible(rows: int) -> bool:
     return 1 <= rows <= _HIP_GROUPED_MAX_ROWS
 
@@ -894,12 +915,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             output = g_tensor_cache.get(
                 device, (rows, H), torch.float, f"moe_gfx12_pf_output_a{rows}"),
             expert_offsets = g_tensor_cache.get(
-                device, (self.num_experts + 1,), torch.long, "moe_gfx12_pf_offsets"),
+                device, (self.num_local_experts + 1,), torch.long, "moe_gfx12_pf_offsets"),
             inverse_order = g_tensor_cache.get(
                 device, (assignments,), torch.long, f"moe_gfx12_pf_inverse_a{assignments}"),
             expert_chunks = g_tensor_cache.get(
                 device,
-                (self.num_experts * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
+                (self.num_local_experts * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
                 torch.int,
                 "moe_gfx12_pf_chunks",
             ),
@@ -961,14 +982,30 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Dedicated ROCm decode route. Keep this exact until additional shapes and split
         # semantics have their own oracle coverage; in particular, expert-parallel and
         # intermediate-split modules must continue through the established fallback.
-        full_expert_layer = (
-            len(self.ups) == self.num_experts and
-            (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
-            (self.routing_first is None or (
-                self.routing_first == 0 and self.routing_last == self.num_experts
-            )) and
-            self.cpu_split_first is None
+        routing_range_ok = (
+            (self.routing_first is None and self.routing_last is None) or
+            (self.routing_first is not None and self.routing_last is not None and
+             0 <= self.routing_first <= self.routing_last <= self.num_experts and
+             self.routing_last - self.routing_first == self.num_local_experts)
         )
+        full_expert_layer = len(self.ups) == self.num_local_experts and routing_range_ok
+        hip_shape_ok = (
+            self.is_quantized and self.gated and self.hidden_size == 2560 and
+            self.intermediate_size_padded in (640, 768) and
+            self.num_experts_per_tok == 10 and self.interm_dtype == torch.half and
+            self.act_limit == 0
+        )
+        hip_activation_ok = self.activation_fn == "silu"
+        hip_shard_ok = _hip_expert_shard_eligible(
+            tp_mode=self.tp_mode, cpu_split_first=self.cpu_split_first,
+            num_local_experts=self.num_local_experts or 0,
+            lora=self.hip_grouped_lora_blocked, activate_all_experts=False,
+            autosplit_measure=False, reconstruct=False,
+            no_reconstruct=self.config.infer_params.no_reconstruct,
+            bias=any(l.inner.bias is not None for l in self.gates + self.ups + self.downs),
+            padded_down=any(l.trim_padded_out and l.out_features != l.out_features_unpadded for l in self.downs),
+            shape_ok=hip_shape_ok, activation_ok=hip_activation_ok)
+        full_expert_layer = full_expert_layer and hip_shard_ok
         hip_grouped_device = False
         if (
             bool(torch.version.hip) and hasattr(ext, "exl3_moe_gfx12_k3") and
@@ -979,14 +1016,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 device_index = torch.cuda.current_device()
             hip_grouped_device = ext.exl3_gemv_supported(device_index)
         self.support_hip_grouped = (
-            hip_grouped_device and self.is_quantized and self.gated and self.activation_fn == "silu" and
-            self.hidden_size == 2560 and self.intermediate_size_padded in (640, 768) and
-            self.num_experts_per_tok == 10 and self.interm_dtype == torch.half and
-            self.act_limit == 0 and self.tp_mode is None and not self.hip_grouped_lora_blocked and
-            full_expert_layer and
-            all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
-            all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs) and
-            not self.config.infer_params.no_reconstruct
+            hip_grouped_device and full_expert_layer
         )
 
         # Make fused modules (only used by the quantized fast paths). Gateless experts have no
@@ -1357,7 +1387,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # by the mgemm kernel's position-preserving mask at num_tokens > 1 (out-of-range picks
         # inactive in place, so the grouped reduction's slot runs stay intact). Shared experts
         # are supported at any bsz via BC_GatedMLP's own multi-row graph (see mlp.py)
-        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN and not (self.tp_reduce and self.bc_sh_exp)
 
         # Routing
         if self.router_pre_norm:
@@ -1407,7 +1437,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # and every row-major assignment slot remains distinct.
         elif (
             _hip_grouped_rows_eligible(bsz) and self.support_hip_grouped and
-            self.tp_mode is None and self.act_limit == 0 and
+            self.tp_mode in (None, "experts") and self.act_limit == 0 and
             tuple(y.shape) == (bsz, _HIP_ROUTER_HIDDEN) and y.dtype == torch.half and
             tuple(selected_experts.shape) == (bsz, _HIP_ROUTER_TOP_K) and
             selected_experts.dtype == torch.long and
@@ -1423,10 +1453,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             buffers = self.hip_grouped_buffers
             assignments = bsz * _HIP_ROUTER_TOP_K
             output = buffers.output[:bsz]
+            selected_local = selected_experts if self.tp_mode is None else _map_expert_ids_to_local(
+                selected_experts, self.routing_first, self.routing_last).contiguous()
             ext.exl3_moe_gfx12_k3(
                 y,
                 output,
-                selected_experts,
+                selected_local,
                 routing_weights,
                 self.multi_gate.ptrs_trellis,
                 self.multi_gate.ptrs_suh,
@@ -1476,12 +1508,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                 # Map to local expert ids whenever this module holds a slice (TP shard or
                 # CPU expert split), not only in the multi-device routing case
-                if self.num_local_experts == self.num_experts:
-                    flat_expert_local = flat_expert_global
-                else:
-                    flat_expert_local = flat_expert_global - self.routing_first
-                    valid = (flat_expert_local >= 0) & (flat_expert_local < E)
-                    flat_expert_local = torch.where(valid, flat_expert_local, torch.full_like(flat_expert_local, E))
+                flat_expert_local = _map_expert_ids_to_local(
+                    flat_expert_global, self.routing_first, self.routing_last)
 
                 # Group once by local expert id (including sentinel for expert-P mode)
                 order = flat_expert_local.argsort(stable = True)
@@ -1532,8 +1560,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     )
 
                 hip_prefill_eligible = (
-                    self.support_hip_prefill and self.tp_mode is None and
-                    self.num_local_experts == self.num_experts and
+                    self.support_hip_prefill and self.tp_mode in (None, "experts") and
                     _hip_prefill_rows_eligible(num_tokens) and
                     y.dtype == torch.half and y.is_contiguous() and
                     selected_experts.is_contiguous() and routing_weights.is_contiguous() and
@@ -1543,13 +1570,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     not params.get("reconstruct") and not params.get("autosplit_measure")
                 )
                 if hip_prefill_eligible:
+                    selected_local = flat_expert_local.view(num_tokens, top_k).contiguous()
+                    # selected_experts_local is the local view passed to the fused prefill kernel.
                     buffers = self._ensure_hip_prefill_buffers(num_tokens)
                     assignments = num_tokens * top_k
                     output = buffers.output[:num_tokens]
                     ext.exl3_moe_gfx12_k3_prefill(
                         y,
                         output,
-                        selected_experts,
+                        selected_local,
                         routing_weights,
                         order,
                         expert_count,
@@ -1858,6 +1887,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.routed_post_norm:
             final_hidden_states = self.routed_post_norm.forward(final_hidden_states, params)
 
+        # Routed-only reduction before shared experts
+        if self.tp_reduce and not pre_norm_reduce:
+            params["backend"].all_reduce(
+                final_hidden_states,
+                self.intermediate_size > 0 and self.num_local_experts > 0
+            )
+
         # Shared experts
         if self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, params)
@@ -1873,13 +1909,6 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     ext.add_sigmoid_gate_proj(y, x, final_hidden_states, self.shared_gate.inner.weight)
             else:
                 final_hidden_states += y
-
-        # Output reduction
-        if self.tp_reduce and not pre_norm_reduce:
-            params["backend"].all_reduce(
-                final_hidden_states,
-                (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
-            )
 
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)
@@ -2043,7 +2072,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             gates = gates,
             ups = ups,
             downs = downs,
-            shared_experts = _import_no_reduce("shared_experts"),
+            shared_experts = _import("shared_experts"),
             shared_gate = _import("shared_gate"),
             routing_gate = _import("routing_gate") if device == output_device else None,
             routing_first = routing_first,
