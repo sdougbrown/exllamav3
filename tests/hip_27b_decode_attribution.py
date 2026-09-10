@@ -198,11 +198,18 @@ def main() -> None:
                 if args.profile_steps > 0 and step >= args.warmup_steps + args.profile_wait_steps:
                     profiled += 1
                     if profiled == args.profile_steps:
-                        prof.export_chrome_trace(str(out_dir / f"profile-{args.mode}-ctx{args.context}{args.tag}.json"))
+                        try:
+                            prof.export_chrome_trace(str(out_dir / f"profile-{args.mode}-ctx{args.context}{args.tag}.json"))
+                        except Exception as exc:
+                            print(f"profiler export skipped: {exc}", file=sys.stderr)
                         prof.__exit__(None, None, None)
                         prof = None
         finally:
             if prof is not None:
+                try:
+                    prof.export_chrome_trace(str(out_dir / f"profile-{args.mode}-ctx{args.context}{args.tag}.json"))
+                except Exception:
+                    pass
                 prof.__exit__(None, None, None)
             for key, attr in (("gemv", "exl3_gemv"), ("reconstruct", "reconstruct"),
                               ("reconstruct_slice", "reconstruct_slice"),
