@@ -78,16 +78,53 @@ __device__ __forceinline__ half2 decode_pair_cb2_dp4a_(uint32_t x0, uint32_t x1)
     return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
 }
 
+// gfx1201 fast form: V_SAD_U8(p, 0, 0x6400) == byte_sum(p) + 0x6400 == __dp4a(p,
+// 0x01010101, 0x6400) bit-exactly (the multiplier is 1 and the addend rides the
+// instruction's accumulator operand). gfx1201 lacks V_DOT4, but V_SAD_U8 is present
+// (MC encoding 0xd6 0x22 on gfx1201). This replaces ~5 VALU ops per state with ~3
+// (mul + sad + pair-pack) — the decode chain was instruction-issue-bound.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+__device__ __forceinline__ uint32_t exl3_sad_u8_(uint32_t p, uint32_t addend)
+{
+    uint32_t u;
+    asm("v_sad_u8 %0, %1, %2, %3" : "=v"(u) : "v"(p), "n"(0), "n"(addend));
+    return u;
+}
+
+__device__ __forceinline__ half2 decode_pair_cb2_sad_(uint32_t x0, uint32_t x1)
+{
+    x0 *= 0x83DCD12Du;
+    x1 *= 0x83DCD12Du;
+    // sum_i = u_i + 1024 (<= 2029, no 16-bit carry): pack the two states' values
+    // into one dword, then the same hfma2 as the dp4a form.
+    const uint32_t sum1 = exl3_sad_u8_(x1, 0x6400u);
+    const uint32_t sum0 = exl3_sad_u8_(x0, 0x6400u);
+    const uint32_t packed = (sum1 << 16) + sum0;
+    half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
+    half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
+    half_uint16 h0((uint16_t) packed);
+    half_uint16 h1((uint16_t)(packed >> 16));
+    return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+}
+#endif
+
 template <int cb>
 __device__ __forceinline__ void decode8(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3,
     uint32_t w4, uint32_t w5, uint32_t w6, uint32_t w7, FragB& f0, FragB& f1)
 {
     if constexpr (cb == 2)
     {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        f0[0] = decode_pair_cb2_sad_(w0, w1);
+        f0[1] = decode_pair_cb2_sad_(w2, w3);
+        f1[0] = decode_pair_cb2_sad_(w4, w5);
+        f1[1] = decode_pair_cb2_sad_(w6, w7);
+#else
         f0[0] = decode_pair_cb2_dp4a_(w0, w1);
         f0[1] = decode_pair_cb2_dp4a_(w2, w3);
         f1[0] = decode_pair_cb2_dp4a_(w4, w5);
         f1[1] = decode_pair_cb2_dp4a_(w6, w7);
+#endif
     }
     else
     {
