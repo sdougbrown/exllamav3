@@ -45,6 +45,19 @@ ITERS = 100
 WARMUP = 8
 
 
+def discover_shapes(model, max_classes=8):
+    """Pick representative EXL3 linear shape classes (in, out), largest-N first."""
+    classes = {}
+    for module in model:
+        inner = getattr(module, "inner", None)
+        if inner is None or not hasattr(inner, "trellis"):
+            continue
+        key = (inner.in_features, inner.out_features)
+        classes.setdefault(key, []).append(inner)
+    picked = sorted(classes, key=lambda k: -classes[k][0].out_features)[:max_classes]
+    return [(f"{i}->{o}", (i, o)) for i, o in sorted(picked, key=lambda k: -k[1])]
+
+
 def time_callable(fn, iters=ITERS, warmup=WARMUP):
     for _ in range(warmup):
         fn()
@@ -63,6 +76,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--auto-shapes", type=int, default=0,
+                    help="discover the N largest EXL3 linear shape classes from the model instead of the hardcoded 27B list")
+    ap.add_argument("--use-dev", default=None,
+                    help="per-device load budgets, e.g. '30,30' (default: all on device 0)")
     args = ap.parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -77,8 +94,11 @@ def main() -> None:
     model = Model.from_config(config)
     loaded = False
     try:
-        model.load(use_per_device=[31.0, 0.0], max_chunk_size=512, max_batch_size=1)
+        load_budgets = [float(x) for x in args.use_dev.split(",")] if args.use_dev else [31.0, 0.0]
+        model.load(use_per_device=load_budgets, max_chunk_size=512, max_batch_size=1)
         loaded = True
+
+        shape_classes = discover_shapes(model, args.auto_shapes) if args.auto_shapes else SHAPES
 
         # one representative linear per (in,out) shape (Linear.load_exl3 stores the
         # EXL3 implementation in .inner; plain FP16 linears have no .inner)
@@ -88,13 +108,13 @@ def main() -> None:
             if inner is None or not hasattr(inner, "trellis"):
                 continue
             key = (inner.in_features, inner.out_features)
-            if key in [s[1] for s in SHAPES] and key not in picked:
+            if key in [s[1] for s in shape_classes] and key not in picked:
                 picked[key] = inner
-            if len(picked) == len(SHAPES):
+            if len(picked) == len(shape_classes):
                 break
 
         rows = []
-        for name, (inp, outp) in SHAPES:
+        for name, (inp, outp) in shape_classes:
             lin = picked.get((inp, outp))
             if lin is None:
                 print(f"skip {name}: no linear found")

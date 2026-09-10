@@ -42,6 +42,31 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
     return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
 }
 
+// gfx1201: V_SAD_U8(p, 0, 0x6400) == byte_sum(p) + 0x6400 bit-exactly (gfx1201 lacks
+// V_DOT4; the dp4a byte-sum is emulated with ~5 VALU ops per state, the SAD form is one
+// instruction and the decode chain is instruction-issue-bound). Same contract as
+// decode_mul1_product_2; see the 2026-09-10 campaign (exl3-decode attribution, §13).
+#if defined(__gfx1200__) || defined(__gfx1201__)
+__device__ inline uint32_t exl3_sad_u8_(uint32_t p, uint32_t addend)
+{
+    uint32_t u;
+    asm("v_sad_u8 %0, %1, %2, %3" : "=v"(u) : "v"(p), "n"(0), "n"(addend));
+    return u;
+}
+
+__device__ inline half2 decode_mul1_product_2_sad(uint32_t x0, uint32_t x1)
+{
+    const uint32_t sum1 = exl3_sad_u8_(x1, 0x6400u);
+    const uint32_t sum0 = exl3_sad_u8_(x0, 0x6400u);
+    const uint32_t packed = (sum1 << 16) + sum0;   // u + 1024 <= 2029: no 16-bit carry
+    half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
+    half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
+    half_uint16 h0((uint16_t) packed);
+    half_uint16 h1((uint16_t)(packed >> 16));
+    return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+}
+#endif
+
 // PTX lop3 LUT 0x6a with operands (a, b, c) implements c ^ (a & b).
 // Keep this expression portable instead of relying on inline PTX.
 __device__ __forceinline__ uint32_t lop3_0x6a(uint32_t a, uint32_t b, uint32_t c)
@@ -126,7 +151,11 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
     {
         x0 *= 0x83DCD12Du;
         x1 *= 0x83DCD12Du;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        return decode_mul1_product_2_sad(x0, x1);
+#else
         return decode_mul1_product_2(x0, x1);
+#endif
     }
 }
 
