@@ -152,6 +152,68 @@ __device__ __forceinline__ HipFp16x8 assemble_b_frag_gfx12(const FragB& b_hi, co
 
 // mma m16n8k16 x2 (n=16)  ->  one v_wmma_f32_16x16x16_f16
 // A from a01/a23, B from b_hi(=f0, cols 0..7) + b_lo(=f1, cols 8..15), fp32 accumulate.
+// Shuffle-path B assembly: gather the gfx12 operand via __shfl_sync on the decoded
+// registers instead of the warp-private LDS staging buffer. Probed bit-exact against
+// the LDS path on gfx1201/ROCm 7.2.4 (probe-shfl-wmma.cpp, campaign
+// 27b-decode-attribution-20260910T031505Z): the documented shfl->WMMA hardware
+// exception applies only to half2 values built from two unaligned __half loads; the
+// decode path's hfma2-computed FragB values are safe. Cost: 4 shuffles per tile per
+// j-tile of the operand (16 per 16x16 tile), no barriers, no LDS traffic.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+__device__ __forceinline__ HipFp16x8 assemble_b_frag_gfx12_shfl(const FragB& b_hi, const FragB& b_lo)
+{
+    const int lane = (int)(threadIdx.x & 31);
+    const int col = lane & 15;                 // AMD B column this lane contributes
+    const int khalf = lane >> 4;               // 0: k 0..7, 1: k 8..15
+    const uint64_t mask = 0xffffffffull;
+    // CUDA fragment (m16n8k16): lane l, g = l>>2, t = l&3:
+    //   b_hi[0] = B[2t][g],B[2t+1][g]   b_hi[1] = B[2t+8][g],B[2t+9][g]
+    //   b_lo[0] = B[2t][g+8],...        b_lo[1] = B[2t+8][g+8],...
+    // The reader wants B[k0+2j (+1)][col] with k0 = 8*khalf: CUDA lane 4*(col&7)+j,
+    // register b_hi (col < 8) or b_lo (col >= 8), element khalf.
+    HipFp16x8 b = {};
+    __half2* bw = (__half2*)&b;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+        const int src = 4 * (col & 7) + j;
+        const __half2 s00 = __shfl_sync(mask, b_hi[0], src);
+        const __half2 s01 = __shfl_sync(mask, b_hi[1], src);
+        const __half2 s10 = __shfl_sync(mask, b_lo[0], src);
+        const __half2 s11 = __shfl_sync(mask, b_lo[1], src);
+        bw[j] = (col >= 8) ? (khalf ? s11 : s10) : (khalf ? s01 : s00);
+    }
+    return b;
+}
+
+// Runtime-selected shuffle variant of mma_ab_h_hip_gfx12_preassembled_a: same
+// contract, but the B operand comes from register shuffles instead of LDS staging.
+template <typename FragC_t>
+__device__ __forceinline__ void mma_ab_h_hip_gfx12_shfl(
+    const HipFp16x8& a,
+    const FragB& b_hi,
+    const FragB& b_lo,
+    FragC_t& c)
+{
+    static_assert(sizeof(FragC_t) == sizeof(HipFp32x8),
+                  "gfx12 path accumulates in 8 fp32 per lane (FragC8)");
+    HipFp16x8 b = assemble_b_frag_gfx12_shfl(b_hi, b_lo);
+    HipFp32x8 d = *reinterpret_cast<HipFp32x8*>(&c);
+    d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, d);
+    *reinterpret_cast<HipFp32x8*>(&c) = d;
+}
+
+__device__ __forceinline__ bool exl3_gfx12_shfl_b_enabled()
+{
+    static const bool on = []
+    {
+        const char* env = getenv("EXL3_GEMV_SHFL");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return on;
+}
+#endif
+
 #if defined(__gfx1200__) || defined(__gfx1201__)
 template <typename FragC_t>
 __device__ __forceinline__ void mma_ab_h_hip_gfx12_preassembled_a(
@@ -162,6 +224,11 @@ __device__ __forceinline__ void mma_ab_h_hip_gfx12_preassembled_a(
 {
     static_assert(sizeof(FragC_t) == sizeof(HipFp32x8),
                   "gfx12 path accumulates in 8 fp32 per lane (FragC8)");
+    if (exl3_gfx12_shfl_b_enabled())
+    {
+        mma_ab_h_hip_gfx12_shfl(a, b_hi, b_lo, c);
+        return;
+    }
     HipFp16x8 b = assemble_b_frag_gfx12(b_hi, b_lo);
     HipFp32x8 d = *reinterpret_cast<HipFp32x8*>(&c);
     d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, d);
