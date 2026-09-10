@@ -185,9 +185,14 @@ __device__ __forceinline__ HipFp16x8 assemble_b_frag_gfx12_shfl(const FragB& b_h
     }
     return b;
 }
+#endif
 
-// Runtime-selected shuffle variant of mma_ab_h_hip_gfx12_preassembled_a: same
+// Opt-in shuffle variant of mma_ab_h_hip_gfx12_preassembled_a: same
 // contract, but the B operand comes from register shuffles instead of LDS staging.
+// Measured ~1% on the 27B decode shapes (campaign msweep, 2026-09-10): the LDS staging
+// was already well hidden, so this is retained as an opt-in helper, not wired into the
+// dispatch. Do not select it with a device-side getenv: host-selected variants only.
+#if defined(__gfx1200__) || defined(__gfx1201__)
 template <typename FragC_t>
 __device__ __forceinline__ void mma_ab_h_hip_gfx12_shfl(
     const HipFp16x8& a,
@@ -202,16 +207,6 @@ __device__ __forceinline__ void mma_ab_h_hip_gfx12_shfl(
     d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, d);
     *reinterpret_cast<HipFp32x8*>(&c) = d;
 }
-
-__device__ __forceinline__ bool exl3_gfx12_shfl_b_enabled()
-{
-    static const bool on = []
-    {
-        const char* env = getenv("EXL3_GEMV_SHFL");
-        return env && env[0] == '1' && env[1] == '\0';
-    }();
-    return on;
-}
 #endif
 
 #if defined(__gfx1200__) || defined(__gfx1201__)
@@ -224,11 +219,6 @@ __device__ __forceinline__ void mma_ab_h_hip_gfx12_preassembled_a(
 {
     static_assert(sizeof(FragC_t) == sizeof(HipFp32x8),
                   "gfx12 path accumulates in 8 fp32 per lane (FragC8)");
-    if (exl3_gfx12_shfl_b_enabled())
-    {
-        mma_ab_h_hip_gfx12_shfl(a, b_hi, b_lo, c);
-        return;
-    }
     HipFp16x8 b = assemble_b_frag_gfx12(b_hi, b_lo);
     HipFp32x8 d = *reinterpret_cast<HipFp32x8*>(&c);
     d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, d);

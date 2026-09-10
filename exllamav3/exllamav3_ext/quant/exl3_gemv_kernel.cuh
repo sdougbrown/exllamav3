@@ -274,9 +274,12 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
     __shared__ float sh_red[WK][RED_ROWS][COLS];
 #if defined(USE_ROCM) || defined(__HIPCC__)
-    // HIP: staged extraction always on (gfx12 WMMA operands must not come from __shfl_sync;
-    // see hip_mma.cuh). SMEM_STAGE is ignored and the staging buffer is unconditional.
-    __shared__ uint32_t sh_stage[WK][LOADS * LSTRIDE];
+    // HIP: staged extraction is the default (gfx12 WMMA operands must not come from
+    // __shfl_sync; see hip_mma.cuh). SMEM_STAGE=false instantiates the no-staging variant:
+    // for bits == 4 the tile words the decode needs are already in registers (bw[t]), and
+    // the circular predecessor arrives via a computed-value __shfl_sync (probed safe:
+    // the shuffled value feeds the decode ALU; WMMA operands remain hfma2-computed).
+    [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
 #else
     [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
 #endif
@@ -340,6 +343,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             }
 
 #if defined(USE_ROCM) || defined(__HIPCC__)
+            if constexpr (SMEM_STAGE)
+            {
             // Staged extraction: write valid tile words to warp-private smem, then decode.
             // The padded K5 tail is never read or written.
             __syncwarp();
@@ -351,6 +356,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     sh_stage[warp][stage_word] = bw[l];
             }
             __syncwarp();
+            }
 #else
             if constexpr (SMEM_STAGE)
             {
@@ -382,6 +388,20 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             {
                 FragB f0, f1;
 #if defined(USE_ROCM) || defined(__HIPCC__)
+                if constexpr (!SMEM_STAGE && bits == 4)
+                {
+                    // No-staging variant (K4): tile t's per-lane word is bw[t] (LSTRIDE ==
+                    // TWORDS == 32 for bits == 4, so stage_word l*32+lane maps load l to tile
+                    // l unguarded); the circular predecessor comes from a register shuffle.
+                    // All 32 lanes are active in the decode loop, so the maskless HIP shfl
+                    // (compat_rocm.cuh maps __shfl_sync) is well-defined. The shuffled word
+                    // feeds only the decode ALU; WMMA operands remain hfma2-computed (probed
+                    // safe on gfx1201, see campaign probe-shfl-wmma.cpp).
+                    const uint32_t prev = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
+                    exl3_gemv_ns::dq8_regs_4bits<cb>(prev, bw[t], f0, f1);
+                }
+                else
+                {
                 const uint32_t* tp = &sh_stage[warp][t * TWORDS];
                 if constexpr (bits == 5 || bits == 6)
                     dq_dispatch<bits, cb>(tp, lane * 8, f0, f1);
@@ -391,6 +411,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     exl3_gemv_ns::dq8_regs_2bits<cb>(tp[x_src_a], tp[x_src_b], lane << 3, f0, f1);
                 else
                     exl3_gemv_ns::dq8_regs_3bits<cb>(tp[x_src_a], tp[x_src_b], x_s2, f0, f1);
+                }
 
                 // One WMMA covers the full 16x16 tile: f0 = cols 0..7 (b_hi), f1 = cols 8..15
                 // (b_lo); operands are reassembled through the LDS staging inside hip_mma.cuh,

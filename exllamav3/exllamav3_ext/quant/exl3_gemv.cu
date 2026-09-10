@@ -964,6 +964,16 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     #define SEL_MMODE2_GRID(bits_, cb_) \
         SEL(bits_, cb_, false, 2, 0) SEL(bits_, cb_, false, 2, 1) \
         SEL(bits_, cb_, true,  2, 0) SEL(bits_, cb_, true,  2, 1)
+    // No-staging (register-shuffle trellis gather) K4/mul1 variants; selected by
+    // EXL3_GEMV_NOSTAGE=1. bits 2/3/5/6 keep staging (their decode needs the staged
+    // tile-word layout; the shuffled-word path is a bits-4-specific mapping).
+    #define SEL_NOSTAGE(bits_, cb_) \
+        SEL(bits_, cb_, false, 0, 0) SEL(bits_, cb_, false, 0, 1) \
+        SEL(bits_, cb_, false, 1, 0) SEL(bits_, cb_, false, 1, 1) \
+        SEL(bits_, cb_, false, 2, 0) SEL(bits_, cb_, false, 2, 1) \
+        SEL(bits_, cb_, true,  0, 0) SEL(bits_, cb_, true,  0, 1) \
+        SEL(bits_, cb_, true,  1, 0) SEL(bits_, cb_, true,  1, 1) \
+        SEL(bits_, cb_, true,  2, 0) SEL(bits_, cb_, true,  2, 1)
     SEL_GRID(4, 0) SEL_GRID(4, 1) SEL_GRID(4, 2)
     SEL_GRID(2, 1) SEL_GRID(2, 2)
     SEL_GRID(3, 1) SEL_GRID(3, 2)
@@ -971,6 +981,7 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID(6, 1) SEL_GRID(6, 2)
     SEL_MMODE2_GRID(3, 2) SEL_MMODE2_GRID(4, 1) SEL_MMODE2_GRID(4, 2)
     SEL_MMODE2_GRID(5, 2) SEL_MMODE2_GRID(6, 1) SEL_MMODE2_GRID(6, 2)
+    SEL_NOSTAGE(4, 2)
     #undef SEL_MMODE2_GRID
     #undef SEL_GRID
     #undef SEL
@@ -1066,15 +1077,28 @@ bool exl3_gemv_try_launch
     };
 
 #if defined(USE_ROCM)
-    // Extraction style on HIP: smem staging is the only safe mode (gfx12 shfl->WMMA hazard),
-    // so the EXL3_GEMV_SMEM override is ignored and staging is always on
-    bool smem = true;
+    // Extraction style on HIP: smem staging is the default (gfx12 shfl->WMMA hazard for the
+    // unaligned-load pattern). EXL3_GEMV_NOSTAGE=1 selects the register-shuffle trellis
+    // gather for bits == 4 (probed safe: computed-half2 -> wmma); unsupported combos fall
+    // back to staging instead of losing GEMV eligibility.
+    static const bool env_nostage = []
+    {
+        const char* e = std::getenv("EXL3_GEMV_NOSTAGE");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    bool smem = !env_nostage;
+    void* narrow_kernel = exl3_gemv_select_kernel(K, cb, c_fp32, mmode, 0, smem);
+    if (!narrow_kernel && env_nostage)
+    {
+        // bits 2/3/5/6 have no no-staging instantiation: fall back to staged kernels
+        smem = true;
+        narrow_kernel = exl3_gemv_select_kernel(K, cb, c_fp32, mmode, 0, smem);
+    }
 #else
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
     bool smem = exl3_gemv_env_smem() == 1;
-#endif
-
     void* narrow_kernel = exl3_gemv_select_kernel(K, cb, c_fp32, mmode, 0, smem);
+#endif
     if (!narrow_kernel) return false;
     int narrow_coresident = occupancy(narrow_kernel, 512) * num_sms;
 
@@ -1082,6 +1106,11 @@ bool exl3_gemv_try_launch
     if (cfg < 0) return false;
 
     void* kernel = cfg == 0 ? narrow_kernel : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg, smem);
+    if (!kernel && env_nostage && !smem)
+    {
+        kernel = exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg, true);
+        if (kernel) smem = true;
+    }
     if (!kernel) return false;
 
     int block_dim = cfg == 0 ? 512 : 256;
