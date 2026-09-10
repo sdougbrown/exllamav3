@@ -69,7 +69,7 @@ def main() -> None:
 
     sys.path.insert(0, str(REPO_ROOT))
     from exllamav3 import Config, Model
-    from exllamav3 import ext as ext_mod
+    from exllamav3.ext import exllamav3_ext as ext_mod
     from exllamav3.util.tensor import g_tensor_cache
 
     torch.manual_seed(0)
