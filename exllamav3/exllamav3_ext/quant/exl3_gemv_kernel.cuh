@@ -379,8 +379,24 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
 #if defined(__gfx1200__) || defined(__gfx1201__)
             // Every adjacent N tile uses the same A rows for this K slice. Assemble the full
-            // operand before the B tiles reuse the warp-private staging buffer.
-            HipFp16x8 a_frag = assemble_a_frag_gfx12(a01, a23);
+            // operand before the B tiles reuse the warp-private staging buffer. In the
+            // no-staging variant, load the A operand directly in the native layout
+            // (A[row = lane&15][k = 8*(lane>>4) + 2j (+1)]) — one aligned half2 per lane
+            // register, no LDS staging (Build 3).
+            HipFp16x8 a_frag;
+            if constexpr (!SMEM_STAGE)
+            {
+                const int arow = lane & 15;
+                const int ah = lane >> 4;
+                const bool a_ok = arow < size_m;
+                const size_t a_base = (size_t) arow * (size_k / 2)
+                    + (size_t) (ks0 + i) * 8 + 4 * ah;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    ((__half2*)&a_frag)[j] = a_ok ? A2[a_base + j] : hzero;
+            }
+            else
+                a_frag = assemble_a_frag_gfx12(a01, a23);
 #endif
 
             #pragma unroll
