@@ -1117,7 +1117,19 @@ bool exl3_gemv_try_launch
     int cols = cfg == 0 ? 32 : 64;
 
     int max_blocks = occupancy(kernel, block_dim) * num_sms;
+    // Grid sizing: the body is a grid-stride loop and every group is processed exactly
+    // once by one block with a block-local reduction, so output is bit-identical for any
+    // grid >= 1 and grid size is a performance knob only. The CUDA path launches
+    // cooperatively, which requires grid <= co-resident blocks, so the occupancy cap
+    // stays there; the HIP launch is an ordinary stream-ordered launch (extra blocks
+    // queue behind the co-resident ones), where the cap measurably throttles the
+    // multi-row cells (M=4: -4.5..-10.7% per call, lm_head M=16: -15.5%; M=1 neutral).
+#if defined(USE_ROCM)
+    int grid = size_n / cols;
+#else
     int grid = MIN(size_n / cols, max_blocks);
+#endif
+    (void) max_blocks;
     if (grid < 1) return false;
 
     cuda_check
