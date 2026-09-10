@@ -80,14 +80,16 @@ def main() -> None:
         model.load(use_per_device=[31.0, 0.0], max_chunk_size=512, max_batch_size=1)
         loaded = True
 
-        # one representative linear per (in,out) shape
+        # one representative linear per (in,out) shape (Linear.load_exl3 stores the
+        # EXL3 implementation in .inner; plain FP16 linears have no .inner)
         picked = {}
         for module in model:
-            if not hasattr(module, "trellis"):
+            inner = getattr(module, "inner", None)
+            if inner is None or not hasattr(inner, "trellis"):
                 continue
-            key = (module.in_features, module.out_features)
+            key = (inner.in_features, inner.out_features)
             if key in [s[1] for s in SHAPES] and key not in picked:
-                picked[key] = module
+                picked[key] = inner
             if len(picked) == len(SHAPES):
                 break
 
