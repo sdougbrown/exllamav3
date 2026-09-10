@@ -121,7 +121,7 @@ def main() -> None:
                                       lin.mcg, lin.mul1)
                 row["gemv_us"][m] = round(time_callable(gemv_call), 2)
 
-                xr = x.to(torch.bfloat16).contiguous()
+                xr = x.to(torch.half).contiguous()
                 def recon_call(xr=xr, lin=lin):
                     lin.reconstruct_hgemm(xr, None)
                 try:
@@ -131,10 +131,10 @@ def main() -> None:
 
                 if m == 1:
                     try:
-                        w = lin.get_weight_tensor()  # dense fp16 [out,in]
+                        w = lin.get_weight_tensor()  # dense [in,out] per torch.mm probe
                         wt = w if w.dtype == torch.half else w.to(torch.half)
-                        def mv_call(wt=wt, xr=xr.to(torch.half).contiguous()):
-                            torch.mm(xr, wt.t())
+                        def mv_call(wt=wt, xr=xr):
+                            torch.mm(xr, wt)
                         row["dense_fp16_us"][m] = round(time_callable(mv_call, iters=30), 2)
                     except Exception as exc:
                         row["dense_fp16_us"][m] = f"err: {exc}"
