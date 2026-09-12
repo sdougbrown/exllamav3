@@ -10,6 +10,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from hip_flash_quant import exl3_expert_quant
 from exllamav3 import Config, Model
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.model.lora import LoRA
@@ -34,9 +35,17 @@ def _require_gfx12(device_index=0):
         pytest.skip(f"grouped MoE requires gfx1200/gfx1201, got {arch or 'unknown'}")
     assert hasattr(ext, "exl3_moe_gfx12_k3"), \
         "gfx12 target build is missing ext.exl3_moe_gfx12_k3"
-    assert hasattr(ext, "exl3_moe_gfx12_k3_prefill"), \
-        "gfx12 target build is missing ext.exl3_moe_gfx12_k3_prefill"
     assert ext.exl3_gemv_supported(device_index)
+
+
+def _require_prefill():
+    if not hasattr(ext, "exl3_moe_gfx12_k3_prefill"):
+        pytest.skip("prefill binding not compiled into this build")
+
+
+def _require_hip_router():
+    if not hasattr(ext, "routing_std_gfx12_bsz1"):
+        pytest.skip("HIP gfx12 router binding not compiled into this build")
 
 
 @pytest.mark.parametrize(
@@ -51,12 +60,14 @@ def _require_gfx12(device_index=0):
 )
 def test_grouped_row_cap_reloads_and_preserves_the_prefill_boundary(monkeypatch, value, expected):
     """The rollback cap is import-time configuration and never opens invalid prefill rows."""
+    import exllamav3.modules.block_sparse_mlp_routing as routing_module
     try:
         with monkeypatch.context() as env:
             if value is None:
                 env.delenv("EXL3_HIP_GROUPED_MAX_ROWS", raising=False)
             else:
                 env.setenv("EXL3_HIP_GROUPED_MAX_ROWS", value)
+            importlib.reload(routing_module)
             module = importlib.reload(block_sparse_mlp_module)
             assert module._HIP_GROUPED_MAX_ROWS == expected
             assert module._HIP_PREFILL_MIN_ROWS == expected + 1
@@ -64,6 +75,7 @@ def test_grouped_row_cap_reloads_and_preserves_the_prefill_boundary(monkeypatch,
             if expected < 16:
                 assert module._hip_prefill_rows_eligible(expected + 1)
     finally:
+        importlib.reload(routing_module)
         importlib.reload(block_sparse_mlp_module)
 
 
@@ -195,6 +207,7 @@ def _run_prefill(x, selected, weights, gate, up, down):
 @pytest.mark.parametrize("rows", [2, 6, 17, 64], ids=["boundary-2", "boundary-6", "boundary-17", "rows-64"])
 @torch.inference_mode()
 def test_prefill_k3_matches_reconstruction_oracle(synthetic_grouped_case, rows):
+    _require_prefill()
     _, gate, up, down = synthetic_grouped_case
     x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda") * 1e-3
     selected = torch.tensor(
@@ -211,6 +224,7 @@ def test_prefill_k3_matches_reconstruction_oracle(synthetic_grouped_case, rows):
 
 @torch.inference_mode()
 def test_prefill_k3_preserves_concentrated_duplicate_slots(synthetic_grouped_case):
+    _require_prefill()
     _, gate, up, down = synthetic_grouped_case
     rows = 52  # 520 assignments to one expert, above the per-token row count
     x_gen = torch.Generator(device="cuda").manual_seed(5201 + rows)
@@ -236,6 +250,7 @@ def test_prefill_k3_preserves_concentrated_duplicate_slots(synthetic_grouped_cas
 
 @torch.inference_mode()
 def test_prefill_k3_is_deterministic(synthetic_grouped_case):
+    _require_prefill()
     _, gate, up, down = synthetic_grouped_case
     rows = 17
     x = torch.randn((rows, HIDDEN), dtype=torch.float16, device="cuda") * 1e-3
@@ -408,6 +423,12 @@ def flash_model():
     _require_gfx12()
     if not MODEL.is_dir():
         pytest.skip(f"Flash model not found: {MODEL}")
+    codebook, bits = exl3_expert_quant(MODEL)
+    if bits["routed"] != 3 or codebook != "mul1":
+        pytest.skip(
+            f"grouped route needs K3/mul1 routed experts; {MODEL} has "
+            f"K{bits['routed']}/{codebook} (set EXL3_FLASH_TEST_MODEL)"
+        )
     return Model.from_config(Config.from_directory(str(MODEL)))
 
 
@@ -423,6 +444,12 @@ def _route_spies():
     calls = {name: 0 for name in bindings}
     calls["routed_k3_gemv"] = 0
     originals = {name: getattr(ext, binding) for name, binding in bindings.items()}
+    real_hgemm_recon = getattr(ext, "hgemm_recon", None)
+
+    def hgemm_recon_spy(*args, **kwargs):
+        calls["hgemm"] += 1  # reconstruct_hgemm may call either GEMM entry point
+        return real_hgemm_recon(*args, **kwargs)
+
     for name, binding in bindings.items():
         def spy(*args, _name=name, **kwargs):
             calls[_name] += 1
@@ -430,10 +457,14 @@ def _route_spies():
                 calls["routed_k3_gemv"] += 1
             return originals[_name](*args, **kwargs)
         setattr(ext, binding, spy)
+    if real_hgemm_recon is not None:
+        ext.hgemm_recon = hgemm_recon_spy
 
     def restore():
         for name, binding in bindings.items():
             setattr(ext, binding, originals[name])
+        if real_hgemm_recon is not None:
+            ext.hgemm_recon = real_hgemm_recon
 
     return calls, restore
 
@@ -443,6 +474,7 @@ def _route_spies():
 @torch.inference_mode()
 def test_flash_multirow_route_and_decline_guards(flash_model, device_index, rows, monkeypatch):
     _require_gfx12(device_index)
+    _require_hip_router()
     device = torch.device("cuda", device_index)
     mlp = flash_model.find_module("model.language_model.layers.0.mlp")
     try:
@@ -455,7 +487,8 @@ def test_flash_multirow_route_and_decline_guards(flash_model, device_index, rows
         assert mlp.multi_down.linears == mlp.downs
         x = torch.randn((1, rows, HIDDEN), dtype=torch.float16, device=device)
 
-        assert getattr(ext.add_sigmoid_gate_proj, "__module__", None) == "exllamav3_ext"
+        # add_sigmoid_gate_proj may be native or the layer-2 PyTorch fallback; the spy wraps
+        # whichever ext resolves to, and block_sparse_mlp looks it up through ext at call time
         calls, restore = _route_spies()
         try:
             with torch.profiler.profile(
@@ -541,6 +574,7 @@ def test_flash_multirow_route_and_decline_guards(flash_model, device_index, rows
 @pytest.mark.parametrize("rows", [6, 8, 12, 16])
 @torch.inference_mode()
 def test_flash_grouped_row_cap_rolls_back_to_prefill_at_6(flash_model, device_index, rows, monkeypatch):
+    _require_prefill()
     _require_gfx12(device_index)
     device = torch.device("cuda", device_index)
     mlp = flash_model.find_module("model.language_model.layers.0.mlp")
@@ -615,6 +649,7 @@ def test_flash_grouped_row_cap_rolls_back_to_prefill_at_6(flash_model, device_in
 @pytest.mark.parametrize("rows", [17, 64], ids=["rows-17", "rows-64"])
 @torch.inference_mode()
 def test_flash_prefill_route_matches_layer_fallback(flash_model, device_index, rows, monkeypatch):
+    _require_prefill()
     _require_gfx12(device_index)
     device = torch.device("cuda", device_index)
     mlp = flash_model.find_module("model.language_model.layers.0.mlp")

@@ -89,14 +89,17 @@ def model():
 
 def _spy_ext_route():
     """Temporarily wrap ext.exl3_gemv / ext.reconstruct / ext.reconstruct_slice /
-    ext.reconstruct_had_slice / ext.hgemm with call-counting spies so a silent
-    fallback into ANY reconstruction path cannot slip through. Returns (calls, restore)."""
+    ext.reconstruct_had_slice / ext.hgemm / ext.hgemm_recon with call-counting spies so a
+    silent fallback into ANY reconstruction path cannot slip through. hgemm and
+    hgemm_recon share the same counter (reconstruct_hgemm may call either). Returns
+    (calls, restore)."""
     calls = {"gemv": 0, "reconstruct": 0, "reconstruct_slice": 0, "reconstruct_had_slice": 0, "hgemm": 0}
     real_gemv = ext.exl3_gemv
     real_reconstruct = ext.reconstruct
     real_reconstruct_slice = getattr(ext, "reconstruct_slice", None)
     real_reconstruct_had_slice = getattr(ext, "reconstruct_had_slice", None)
     real_hgemm = ext.hgemm
+    real_hgemm_recon = getattr(ext, "hgemm_recon", None)
 
     def gemv_spy(*args, **kwargs):
         calls["gemv"] += 1
@@ -118,6 +121,10 @@ def _spy_ext_route():
         calls["hgemm"] += 1
         return real_hgemm(*args, **kwargs)
 
+    def hgemm_recon_spy(*args, **kwargs):
+        calls["hgemm"] += 1
+        return real_hgemm_recon(*args, **kwargs)
+
     ext.exl3_gemv = gemv_spy
     ext.reconstruct = reconstruct_spy
     if real_reconstruct_slice is not None:
@@ -125,6 +132,8 @@ def _spy_ext_route():
     if real_reconstruct_had_slice is not None:
         ext.reconstruct_had_slice = reconstruct_had_slice_spy
     ext.hgemm = hgemm_spy
+    if real_hgemm_recon is not None:
+        ext.hgemm_recon = hgemm_recon_spy
 
     def restore():
         ext.exl3_gemv = real_gemv
@@ -134,6 +143,8 @@ def _spy_ext_route():
         if real_reconstruct_had_slice is not None:
             ext.reconstruct_had_slice = real_reconstruct_had_slice
         ext.hgemm = real_hgemm
+        if real_hgemm_recon is not None:
+            ext.hgemm_recon = real_hgemm_recon
 
     return calls, restore
 

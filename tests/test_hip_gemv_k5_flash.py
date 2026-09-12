@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from hip_flash_quant import exl3_expert_quant
 from exllamav3 import Config, Model
 from exllamav3.ext import exllamav3_ext as ext
 
@@ -40,6 +41,12 @@ def flash_model():
         pytest.skip("ROCm build / device not available")
     if not _MODEL.is_dir():
         pytest.skip(f"Test model not found: {_MODEL} (set EXL3_FLASH_TEST_MODEL)")
+    _codebook, bits = exl3_expert_quant(_MODEL)
+    if bits["shared"] != 5:
+        pytest.skip(
+            f"K5 route needs K5 shared experts; {_MODEL} has K{bits['shared']} "
+            "(set EXL3_FLASH_TEST_MODEL)"
+        )
     return Model.from_config(Config.from_directory(str(_MODEL)))
 
 

@@ -21,7 +21,7 @@ from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
     _HIP_ROUTER_HIDDEN, _HIP_ROUTER_EXPERTS, _HIP_ROUTER_TOP_K,
-    _HIP_GROUPED_MAX_ROWS, _HIP_PREFILL_MAX_ROWS, _HIP_PREFILL_MAX_EXPERT_ROWS,
+    _HIP_GROUPED_MAX_ROWS, _HIP_PREFILL_MIN_ROWS, _HIP_PREFILL_MAX_ROWS, _HIP_PREFILL_MAX_EXPERT_ROWS,
     _hip_grouped_rows_eligible, _hip_prefill_rows_eligible, _prepare_hip_router_gate_t,
 )
 
@@ -505,8 +505,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss)
+        has_mgemm = hasattr(ext, "exl3_mgemm")
         self.support_quant_paths = (
-            self.is_quantized and
+            has_mgemm and self.is_quantized and
             (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
@@ -520,7 +521,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             has = [l.inner.bias is not None for l in ls]
             return all(has) or not any(has)
         self.support_bc_bszn = (
-            self.is_quantized and
+            has_mgemm and self.is_quantized and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             not self.config.infer_params.no_reconstruct
@@ -574,6 +575,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.multi_down.q_cb(),
             )
             self.support_fused = (
+                hasattr(ext, "exl3_moe") and hasattr(ext, "exl3_moe_max_concurrency") and
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
                 self.support_quant_paths
             )
