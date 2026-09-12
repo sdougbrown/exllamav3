@@ -90,6 +90,8 @@
 #include "generator/gumbel.cuh"
 #include "generator/rep_pen.cuh"
 #include "generator/cache.cuh"
+#include "generator/dry.cuh"
+#include "ngram.cuh"
 
 #endif
 
@@ -317,6 +319,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
 
+    py::class_<ConvRewindJob>(m, "ConvRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int, int, int>());
+    py::class_<StateRewindJob>(m, "StateRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int64_t>());
+    m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
+
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
     m.def("gumbel_noise_f16", &gumbel_noise_f16, "gumbel_noise_f16");
@@ -325,11 +335,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
     m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
     m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
+    m.def("dry_penalty", &dry_penalty, "dry_penalty");
 
     m.def("cache_rotate", &cache_rotate, "cache_rotate");
     m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
 
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
     m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
+    m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
+    m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
+    m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
 #endif
 }
