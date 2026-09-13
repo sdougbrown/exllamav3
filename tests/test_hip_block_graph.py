@@ -294,7 +294,16 @@ class TestRealModelCapture:
         budgets[devices[0]] = float(os.environ.get("EXL3_FLASH_GRAPH_GPU0_GB", "25"))
         budgets[devices[1]] = float(os.environ.get("EXL3_FLASH_GRAPH_GPU1_GB", "31"))
         try:
-            model.load(use_per_device=budgets, max_chunk_size=256, max_batch_size=1)
+            try:
+                model.load(use_per_device=budgets, max_chunk_size=256, max_batch_size=1)
+            except RuntimeError as e:
+                # The split loader reserves cache and working buffers alongside weights.
+                # A checkpoint that cannot fit the visible devices is an environment fit
+                # problem, not a capture regression; EXL3_FLASH_TEST_MODEL can point at a
+                # smaller quantization of the same architecture.
+                if "Insufficient VRAM" not in str(e):
+                    raise
+                pytest.skip(f"checkpoint does not fit the visible gfx12 split: {e}")
             tokenizer = Tokenizer.from_config(model.config)
 
             def generate(cache):
