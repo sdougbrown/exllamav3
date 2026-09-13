@@ -15,7 +15,8 @@ Contract:
   executing; the capture call then replays once, committing exactly one state transition.
 - Graphs on a device share one private pool. Replays are sequential on the decode stream in
   invariant block order, which is the documented safe sharing pattern.
-- A failed capture declines the slot and falls back to eager (nothing executed). A failed
+- A failed capture declines the slot; by default the error is raised, since a capture error
+  may mean captured-region work already ran. A failed
   replay disables the slot and raises: replay failure is not automatically safe to retry
   eagerly.
 """
@@ -83,14 +84,14 @@ def _pool_for(device_index: int):
 
 
 class _BlockGraphSlot:
-    __slots__ = ("graph", "x_in", "slots_dev", "last_used", "slots_src_id")
+    __slots__ = ("graph", "x_in", "slots_dev", "last_used", "slots_src")
 
     def __init__(self, graph, x_in, slots_dev, stamp):
         self.graph = graph
         self.x_in = x_in
         self.slots_dev = slots_dev
         self.last_used = stamp
-        self.slots_src_id = None
+        self.slots_src = None
 
 
 class BlockGraphRunner:
@@ -145,6 +146,13 @@ class BlockGraphRunner:
         rows = bsz * seqlen
         if not (1 <= rows <= BLOCK_GRAPH_MAX_ROWS):
             self.stats["declines"]["rows"] += 1
+            return None
+        num_v_heads = getattr(attn, "num_v_heads", None)
+        if num_v_heads is not None and seqlen >= num_v_heads:
+            # The chunk-rule path consumes slot ids host-side at capture time, so the
+            # replay-time device-side slots refresh cannot retarget it. Capture stays on
+            # the recurrent-kernel path, which reads slot ids from device memory.
+            self.stats["declines"]["chunk_path"] += 1
             return None
         if BLOCK_GRAPH_DEVICES is not None and x.device.index not in BLOCK_GRAPH_DEVICES:
             self.stats["declines"]["device_filter"] += 1
@@ -207,7 +215,6 @@ class BlockGraphRunner:
                 torch.cuda.synchronize(d)
         torch.cuda.synchronize(dev)
         x_in = torch.empty_like(x)
-        live_slots = params["recurrent_slots"]
         live_slots = params["recurrent_slots"]
         slots_cpu = live_slots.clone()  # stable CPU source; its device copy is slot-static
         slots_dev = get_static_device_copy(slots_cpu, dev)
@@ -286,13 +293,14 @@ class BlockGraphRunner:
             # with a persistent per-device copy. Refresh the graph's fixed-address slots buffer
             # with a stream-ordered D2D copy only when the source object changes (job slot
             # reassignment); same-tuple continuations upload nothing (a blocking pageable H2D
-            # here would drain the queue once per captured block).
+            # here would drain the queue once per captured block). The held reference makes
+            # object identity exact: a recycled allocation address cannot alias the source.
             live = params["recurrent_slots"]
-            if live.data_ptr() != slot.slots_src_id:
+            if live is not slot.slots_src:
                 from ..util.tensor import get_for_device
                 live_dev = get_for_device(params, "recurrent_slots", x.device)
                 slot.slots_dev.copy_(live_dev)
-                slot.slots_src_id = live.data_ptr()
+                slot.slots_src = live
             with torch.cuda.device(x.device):
                 slot.graph.replay()
         except Exception as e:

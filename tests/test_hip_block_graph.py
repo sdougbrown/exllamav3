@@ -33,6 +33,7 @@ def _gfx12_available() -> bool:
 def _fake_attn(**attrs):
     attn = GatedDeltaNet.__new__(GatedDeltaNet)
     attn.bc = None
+    attn.num_v_heads = 48
     for name, value in attrs.items():
         setattr(attn, name, value)
     return attn
@@ -136,6 +137,10 @@ class TestDeclines:
         assert runner.stats["declines"]["io"] == 2
         assert runner.slot_key(_decode_input(device, rows=17), {}) is None
         assert runner.stats["declines"]["rows"] == 1
+        runner.block.attn = _fake_attn(num_v_heads=8)
+        assert runner.slot_key(_decode_input(device, rows=8), {}) is None
+        assert runner.stats["declines"]["chunk_path"] == 1
+        assert runner.slot_key(_decode_input(device, rows=7), _eligible_params()) is not None
         runner.block.device = torch.device("cuda", 1)
         assert runner.slot_key(_decode_input(device), {}) is None
         assert runner.stats["declines"]["device"] == 1
@@ -225,6 +230,27 @@ class TestCaptureReplayMachine:
         assert key in runner.disabled
         assert runner.maybe_forward(x2, params) is None
         assert runner.stats["declines"]["disabled_slot"] == 1
+
+    @staticmethod
+    def test_slot_source_identity_refresh():
+        device = torch.device("cuda", 0)
+        runner = TestCaptureReplayMachine._fake_runner(device)
+        params = _eligible_params()
+        for _ in range(block_graph.BLOCK_GRAPH_WARMUPS):
+            runner.maybe_forward(_decode_input(device), params)
+        x = torch.zeros(1, 1, 1, 8, dtype=torch.float32, device=device)
+        runner.maybe_forward(x, params)  # capture + first replay
+        slot = next(iter(runner.slots.values()))
+        assert slot.slots_src is params["recurrent_slots"]
+        # A different source object (job slot reassignment) refreshes the buffer contents.
+        params2 = dict(params)
+        params2["recurrent_slots"] = torch.ones(1, dtype=torch.int32)
+        runner.maybe_forward(x, params2)
+        assert slot.slots_src is params2["recurrent_slots"]
+        assert slot.slots_dev.cpu().tolist() == [1]
+        # Same object again: contents stay as uploaded (no re-copy of the old buffer).
+        runner.maybe_forward(x, params2)
+        assert slot.slots_dev.cpu().tolist() == [1]
 
     @staticmethod
     def test_total_capture_cap_declines(monkeypatch):
