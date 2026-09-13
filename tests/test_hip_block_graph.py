@@ -30,6 +30,16 @@ def _gfx12_available() -> bool:
     return False
 
 
+def _gfx12_devices() -> list:
+    if not (torch.version.hip and torch.cuda.is_available()):
+        return []
+    return [
+        index for index in range(torch.cuda.device_count())
+        if getattr(torch.cuda.get_device_properties(index), "gcnArchName", "").split(":", 1)[0]
+        in ("gfx1200", "gfx1201")
+    ]
+
+
 def _fake_attn(**attrs):
     attn = GatedDeltaNet.__new__(GatedDeltaNet)
     attn.bc = None
@@ -270,16 +280,21 @@ class TestCaptureReplayMachine:
             block_graph._total_captures[0] = saved
 
 
-@pytest.mark.skipif(not (MODEL.is_dir() and _gfx12_available()),
-                    reason=f"requires the flash model and a gfx12 device: {MODEL}")
+@pytest.mark.skipif(not (MODEL.is_dir() and len(_gfx12_devices()) >= 2),
+                    reason=f"the flash model needs two gfx12 devices and {MODEL}: "
+                           f"found {_gfx12_devices()}")
 class TestRealModelCapture:
     @staticmethod
     @torch.inference_mode()
     def test_graph_replay_matches_eager_generation(monkeypatch):
         monkeypatch.setattr(block_graph, "BLOCK_GRAPH_ENABLED", False)
         model = Model.from_config(Config.from_directory(str(MODEL)))
+        devices = _gfx12_devices()
+        budgets = [0.0] * torch.cuda.device_count()
+        budgets[devices[0]] = float(os.environ.get("EXL3_FLASH_GRAPH_GPU0_GB", "25"))
+        budgets[devices[1]] = float(os.environ.get("EXL3_FLASH_GRAPH_GPU1_GB", "31"))
         try:
-            model.load()
+            model.load(use_per_device=budgets, max_chunk_size=256, max_batch_size=1)
             tokenizer = Tokenizer.from_config(model.config)
 
             def generate(cache):
