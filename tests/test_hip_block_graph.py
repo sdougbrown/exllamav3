@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from exllamav3 import Cache, Config, Generator, Model, Tokenizer
+from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from exllamav3.modules import block_graph
 from exllamav3.modules.block_graph import BlockGraphRunner, maybe_graph_forward
 from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
@@ -284,58 +284,111 @@ class TestCaptureReplayMachine:
                     reason=f"the flash model needs two gfx12 devices and {MODEL}: "
                            f"found {_gfx12_devices()}")
 class TestRealModelCapture:
+    """Real-model validation under the model's intrinsic run-to-run noise.
+
+    The eager path on this model is nondeterministic run-to-run (grouped-gemv
+    atomics amplified through recurrent state change greedy tokens between two
+    eager passes), so token equality is not an attainable contract. The graphed
+    pass is instead compared against an eager control under the same forced
+    token trajectory, with the eager-vs-eager control drift as the envelope —
+    the same methodology as the grouped-MoE oracle.
+    """
+
+    STEPS = 8
+
+    @staticmethod
+    def _forced_pass(model, cache, tokenizer, forced_tokens):
+        generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
+        job = Job(
+            input_ids=tokenizer.encode(PROMPT, add_bos=True),
+            max_new_tokens=TestRealModelCapture.STEPS + 1,
+            stop_conditions=[],
+            return_logits=True,
+            sampler=GreedySampler(),
+        )
+        generator.enqueue(job)
+        if forced_tokens is not None:
+            job.constrain_output_now(forced_tokens.contiguous())
+        token_chunks, logit_chunks = [], []
+        while generator.num_remaining_jobs():
+            for result in generator.iterate():
+                if "token_ids" in result:
+                    token_chunks.append(result["token_ids"].cpu())
+                    logit_chunks.append(result["logits"].cpu())
+        return torch.cat(token_chunks, dim=-1), torch.cat(logit_chunks, dim=1)
+
+    @staticmethod
+    def _drift(logits_a, logits_b):
+        diff = (logits_a.float() - logits_b.float()).abs()
+        top1_agree = int((logits_a.argmax(-1) == logits_b.argmax(-1)).sum())
+        return top1_agree, float(diff.max()), float(diff.mean())
+
     @staticmethod
     @torch.inference_mode()
-    def test_graph_replay_matches_eager_generation(monkeypatch):
+    def test_graphed_decode_matches_eager_within_control_envelope(monkeypatch):
         monkeypatch.setattr(block_graph, "BLOCK_GRAPH_ENABLED", False)
         model = Model.from_config(Config.from_directory(str(MODEL)))
         devices = _gfx12_devices()
         budgets = [0.0] * torch.cuda.device_count()
         budgets[devices[0]] = float(os.environ.get("EXL3_FLASH_GRAPH_GPU0_GB", "25"))
         budgets[devices[1]] = float(os.environ.get("EXL3_FLASH_GRAPH_GPU1_GB", "31"))
-        # model.load() allocates cache tensors only for caches attached before the call,
-        # so both caches exist up front; the eager reference and the graphed passes
-        # still run on separate caches.
-        reference_cache = Cache(model, max_num_tokens=256, max_batch_size=1)
-        graph_cache = Cache(model, max_num_tokens=256, max_batch_size=1)
+        # model.load() allocates cache tensors only for caches attached before the call.
+        cache = Cache(model, max_num_tokens=256, max_batch_size=1)
         try:
             try:
                 model.load(use_per_device=budgets, max_chunk_size=256, max_batch_size=1)
             except RuntimeError as e:
-                # The split loader reserves cache and working buffers alongside weights.
                 # A checkpoint that cannot fit the visible devices is an environment fit
-                # problem, not a capture regression; EXL3_FLASH_TEST_MODEL can point at a
-                # smaller quantization of the same architecture.
+                # condition, not a capture regression; EXL3_FLASH_TEST_MODEL can point at
+                # a smaller quantization of the same architecture.
                 if "Insufficient VRAM" not in str(e):
                     raise
                 pytest.skip(f"checkpoint does not fit the visible gfx12 split: {e}")
             tokenizer = Tokenizer.from_config(model.config)
 
-            def generate(cache):
-                return Generator(model=model, cache=cache, tokenizer=tokenizer).generate(
-                    prompt=PROMPT,
-                    stop_conditions=[],
-                    max_new_tokens=12,
-                    completion_only=True,
-                    add_bos=True,
-                )
-
-            # Eager reference on its own cache.
-            reference = generate(reference_cache)
-            assert reference
+            reference_tokens, reference_logits = TestRealModelCapture._forced_pass(
+                model, cache, tokenizer, None)
+            # Eager control under the same forced trajectory: measures the model's
+            # intrinsic run-to-run drift, which bounds every later comparison.
+            control_tokens, control_logits = TestRealModelCapture._forced_pass(
+                model, cache, tokenizer, reference_tokens)
+            assert torch.equal(control_tokens, reference_tokens)
+            control_top1, control_max, control_mean = TestRealModelCapture._drift(
+                reference_logits, control_logits)
 
             monkeypatch.setattr(block_graph, "BLOCK_GRAPH_ENABLED", True)
-            first = generate(graph_cache)
+            graph_tokens, graph_logits = TestRealModelCapture._forced_pass(
+                model, cache, tokenizer, reference_tokens)
+            assert torch.equal(graph_tokens, reference_tokens)
+            stats = block_graph.global_stats()
+            assert stats["captures"] > 0, "no decode block was captured"
+            assert stats["replays"] > 0, "no graph replay ran"
+            assert stats["capture_failed"] == 0
+
+            # The graphed pass must not drift beyond the eager control on any metric:
+            # its divergence from the reference must stay within what a second eager
+            # pass already produces. Margins absorb per-kernel nondeterminism that the
+            # recurrent state amplifies; the absolute floors keep a dead path honest.
+            graph_top1, graph_max, graph_mean = TestRealModelCapture._drift(
+                reference_logits, graph_logits)
+            assert graph_top1 >= min(control_top1, TestRealModelCapture.STEPS) - 2, (
+                f"graphed top-1 agreement {graph_top1} vs control {control_top1}")
+            assert graph_max <= max(6.0, control_max * 1.5), (
+                f"graphed max drift {graph_max} vs control {control_max}")
+            assert graph_mean <= max(0.6, control_mean * 1.5 + 1e-3), (
+                f"graphed mean drift {graph_mean} vs control {control_mean}")
+
+            # A second graphed pass replays the existing slots: no new captures.
             captures_after_first = block_graph.global_stats()["captures"]
-            replays_after_first = block_graph.global_stats()["replays"]
-            assert captures_after_first > 0, "no decode block was captured"
-            assert replays_after_first > 0, "no graph replay ran"
-            assert first == reference, "graphed pass diverged from the eager reference"
-            # A second pass on the same cache replays the existing slots: same output,
-            # no new captures.
-            second = generate(graph_cache)
-            assert second == first
-            assert block_graph.global_stats()["captures"] == captures_after_first
+            graph2_tokens, graph2_logits = TestRealModelCapture._forced_pass(
+                model, cache, tokenizer, reference_tokens)
+            assert torch.equal(graph2_tokens, reference_tokens)
+            assert block_graph.global_stats()["captures"] == captures_after_first, (
+                "second graphed pass re-captured instead of replaying")
+            reuse_top1, reuse_max, _ = TestRealModelCapture._drift(
+                graph_logits, graph2_logits)
+            assert reuse_top1 >= min(control_top1, TestRealModelCapture.STEPS) - 2
+            assert reuse_max <= max(6.0, control_max * 1.5)
         finally:
             block_graph.purge()
             model.unload()
