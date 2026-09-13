@@ -1236,8 +1236,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             num_tokens, top_k = selected_experts.shape
             flat_expert_local = selected_experts.reshape(-1)
             order = flat_expert_local.argsort(stable = True)
-            expert_count = torch.bincount(flat_expert_local, minlength = self.num_experts + 1)
-            buffers = self.hip_prefill_buffers
+            if _moe_sync_free_count():
+                expert_count = _scatter_expert_count(flat_expert_local, self.num_experts + 1)
+            else:
+                expert_count = torch.bincount(flat_expert_local, minlength = self.num_experts + 1)
+            buffers = self._ensure_hip_prefill_buffers(num_tokens)
             assignments = num_tokens * top_k
             output = buffers.output[:num_tokens]
             ext.exl3_moe_gfx12_k3_prefill(
@@ -1264,7 +1267,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 buffers.expert_chunks,
                 buffers.chunk_count,
             )
-            final_hidden_states = output
+            final_hidden_states = output.view(x.shape)
 
         # Torch/C++/fused path
         elif (
@@ -1312,13 +1315,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 token_sorted = flat_token[order]
                 weight_sorted = flat_weight[order]
 
-                # Count how many assignments per expert
+                # Count how many assignments per expert. With few enough total assignments no
+                # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
+                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
                 if _moe_sync_free_count():
                     expert_count = _scatter_expert_count(flat_expert_local, E + 1)
                 else:
                     expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                token_sorted = None
-                weight_sorted = None
+                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
+                    expert_count_list = None
+                else:
+                    expert_count_list = expert_count.tolist()
 
                 # Tier plan: fused kernel for experts up to self.fused_rows rows, batched
                 # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond

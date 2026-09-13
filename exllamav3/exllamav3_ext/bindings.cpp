@@ -114,14 +114,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
     m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
 
-    py::class_<ConvRewindJob>(m, "ConvRewindJob")
-        .def(py::init<uintptr_t, uintptr_t, int, int, int>());
-    py::class_<StateRewindJob>(m, "StateRewindJob")
-        .def(py::init<uintptr_t, uintptr_t, int64_t>());
-    m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
-    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
-    m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
-
     m.def("hc_mix_supported", &hc_mix_supported, "hc_mix_supported");
     m.def("hc_mix", &hc_mix, "hc_mix");
     m.def("hc_head", &hc_head, "hc_head");

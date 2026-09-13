@@ -14,6 +14,7 @@ if not (torch.version.hip and torch.cuda.is_available()):
 from exllamav3 import Config, Model
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.modules import block_sparse_mlp as bsm
+from exllamav3.modules import block_sparse_mlp_routing as routing_module
 from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
 
 HIDDEN = 2560
@@ -405,7 +406,7 @@ def test_every_flash_router_real_weights_match_torch_on_random_states(device_ind
             mlp.load(device=device)
             try:
                 cfg = mlp.routing_cfg
-                if not bsm._hip_router_config_supported(cfg):
+                if not routing_module._hip_router_config_supported(cfg):
                     continue
                 assert cfg.gate_tensor_t is not None
                 assert cfg.gate_tensor_t.shape == (EXPERTS, HIDDEN)
@@ -472,7 +473,7 @@ def test_flash_mlp_forward_has_native_router_route_and_output_parity(device_inde
 
     try:
         mlp.load(device=device)
-        if not bsm._hip_router_config_supported(mlp.routing_cfg):
+        if not routing_module._hip_router_config_supported(mlp.routing_cfg):
             pytest.skip(f"{mlp.key} is not a supported Flash router")
         generator = torch.Generator(device=device).manual_seed(1201)
         x = torch.randn((1, 4, HIDDEN), generator=generator, device=device, dtype=torch.half) * 0.02

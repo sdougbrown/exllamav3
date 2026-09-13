@@ -78,7 +78,7 @@ class RoutingCFG:
 _HIP_ROUTER_HIDDEN = 2560
 _HIP_ROUTER_EXPERTS = 512
 _HIP_ROUTER_TOP_K = 10
-_HIP_ROUTER_MAX_ROWS = 8
+_HIP_ROUTER_MAX_ROWS = 16
 
 
 def _hip_grouped_max_rows() -> int:
@@ -91,7 +91,7 @@ def _hip_grouped_max_rows() -> int:
 _HIP_GROUPED_MAX_ROWS = _hip_grouped_max_rows()
 # The native prefill binding follows the grouped cap boundary and accepts rows 2..512.
 _HIP_PREFILL_MIN_ROWS = _HIP_GROUPED_MAX_ROWS + 1
-_HIP_PREFILL_MAX_ROWS = 512
+_HIP_PREFILL_MAX_ROWS = 2048
 _HIP_PREFILL_MAX_EXPERT_ROWS = _HIP_PREFILL_MAX_ROWS * _HIP_ROUTER_TOP_K
 
 
