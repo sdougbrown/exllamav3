@@ -496,7 +496,12 @@ def test_flash_mlp_forward_has_native_router_route_and_output_parity(device_inde
         assert native_calls == 1
         native_selected, native_weights = routes["native"]
         fallback_selected, fallback_weights = routes["fallback"]
-        assert torch.equal(native_selected, fallback_selected)
+        # Compare top-k membership row-wise: exactly tied scores may be emitted in
+        # different orders by the native kernel and the fallback sort, which is not a
+        # routing divergence; tied experts carry equal weights, so the weight and output
+        # comparisons below are order-insensitive for them.
+        assert torch.equal(native_selected.sort(dim=1).values,
+                           fallback_selected.sort(dim=1).values)
         torch.testing.assert_close(native_weights, fallback_weights, rtol=2e-3, atol=2e-3)
         torch.testing.assert_close(native_output, fallback_output, rtol=2e-3, atol=2e-5)
     finally:
