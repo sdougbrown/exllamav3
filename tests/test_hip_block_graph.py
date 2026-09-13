@@ -293,6 +293,11 @@ class TestRealModelCapture:
         budgets = [0.0] * torch.cuda.device_count()
         budgets[devices[0]] = float(os.environ.get("EXL3_FLASH_GRAPH_GPU0_GB", "25"))
         budgets[devices[1]] = float(os.environ.get("EXL3_FLASH_GRAPH_GPU1_GB", "31"))
+        # model.load() allocates cache tensors only for caches attached before the call,
+        # so both caches exist up front; the eager reference and the graphed passes
+        # still run on separate caches.
+        reference_cache = Cache(model, max_num_tokens=256, max_batch_size=1)
+        graph_cache = Cache(model, max_num_tokens=256, max_batch_size=1)
         try:
             try:
                 model.load(use_per_device=budgets, max_chunk_size=256, max_batch_size=1)
@@ -316,11 +321,10 @@ class TestRealModelCapture:
                 )
 
             # Eager reference on its own cache.
-            reference = generate(Cache(model, max_num_tokens=256, max_batch_size=1))
+            reference = generate(reference_cache)
             assert reference
 
             monkeypatch.setattr(block_graph, "BLOCK_GRAPH_ENABLED", True)
-            graph_cache = Cache(model, max_num_tokens=256, max_batch_size=1)
             first = generate(graph_cache)
             captures_after_first = block_graph.global_stats()["captures"]
             replays_after_first = block_graph.global_stats()["replays"]
