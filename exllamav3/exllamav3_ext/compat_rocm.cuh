@@ -76,7 +76,16 @@ __device__ __forceinline__ __hip_bfloat16 float2bfloat16_rn(float f)
 #endif
 #endif
 
-struct FragB { half2 elems[2]; __device__ half2& operator[](int i) { return elems[i]; } };
+// Layout-identical stand-in for the CUDA m16n8k16 B-fragment (ptx.cuh FragB). Exposed so
+// TUs that never include ptx.cuh (all ROCm builds) still get the decode helpers' operand type.
+// hip/hip_mma.cuh defers to this definition when both headers land in one TU (see EXL3_ROCM_FRAGB).
+#define EXL3_ROCM_FRAGB 1
+struct FragB
+{
+    half2 elems[2];
+    __device__ half2& operator[](int i) { return elems[i]; }
+    __device__ const half2& operator[](int i) const { return elems[i]; }
+};
 
 #define FSHF_IMM(dst, lo, hi, imm) \
     do { uint64_t _m = (static_cast<uint64_t>(hi) << 32) | static_cast<uint32_t>(lo); (dst) = static_cast<uint32_t>(_m >> (imm)); } while(0)
