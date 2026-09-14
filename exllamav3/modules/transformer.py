@@ -140,6 +140,12 @@ class TransformerBlock(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+        # Opt-in per-block HIP graph capture (EXL3_BLOCK_GRAPH, ROCm decode only). Declines
+        # return None and fall through to the eager path below.
+        from .block_graph import maybe_graph_forward
+        y_graph = maybe_graph_forward(self, x, params)
+        if y_graph is not None:
+            return y_graph
 
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
