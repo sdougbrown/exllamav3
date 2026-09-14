@@ -6,6 +6,7 @@ class Graph;
 
 // Fused mHC HyperConnection mix / HyperHead collapse
 
+bool hc_mix_supported(int device);
 int hc_mix_num_chunks(int R, int row_len);
 
 void hc_mix

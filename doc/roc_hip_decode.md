@@ -132,71 +132,7 @@ The existing fused GatedResidual and hyperconnection kernels are also available 
 
 Keeping the PLE table in RAM did not improve that fresh-process result: disk streaming measured 13.553 tok/s versus 13.410 tok/s from RAM. RAM residency also increased model load time from 17.0 to 30.9 seconds. The streamed path remains the recommended default and avoids reserving 32.64 GB of host memory.
 
-A dedicated gfx12 batch-one MoE route groups the ten selected K3/mul1 experts into device-resident gate/up/down launches. It preserves duplicate expert slots and uses a deterministic fp32 weighted reduction. Strict eligibility keeps batch, conversion, TP, LoRA, activation-limit, unsupported-shape, and non-gfx12 calls on the established path.
-
-Two warmed free-running comparisons measured grouped medians of 24.59 and 24.83 tok/s, versus 14.21 and 14.63 tok/s without grouping. Individual grouped trials ranged from 20.03 to 29.95 tok/s because generated token paths select different PLE rows and experts. Under one fixed forced-token path, the median improved from 12.315 to 23.697 tok/s, a reproducible 92.4% gain. The four-token profile reduced K3 GEMV calls from 5,808 to 48 and HIP activities from 43,240 to 13,288.
-
-The scalar shared-expert gate also uses the native fused dot–sigmoid–accumulate kernel on ROCm. This removes 192 small matrix multiplications and 960 device activities over four tokens. Controlled fixed-token decode improved from 26.211 to 29.133 tok/s, while the free-running median improved from 25.851 to 28.670 tok/s.
-
-A gfx12 batch-one standard router replaces each remaining 2560-by-512 rocBLAS projection and PyTorch top-k with two wave32 kernels. It keeps a 2.5-MiB transposed gate per layer, 120 MiB across the 48-layer model. The four-token profile removed 192 `aten::mm` and 192 `aten::topk` calls; the native router used 3.067 ms total. Controlled free-running time fell from 34.508 to 32.916 ms/token, equivalent to 28.98 and 30.38 tok/s.
-
-Three retained gfx12 optimizations from `d189d3a`, `0bbf261`, and `69acc17` carry that target further. The fixed-K QSA selector is native only for gfx1200/gfx1201 wave32 inputs with fp16 scores, int32 indices, `k == 512`, a 2D score matrix with 128-aligned row stride, and no `t_ptr` / `t_seq` override; every other shape or device uses the Python fallback. It preserves the exact fp16 bit-key order used in tests: `-inf` and negative NaNs stay out, positive NaNs rank above `+inf`, and 69acc17 adds stable block-parallel compaction while preserving ascending-index threshold ties. On gfx1201, the same-harness R512/T32768 native selector improved from 6.298 to 0.396 ms, a 15.9x speedup over the prior serial native path; the real Flash 128K selector improved from 7.131 to 0.852 ms, an 8.37x speedup. Full 128K prefill improved from 136.183 to 123.601 s (9.2%), the late 512-row chunk from 572.7 to 466.1 ms (18.6%), and 128K target decode from 22.59 to 38.27 tok/s (69.4%). A 12K full prefill run was noise-level/neutral.
-
-The standard router is native for rows 1 through 8 on gfx1200/gfx1201 wave32 when the router config is the supported 512-expert/10-top-k half-precision shape with no router bias, per-expert scale, or activate-all path. `RoutingCFG` owns one persistent multirow workspace reused in stream order, and like existing per-module inference workspaces it assumes the loaded model is not invoked concurrently on independent streams. Unsupported rows, disabled routing, missing bindings, and other mismatched configs still fall back to the torch path. In isolated router runs, that native path was 1.5x-2.6x faster, and controlled concurrent decode improved by 1.5%-5.5% across 2-8 jobs.
-
-The grouped path's first real-model layer difference is 1.49e-8 maximum in fp32 output. Qwen4Exp recurrent state amplifies numerical noise. A 16-step fallback repeat measured a 3.63 maximum logit delta and 0.270 mean delta. The grouped pass measured 4.44 and 0.274. Both retained 15/16 top-1 agreement with the reference pass and at least 4/5 top-five overlap. The opt-in full-model oracle includes that fallback control and verifies grouped execution on both gfx1201 devices.
-
-The gfx12 throughput route extends the same direct K3 arithmetic to the prefill rows routed above the grouped cap. It sorts assignments by expert, processes up to 16 rows per wide WMMA tile, and reduces through the inverse permutation in deterministic expert order. The shared workspaces add approximately 119 MiB per device. Five controlled pp511 trials improved from a 357.93 tok/s fallback median to 855.11 tok/s, a 138.9% gain. Under the profiler, HIP launches fell from 136,043 to 13,305; aggregate GPU time fell from 986 to 484 ms. A prefill-only 128-thread schedule later reduced the warm layer-harness median from 2.207 to 2.083 ms and grouped-body GPU time from 1.857 to 1.697 ms. Fixed-prompt pp511 medians improved from 902.32 to 926.67 tok/s; decode and MTP retain their existing schedules.
-
-The gfx12 GDN prefill kernel uses two V partitions instead of the decode-oriented four. This retains the four-way layout for sequences up to five rows and leaves NVIDIA unchanged. A controlled pp511 sweep was noise-level, 894.48 versus 896.61 tok/s. Profiled recurrent-kernel time fell from 97.45 to 78.34 ms, while aggregate GPU time fell from 484 to 468 ms. An alternating 12K sweep improved from a 660.69 to 675.48 tok/s median, a 2.24% gain.
-
-AITER can complement the runtime one operation at a time; Triton is not an all-or-nothing dependency. The installed AITER exposes chunked GDN, paged-attention, and GEMM APIs. Its GDN API requires expanding this checkpoint's 16 shared q/k heads to 48 value heads. Both tested chunk variants accumulated non-finite full-model state. Its A16W16 assembly path also has no gfx1201 kernel or Triton GEMM configuration. No AITER route is enabled.
-
-The 30.4 tok/s target-only short-context median is above the historical 19.43 tok/s llama.cpp target-only result for this host.
-
-The checkpoint also includes its complete 6,200-tensor MTP head; no separate EXL3 draft download is required. The draft adds approximately 1.25 GB on GPU0. Grouped K3 execution now supports verification windows of up to 16 rows. This moves MTP3 from 17.50 to 49.79 tok/s in a controlled on/off comparison. It also preserves duplicate routing slots and deterministic per-token reductions.
-
-Across three warmed 64-token trials, target-only measured 38.34 tok/s. MTP1/2/3/4 measured 47.91, 50.19, 53.56, and 43.30 tok/s respectively. MTP3 is the recommended short-context setting. Its three trials accepted 40–43 draft tokens and rejected 20–32 while producing coherent output. Speculative jobs now honor the same maximum output length as target-only jobs instead of reserving an unused full draft window.
-
-The MTP3 result is above the historical 45–50 tok/s llama.cpp short-context MTP band, but the prompt and active-context lengths differ. An initial 4,095-token random-word prompt produced only one accepted draft token out of 96 proposals. That result was prompt-confounded rather than a context-length boundary.
-
-A controlled sweep kept the same `The capital of France is` suffix while varying the prefix from 511 to 4,095 tokens. MTP3 accepted 14–20 draft tokens and rejected 19–43, with no discontinuity at QSA's 2,051-token sparse threshold. At 12K it accepted 18 and rejected 27 while decoding at 37.60 tok/s. MTP acceptance is workload-sensitive, but it does not inherently collapse when sparse QSA activates.
-
-Sparse-QSA target decode measured 32.38 tok/s at 11,999 tokens. The original 256-token prefill chunks reached 547.5 tok/s. Loading with `max_chunk_size=512` raised 12K prefill to 643.1 tok/s; a value of 1,024 regressed to 627.4 tok/s. `Generator` retains its independent 2,048-token default unless its `max_chunk_size` is also set.
-
-With 512-token chunks, synthetic prefill remained stable as context grew:
-
-| Active context | Prefill | Target decode |
-| ---: | ---: | ---: |
-| 11,999 | 643.1 tok/s | 32.45 tok/s |
-| 32,767 | 598.0 tok/s | 28.33 tok/s |
-| 65,535 | 592.8 tok/s | 28.65 tok/s |
-| 131,071 | 568.6 tok/s | 29.07 tok/s |
-| 179,999 | 563.6 tok/s | 31.69 tok/s |
-
-The 180K result retained 87.6% of the 12K prefill rate instead of falling toward 300 tok/s. Retrieval quality is not yet qualified. A synthetic 12K passkey prompt failed under both sparse QSA and a forced-dense control, so it did not isolate the selector.
-
-This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP3 works beyond the sparse threshold, but its workload-dependent acceptance and sparse-QSA retrieval quality still need broader qualification. The remaining short-context bottlenecks are now the grouped K3 WMMA body, recurrent GDN, and the remaining reconstructed K5 projections. Warmed 511-token prefill reached 896.61 tok/s with both throughput changes. Long-context retrieval quality still needs a representative control before comparison with sparse-QSA serving results.
-
-## Q8 QSA cache route
-
-`CacheLayer_qsa_quant` keeps the main K/V in the existing packed `CacheLayer_quant` format while the raw and pooled selector side planes stay fp16. That preserves selection semantics.
-
-On gfx1201, the eager sparse Triton path dequantizes only the selected rows online through the existing H32/cache loaders. It does not reconstruct a full fp16 cache first for eligible linear Q8/Q8 layers with whole 32-value head groups. Other quant widths, companded Q8, and partial head groups still use the full-dequant fallback. Unknown classes fail fast, and QSA TP fails early. Q8 also declines to eager when BC graph integration would be required; the existing fp16 BC/CUDA ABI stays unchanged.
-
-| Cache | FP16 | Q8 | Reduction |
-| --- | ---: | ---: | ---: |
-| 128K / 12 layers | 3,724,541,952 B | 2,214,592,512 B | 40.54% |
-
-A warm 8K synthetic full-model A/B measured 7.224 s for FP16 and 7.880 s for Q8, about 9.1% slower. The quantized run dispatched the online Q8 path 144 times and never used the fp16 gather; the inverse fp16 run dispatched 144 fp16 gathers and no Q8 gathers.
-
-For true capacity qualification, a pool of 393,216 with two concurrent prompts at 196,096 tokens each ran under Q8+MTP3 for 392.036 s and reached 1000.40 tok/s aggregate prefill. Both prompts generated 7 tokens. The eligible Q8 sparse route included 9,828 512-row calls, and the process exited cleanly.
-
-The storage budget was 6,643,777,536 B (6.188 GiB) for target Q8 planes, 916,783,184 B (0.854 GiB) for recurrent state, and 553,648,128 B (0.516 GiB) for the Q8 MTP draft plane, 7.557 GiB total. Allocated VRAM was 30.265/28.838 GiB and reserved VRAM was 30.676/29.109 GiB.
-
-These repeated-token prompts exercise capacity and routing only; they do not qualify language quality or retrieval.
-
-The focused suite passed 241 tests. The 13-test QSA file also passed after the final test-only correction. This does not qualify NVIDIA runtime behavior.
+This is a foundation result, not the final serving profile. Qwen4Exp currently uses layer split rather than tensor parallelism. MTP has not been enabled, and sparse QSA beyond the short-context dense threshold still needs ROCm qualification. The remaining short-context bottlenecks are launch count and K3 expert GEMV. Prefill and long-context performance need separate measurements before comparison with sparse QSA serving results.
 
 ## MCG compatibility
 

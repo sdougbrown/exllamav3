@@ -19,7 +19,7 @@ ROCM_EXCLUDE_FILES = {
     'libtorch/mlp.cpp', 'libtorch/attention.cpp', 'libtorch/gated_rmsnorm.cpp',
     'libtorch/linear.cpp', 'libtorch/dsv4_attn.cpp', 'libtorch/dsv4_compressor.cpp',
     'libtorch/mla_attention.cpp',
-    'dsv4_compress.cu', 'dsa_topk.cu', 'hc_mix.cu', 'ple.cu',
+    'dsv4_compress.cu', 'dsa_topk.cu', 'ple.cu',
     'cpu/moe_handoff.cu', 'cpu/moe_mul1.cpp',
 }
 
@@ -41,7 +41,7 @@ def get_sources(sources_dir, is_rocm, base_dir=None):
         for file in files:
             if not file.endswith(('.c', '.cpp', '.cu')):
                 continue
-            if '_hip' in file or file.endswith('.hip'):
+            if '_hip' in file or file.startswith('hip_') or file.endswith('.hip'):
                 continue
             rel_path = os.path.relpath(os.path.join(root, file), start=sources_dir)
             norm_rel = rel_path.replace('\\', '/')

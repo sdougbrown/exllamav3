@@ -16,6 +16,7 @@ from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.model.lora import LoRA
 from exllamav3.modules.block_sparse_mlp import _HIP_PREFILL_MAX_EXPERT_ROWS
 from exllamav3.modules import block_sparse_mlp as block_sparse_mlp_module
+from exllamav3.modules import block_sparse_mlp_routing as routing_module
 
 HIDDEN = 2560
 INTERMEDIATES = (640, 768)
@@ -60,7 +61,6 @@ def _require_hip_router():
 )
 def test_grouped_row_cap_reloads_and_preserves_the_prefill_boundary(monkeypatch, value, expected):
     """The rollback cap is import-time configuration and never opens invalid prefill rows."""
-    import exllamav3.modules.block_sparse_mlp_routing as routing_module
     try:
         with monkeypatch.context() as env:
             if value is None:
@@ -487,8 +487,7 @@ def test_flash_multirow_route_and_decline_guards(flash_model, device_index, rows
         assert mlp.multi_down.linears == mlp.downs
         x = torch.randn((1, rows, HIDDEN), dtype=torch.float16, device=device)
 
-        # add_sigmoid_gate_proj may be native or the layer-2 PyTorch fallback; the spy wraps
-        # whichever ext resolves to, and block_sparse_mlp looks it up through ext at call time
+        assert getattr(ext.add_sigmoid_gate_proj, "__module__", None) == "exllamav3_ext"
         calls, restore = _route_spies()
         try:
             with torch.profiler.profile(
@@ -599,6 +598,7 @@ def test_flash_grouped_row_cap_rolls_back_to_prefill_at_6(flash_model, device_in
     try:
         monkeypatch.setenv("EXL3_HIP_GROUPED_MAX_ROWS", "5")
         monkeypatch.setenv("EXL3_HIP_GROUPED_MOE_PREFILL", "1")
+        importlib.reload(routing_module)
         importlib.reload(block_sparse_mlp_module)
         monkeypatch.setattr(ext, "exl3_moe_gfx12_k3", grouped_spy)
         monkeypatch.setattr(ext, "exl3_moe_gfx12_k3_prefill", prefill_spy)
@@ -625,6 +625,7 @@ def test_flash_grouped_row_cap_rolls_back_to_prefill_at_6(flash_model, device_in
         prefill_calls = 0
         monkeypatch.setenv("EXL3_HIP_GROUPED_MAX_ROWS", "16")
         monkeypatch.setenv("EXL3_HIP_GROUPED_MOE_PREFILL", "1")
+        importlib.reload(routing_module)
         importlib.reload(block_sparse_mlp_module)
         mlp.unload()
         mlp.load(device=device)
@@ -641,6 +642,7 @@ def test_flash_grouped_row_cap_rolls_back_to_prefill_at_6(flash_model, device_in
             os.environ.pop("EXL3_HIP_GROUPED_MOE_PREFILL", None)
         else:
             os.environ["EXL3_HIP_GROUPED_MOE_PREFILL"] = old_prefill
+        importlib.reload(routing_module)
         importlib.reload(original_module)
         mlp.unload()
 

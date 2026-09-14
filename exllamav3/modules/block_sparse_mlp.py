@@ -46,6 +46,38 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
+
+def _moe_sync_free_count() -> bool:
+    # Default on: torch.bincount on a device tensor synchronizes the host once per MoE
+    # layer per chunk (48 layers), locking the host to the device. The scatter_add_
+    # histogram below is device-only. EXL3_MOE_SYNC_FREE_COUNT=0 restores bincount.
+    return os.environ.get("EXL3_MOE_SYNC_FREE_COUNT", "1") != "0"
+
+
+# Persistent all-ones source for the sync-free expert histogram, one per device. Sized
+# to the max assignments of the gfx12 prefill route (2048 rows x top-k 10).
+_moe_sync_free_ones = {}
+
+
+def _scatter_expert_count(flat_expert_local: torch.Tensor, num_bins: int) -> torch.Tensor:
+    """Sync-free int64 histogram identical to torch.bincount(flat_expert_local, minlength = num_bins)."""
+    n = flat_expert_local.numel()
+    dev = flat_expert_local.device
+    if n <= _HIP_PREFILL_MAX_EXPERT_ROWS:
+        ones = _moe_sync_free_ones.get(dev)
+        if ones is None:
+            ones = torch.ones(_HIP_PREFILL_MAX_EXPERT_ROWS, dtype = torch.long, device = dev)
+            _moe_sync_free_ones[dev] = ones
+        src = ones[:n]
+    else:
+        # Rare: paths beyond the gfx12 prefill envelope (e.g. chunk > 512 rows). A fresh
+        # ones tensor here is still device-side (no host sync).
+        src = torch.ones(n, dtype = torch.long, device = dev)
+    expert_count = torch.zeros(num_bins, dtype = torch.long, device = dev)
+    expert_count.scatter_add_(0, flat_expert_local, src)
+    return expert_count
+
+
 @dataclass
 class FusedBuffers:
     temp_state_g: torch.Tensor
@@ -461,6 +493,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.hip_grouped_buffers = None
         self.support_hip_prefill = False
         self.hip_prefill_buffers = None
+        self._pf_assignments = 0
         self.hip_grouped_lora_blocked = False
         self._cpu_init_state()
 
@@ -478,6 +511,44 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return [s, [g + u, d]]
         else:
             return [[g + u, d]]
+
+
+    def _ensure_hip_prefill_buffers(self, num_tokens):
+        """Allocate the gfx12 prefill workspace sized to the actual chunk so chunk512
+        serving never reserves the full 2048-row envelope. Grows only if a larger
+        chunk routes later in the same process."""
+        top_k = self.num_experts_per_tok
+        assignments = num_tokens * top_k
+        if self.hip_prefill_buffers is not None and self._pf_assignments >= assignments:
+            return self.hip_prefill_buffers
+        device = self.device
+        H = self.hidden_size
+        I = self.intermediate_size_padded
+        rows = assignments // top_k
+        self.hip_prefill_buffers = HIPPrefillBuffers(
+            gu_had = g_tensor_cache.get(
+                device, (2 * assignments, H), torch.half, f"moe_gfx12_pf_gu_had_a{assignments}"),
+            gu_out = g_tensor_cache.get(
+                device, (2 * assignments, I), torch.half, f"moe_gfx12_pf_gu_out_a{assignments}"),
+            down_out = g_tensor_cache.get(
+                device, (assignments, H), torch.float, f"moe_gfx12_pf_down_out_a{assignments}"),
+            output = g_tensor_cache.get(
+                device, (rows, H), torch.float, f"moe_gfx12_pf_output_a{rows}"),
+            expert_offsets = g_tensor_cache.get(
+                device, (self.num_experts + 1,), torch.long, "moe_gfx12_pf_offsets"),
+            inverse_order = g_tensor_cache.get(
+                device, (assignments,), torch.long, f"moe_gfx12_pf_inverse_a{assignments}"),
+            expert_chunks = g_tensor_cache.get(
+                device,
+                (self.num_experts * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
+                torch.int,
+                "moe_gfx12_pf_chunks",
+            ),
+            chunk_count = g_tensor_cache.get(
+                device, (1,), torch.int, "moe_gfx12_pf_chunk_count"),
+        )
+        self._pf_assignments = assignments
+        return self.hip_prefill_buffers
 
 
     def invalidate_hip_grouped_for_lora(self, target: Linear):
@@ -668,29 +739,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
 
         if self.support_hip_prefill:
-            max_assignments = _HIP_PREFILL_MAX_ROWS * numex
-            self.hip_prefill_buffers = HIPPrefillBuffers(
-                gu_had = g_tensor_cache.get(
-                    device, (2 * max_assignments, H), torch.half, "moe_gfx12_pf_gu_had"),
-                gu_out = g_tensor_cache.get(
-                    device, (2 * max_assignments, I), torch.half, "moe_gfx12_pf_gu_out"),
-                down_out = g_tensor_cache.get(
-                    device, (max_assignments, H), torch.float, "moe_gfx12_pf_down_out"),
-                output = g_tensor_cache.get(
-                    device, (_HIP_PREFILL_MAX_ROWS, H), torch.float, "moe_gfx12_pf_output"),
-                expert_offsets = g_tensor_cache.get(
-                    device, (self.num_experts + 1,), torch.long, "moe_gfx12_pf_offsets"),
-                inverse_order = g_tensor_cache.get(
-                    device, (max_assignments,), torch.long, "moe_gfx12_pf_inverse"),
-                expert_chunks = g_tensor_cache.get(
-                    device,
-                    (self.num_experts * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
-                    torch.int,
-                    "moe_gfx12_pf_chunks",
-                ),
-                chunk_count = g_tensor_cache.get(
-                    device, (1,), torch.int, "moe_gfx12_pf_chunk_count"),
-            )
+            # Workspace is allocated lazily at dispatch sized to the actual chunk
+            # (see _ensure_hip_prefill_buffers), not reserved at the 2048-row cap, so
+            # chunk512 serving does not overallocate VRAM.
+            self.hip_prefill_buffers = None
+            self._pf_assignments = 0
 
         if (self.support_quant_paths or self.support_bc_bszn) \
                 and not self.config.infer_params.no_reconstruct:
@@ -1030,6 +1083,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.hip_grouped_buffers = None
         self.support_hip_prefill = False
         self.hip_prefill_buffers = None
+        self._pf_assignments = 0
         self.hip_grouped_lora_blocked = False
         if self.multi_gate is not None:
             self.multi_gate.unload()
@@ -1182,8 +1236,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             num_tokens, top_k = selected_experts.shape
             flat_expert_local = selected_experts.reshape(-1)
             order = flat_expert_local.argsort(stable = True)
-            expert_count = torch.bincount(flat_expert_local, minlength = self.num_experts + 1)
-            buffers = self.hip_prefill_buffers
+            if _moe_sync_free_count():
+                expert_count = _scatter_expert_count(flat_expert_local, self.num_experts + 1)
+            else:
+                expert_count = torch.bincount(flat_expert_local, minlength = self.num_experts + 1)
+            buffers = self._ensure_hip_prefill_buffers(num_tokens)
             assignments = num_tokens * top_k
             output = buffers.output[:num_tokens]
             ext.exl3_moe_gfx12_k3_prefill(
@@ -1210,7 +1267,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 buffers.expert_chunks,
                 buffers.chunk_count,
             )
-            final_hidden_states = output
+            final_hidden_states = output.view(x.shape)
 
         # Torch/C++/fused path
         elif (
@@ -1261,7 +1318,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # Count how many assignments per expert. With few enough total assignments no
                 # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
                 # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+                if _moe_sync_free_count():
+                    expert_count = _scatter_expert_count(flat_expert_local, E + 1)
+                else:
+                    expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
                 if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
                     expert_count_list = None
                 else:

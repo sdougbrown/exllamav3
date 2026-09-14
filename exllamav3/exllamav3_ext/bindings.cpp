@@ -7,13 +7,14 @@
 #include "stloader.h"
 #include "cuda_host.h"
 #include "hadamard.h"
+#include "hc_mix.cuh"
+#include "activation.cuh"
 
 #if !defined(USE_ROCM)
 
 #include "norm.cuh"
 #include "hgemm.cuh"
 #include "rope.cuh"
-#include "activation.cuh"
 #include "softcap.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
@@ -66,7 +67,6 @@
 #include "dsv4_compress.cuh"
 #include "dsv4_pool_quant.cuh"
 #include "dsa_topk.cuh"
-#include "hc_mix.cuh"
 #include "ple.cuh"
 #include "ngram.cuh"
 
@@ -79,6 +79,7 @@
 #include "hgemm.cuh"
 #include "rope.cuh"
 #include "gdn.cuh"
+#include "routing_std_gfx12.cuh"
 #include "add.cuh"
 
 #include "quant/pack.cuh"
@@ -113,6 +114,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
     m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
 
+    m.def("hc_mix_supported", &hc_mix_supported, "hc_mix_supported");
+    m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("hc_head", &hc_head, "hc_head");
+    m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
+    m.def("hc_apply", &hc_apply, "hc_apply");
+    m.def("gr_mix", &gr_mix, "gr_mix");
+    m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
+
 #if !defined(USE_ROCM)
     m.def("rms_norm", &rms_norm, "rms_norm",
         py::arg("x"), py::arg("w"), py::arg("y"), py::arg("epsilon"),
@@ -136,16 +145,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsa_topk", &dsa_topk, "dsa_topk");
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
     m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
-    m.def("hc_mix", &hc_mix, "hc_mix");
     m.def("ple_gate", &ple_gate, "ple_gate");
     m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
-    m.def("hc_head", &hc_head, "hc_head");
-    m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
-    m.def("hc_apply", &hc_apply, "hc_apply");
-    m.def("gr_mix", &gr_mix, "gr_mix");
     m.def("routing_std", &routing_std, "routing_std");
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
@@ -227,7 +231,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("deinterleave_qg", &deinterleave_qg, "deinterleave_qg");
     m.def("mul_sigmoid_broadcast_", &mul_sigmoid_broadcast_, "mul_sigmoid_broadcast_");
     m.def("mul_softplus_broadcast_", &mul_softplus_broadcast_, "mul_softplus_broadcast_");
-    m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
@@ -322,6 +325,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemv_supported", &exl3_gemv_supported, "exl3_gemv_supported");
     m.def("exl3_moe_gfx12_k3", &exl3_moe_gfx12_k3, "exl3_moe_gfx12_k3");
+    m.def("exl3_moe_gfx12_k3_prefill", &exl3_moe_gfx12_k3_prefill,
+          "exl3_moe_gfx12_k3_prefill");
+    m.def("routing_std_gfx12_bsz1", &routing_std_gfx12_bsz1,
+          "routing_std_gfx12_bsz1");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
     m.def("pack_signs", &pack_signs, "pack_signs");
